@@ -58,6 +58,65 @@ the three common result artifacts, and (for RLM mode) per-example transcripts.
 The canonical benchmark scorer—not the harness's quick progress-match flag—is
 the authoritative score in `metrics.json`.
 
+## Comparing against KVPress
+Run both backends on the same `dataset` / `data_dir` / `model`, then join them:
+
+```bash
+python -m evaluation.compare --dataset ruler32k --csv comparison.csv
+```
+
+`compare.py` walks `evaluation/results/`, reads each run's `config.yaml` and
+`metrics.json`, and prints one row per run. What makes the rows commensurable:
+
+- **Same scorer.** Both backends call `benchmarks/results.score_prediction_frame`,
+  so `score` is literally the same function applied to the same gold answers.
+- **Same cost axis.** `context_tokens_held` is KVPress's
+  `average_retained_context_tokens` and RLM's `average_peak_context_tokens` —
+  both answer "how much context was live at once", which is what KV memory is
+  proportional to. Plot score against this column to put a compression sweep and
+  a `--max-context-tokens` sweep on one chart.
+
+Two asymmetries the harness records rather than hides, because ignoring either
+one silently flatters RLM:
+
+- **Errors.** An RLM example that dies on an API error is dropped from the score
+  and counted in `runtime.errors`. KVPress runs locally and cannot fail this
+  way, so scoring an outage as a zero would understate RLM for a reason that has
+  nothing to do with the method. Treat a run with many errors as incomplete, not
+  as a result — check the `errors` column before believing a score.
+- **Truncation.** KVPress compresses the full context; vanilla truncates it. The
+  `context_retained` column is the fraction that survived, so a low vanilla score
+  can be read as a property of the char/token limit rather than of the model.
+  Set `--vanilla-max-prompt-tokens` to `(max-model-len - max-tokens - margin)`;
+  without it, densely-tokenising subsets (RULER `cwe`, `niah_multikey_3`)
+  overflow the served window and score 0.0 from a harness error.
+
+## Runaway guards and the scratchpad
+All four are toggleable and independent; pass `0` to disable one without
+affecting the others. Defaults are on because an unguarded run can burn a whole
+SLURM allocation on one pathological example, but a debugging session that wants
+to watch a single example run to completion can switch any of them off.
+
+| Flag | Default | Off | What it bounds |
+|---|---|---|---|
+| `--exec-timeout` | `60` s | `0` | Pure-Python time for ONE code block, so a model-generated infinite loop can't hang the sweep. Time inside `llm_query` is excluded — the watchdog is paused around sub-calls, so a slow-but-legitimate API call is never mistaken for a runaway loop. |
+| `--run-timeout` | `900` s | `0` | Wall-clock for ONE example, ending it with `end_reason=run_timeout`. Needed because `--exec-timeout` deliberately does not bound `llm_query` time. |
+| `--max-sub-calls` | `40` | `0` | `llm_query` calls per example. Past the cap, calls return a notice instead of hitting the API, so the model degrades gracefully rather than erroring. |
+| `--scratchpad` | off | (omit) | Opt-in `note(text)` REPL tool. Notes are re-shown every turn and survive budget eviction, giving the model a durable place to keep findings. Size it with `--max-notes-tokens`. |
+
+`--exec-timeout` relies on `SIGALRM`, so it is a no-op off the main thread or on
+platforms without it; it also cannot interrupt a C-level regex. `--run-timeout`
+has neither limitation and is the backstop.
+
+Because `--scratchpad` and `--max-context-tokens` both change results, both
+appear in the run directory name — otherwise two configurations would share a
+`checkpoint.jsonl` and silently merge. Nothing parses that name; `compare.py`
+reads `config.yaml`.
+
+The root and sub clients now share one `RateLimiter`, so `--rpm` is a per-account
+cap. Previously each client had its own and the process could issue ~2x `--rpm`
+and trip 429s.
+
 ## Benchmarks (in order of effort)
 | Benchmark | Why | Source |
 |---|---|---|
