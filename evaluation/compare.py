@@ -27,7 +27,13 @@ import yaml
 # Checked in order; the first hit wins. Both backends run the SAME scorer for a
 # given dataset, so whichever key is picked is picked identically for both -- that
 # symmetry, not the specific key, is what makes the columns comparable.
-SCORE_KEYS = ("average", "string_match", "exact_match", "score", "accuracy", "f1")
+#
+# `subspan_em` sits ahead of `f1` for LOFT specifically: it is LOFT's primary RAG
+# metric AND the only one all five subsets report. Without it, nq/hotpotqa/musique
+# fell through to `f1` while qampari/quest (which report `coverage`, not `f1`) had
+# no key hit at all and three numeric entries, so they failed the single-numeric
+# fallback below and were dropped from the comparison entirely.
+SCORE_KEYS = ("average", "string_match", "exact_match", "score", "accuracy", "subspan_em", "f1")
 
 # Reported by the RLM harness about itself; never a benchmark score.
 RUNTIME_KEY = "runtime"

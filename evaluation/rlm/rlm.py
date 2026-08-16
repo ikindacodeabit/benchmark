@@ -512,6 +512,8 @@ class RLM:
         evicted_count = 0  # number of leading pairs already dropped (evicted)
         transcript: list = []
         nudges = 0
+        last_code_norm: str | None = None  # repetition-breaker state (see below)
+        repeat_count = 0
         seen_output = ""  # grounding accumulator — NEVER compacted
 
         def build_sent() -> tuple[list, int]:
@@ -727,16 +729,76 @@ class RLM:
                     continue
                 return RLMResult(val, step, True, transcript, "final_called", metrics)
 
+            # --- Repetition breaker ---
+            # A stuck small model re-emits the SAME code cell every turn — identical
+            # code -> identical observation — and burns all max_steps (and the whole
+            # run_timeout) without ever calling FINAL. Detect an exact consecutive
+            # repeat and escalate: first a hard nudge to stop and answer or change
+            # tactic, then a forced GROUNDED fallback that answers from what was
+            # actually seen, so the example still yields a real answer instead of
+            # grinding to max_steps with score 0.
+            code_norm = " ".join(code.split())
+            if code_norm == last_code_norm:
+                repeat_count += 1
+            else:
+                repeat_count = 1
+                last_code_norm = code_norm
+
+            if repeat_count >= 3:
+                # Still looping after the nudge: answer from the real REPL output
+                # accumulated so far (grounded), plus the task. Bypasses FINAL()'s
+                # literal-grounding guard deliberately — this is the escape hatch.
+                material = seen_output.strip()[-self.max_subcall_chars :]
+                fb_prompt = (
+                    "Answer the task using ONLY the material below, which was extracted "
+                    "from a long document by prior code. Be concise and factual.\n\n"
+                    f"Task: {task}\n\nExtracted material:\n{material}"
+                )
+                ans = self.sub.chat(
+                    [
+                        {"role": "system", "content": SUB_SYSTEM_PROMPT},
+                        {"role": "user", "content": fb_prompt},
+                    ]
+                )
+                metrics["sub_calls"] += 1
+                metrics["sub_call_tokens"] += self.tok.count(fb_prompt) + self.tok.count(ans)
+                transcript.append(
+                    {
+                        "step": step,
+                        "reply": "[repetition-breaker fallback]",
+                        "code": None,
+                        "observation": "[forced grounded answer after 3 identical code cells]",
+                    }
+                )
+                return RLMResult(ans, step, True, transcript, "repetition_broken", metrics)
+
             full_history.append({"role": "assistant", "content": reply})
-            full_history.append(
-                {
-                    "role": "user",
-                    "content": f"ACTUAL REPL output:\n```\n{obs}\n```\n"
-                    f"Continue. ({self.max_steps - step} turns left) "
-                    "Remember: one code block only; finish with FINAL(...) once you have "
-                    "seen the answer in a real output.",
-                }
-            )
+            if repeat_count == 2:
+                full_history.append(
+                    {
+                        "role": "user",
+                        "content": "STOP: you just ran this EXACT same code twice and got the same "
+                        "result — repeating it will not help. Do ONE of these, and do NOT "
+                        "repeat the previous code:\n"
+                        "1) If you already have enough to answer, reply with a code block "
+                        "containing only FINAL(<expr>) (a variable/expression you computed, "
+                        "not a guessed literal).\n"
+                        "2) If your search found nothing, your approach is WRONG — the answer "
+                        "may be a category/label, or phrased differently. Try a COMPLETELY "
+                        "different tactic: inspect context[:2000], search a different keyword, "
+                        "or llm_query a relevant snippet.",
+                    }
+                )
+            else:
+                full_history.append(
+                    {
+                        "role": "user",
+                        "content": f"ACTUAL REPL output:\n```\n{obs}\n```\n"
+                        f"Continue. ({self.max_steps - step} turns left) "
+                        "Remember: one code block only; finish with FINAL(...) once you have "
+                        "seen the answer in a real output.",
+                    }
+                )
 
         return RLMResult(None, self.max_steps, False, transcript, "max_steps", metrics)
 

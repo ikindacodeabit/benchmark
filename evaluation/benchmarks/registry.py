@@ -54,6 +54,15 @@ SCORER_REGISTRY = {
 }
 
 
+# LOFT ships six task categories, but only the RAG subsets have been mirrored to
+# the Hub (see benchmarks/loft/create_huggingface_dataset.py). Retrieval, ICL and
+# SQL have no loader here yet, so they are deliberately absent rather than listed
+# and broken.
+LOFT_RAG_DATASETS = ("nq", "hotpotqa", "musique", "qampari", "quest")
+LOFT_LENGTHS = ("32k", "128k", "1m")
+LOFT_TASKS = tuple(f"{name}_{length}" for name in LOFT_RAG_DATASETS for length in LOFT_LENGTHS)
+
+
 RULER_32K_TASKS = (
     "cwe",
     "fwe",

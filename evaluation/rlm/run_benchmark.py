@@ -17,7 +17,7 @@ from pathlib import Path
 import pandas as pd
 import yaml
 
-from evaluation.benchmarks.registry import RULER_32K_TASKS, SCORER_REGISTRY
+from evaluation.benchmarks.registry import LOFT_TASKS, RULER_32K_TASKS, SCORER_REGISTRY
 from evaluation.benchmarks.results import score_prediction_frame
 
 from .client import NIMClient, RateLimiter
@@ -224,6 +224,10 @@ def main() -> None:
         ap.error("--limit must be positive")
     if dataset_name == "ruler32k" and args.data_dir not in RULER_32K_TASKS:
         ap.error("--dataset ruler32k requires --data-dir with one of: " + ", ".join(RULER_32K_TASKS))
+    # Without this, a typo'd or omitted subset surfaces as a HF 404 deep inside
+    # _load_loft after the clients are already built.
+    if dataset_name == "loft" and args.data_dir not in LOFT_TASKS:
+        ap.error("--dataset loft requires --data-dir with one of: " + ", ".join(LOFT_TASKS))
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -293,6 +297,11 @@ def main() -> None:
                     "mode": mode,
                     "answers": ex["answers"],
                     "answer": ex.get("scoring", {}).get("answer", ex["answers"]),
+                    # LOFT's scorer reads this column to know which cue to look for
+                    # and falls back to a hardcoded "Final Answer: " when it is
+                    # absent. It was being appended to the question below but never
+                    # recorded, so the scorer silently used the wrong cue.
+                    "answer_prefix": ex.get("answer_prefix") or "",
                 }
                 record.update(ex.get("scoring", {}))
                 question = ex["question"]
