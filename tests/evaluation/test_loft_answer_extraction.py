@@ -103,9 +103,7 @@ def test_multi_value_comma_prose_is_not_split_by_the_primary_extractor():
 
 def test_primary_extractor_still_wins_on_bracketed_output():
     """The fallback runs only when the primary extractor returns nothing."""
-    metrics = calculate_metrics(
-        _frame("Final Answer: [Paris]", ["Paris"], task="nq_128k")
-    )
+    metrics = calculate_metrics(_frame("Final Answer: [Paris]", ["Paris"], task="nq_128k"))
     assert metrics["em"] == pytest.approx(1.0)
 
 
