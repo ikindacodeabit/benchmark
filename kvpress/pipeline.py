@@ -295,7 +295,7 @@ class KVPressTextGenerationPipeline(Pipeline):
         # Prefilling using the press on the context
         if cache is None:
             cache = DynamicCache()
-        
+
         bytes_per_token = self._compute_kv_bytes_per_token()
         compression_ratio = float(getattr(press, "compression_ratio", 0.0)) if press is not None else 0.0
         retained_context_tokens = max(1, int(context_length * (1 - compression_ratio)))

@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 import os
 import shutil
 from datasets import load_dataset
@@ -19,19 +21,19 @@ for task in longbench_tasks:
         split="test",
     )
     print(f"cached: {task}")
-    
+
     # 2. Find ONLY the raw hash folder.
     # We filter out any folder that already has '=' in it so we don't touch previous tasks.
     subdirs = [
-        d for d in os.listdir(base_cache_dir) 
+        d for d in os.listdir(base_cache_dir)
         if d.startswith("default-") and "=" not in d
     ]
-    
+
     if subdirs:
         # subdirs[0] will be the exact hex-hash folder just created (e.g., 'default-0065b3b...')
         current_hash_dir = os.path.join(base_cache_dir, subdirs[0])
         target_dir = os.path.join(base_cache_dir, f"default-data_dir={task}")
-        
+
         # 3. Rename it safely
         shutil.move(current_hash_dir, target_dir)
         print(f"Renamed cache folder to: {target_dir}")

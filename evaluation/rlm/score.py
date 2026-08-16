@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Aggregate RLM JSONL results into a comparison table."""
+
 from __future__ import annotations
 
 import json
@@ -43,7 +44,9 @@ def main(results_dir: str = "evaluation/results/rlm") -> None:
         return
 
     # Backward compatibility for results produced before the common contract.
-    rows = defaultdict(lambda: {"n": 0, "correct": 0, "tokens": 0, "latency": 0.0, "unfinished": 0, "errors": 0})
+    rows: defaultdict = defaultdict(
+        lambda: {"n": 0, "correct": 0, "tokens": 0, "latency": 0.0, "unfinished": 0, "errors": 0}
+    )
     for path in sorted(result_root.glob("*.jsonl")):
         variant = path.parent.name if path.parent != result_root else "root"
         parts = path.stem.split(".", 2)
