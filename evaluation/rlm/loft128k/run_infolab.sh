@@ -112,11 +112,21 @@ if [ "$1" = "setup" ]; then
     # CUDA than some infolab drivers accept, and 0.8.5.post1 is the version the
     # earlier Qwen3-8B numbers were produced with, so results stay comparable.
     pip install "vllm==${VLLM_VERSION:-0.8.5.post1}"
+    # Pin transformers LAST so it wins over both installs above. pyproject asks for
+    # >=4.56 for the kvpress side, but transformers 5.x removed
+    # `all_special_tokens_extended`, which vLLM 0.8.5 still calls -- the server dies
+    # at tokenizer init with "Qwen2Tokenizer has no attribute
+    # all_special_tokens_extended". pip will warn about the kvpress conflict; that is
+    # expected and harmless here, because the RLM arm never imports the presses.
+    # Consequence: this venv is for the RLM path only. Keep a separate one for kvpress.
+    pip install "transformers==${TRANSFORMERS_VERSION:-4.51.3}"
 
     python - <<'PY'
 import torch
 print(f"torch {torch.__version__}, cuda {torch.version.cuda}, devices {torch.cuda.device_count()}")
 print("capabilities:", {torch.cuda.get_device_capability(i) for i in range(torch.cuda.device_count())})
+import transformers
+print(f"transformers {transformers.__version__}")
 PY
 
     # Pre-fetch the weights HERE, with a visible progress bar, rather than letting
@@ -125,6 +135,26 @@ PY
     # failure reads as "server never became ready", which points at the wrong thing.
     echo "pre-fetching $MODEL into $HF_HOME ..."
     hf download "$MODEL" || huggingface-cli download "$MODEL"
+
+    # Reproduce the exact call vLLM makes at tokenizer init. Without this the first
+    # incompatibility only shows up ~5 minutes into a serve, as a readiness timeout
+    # that points at the GPU rather than at the dependency set.
+    MODEL="$MODEL" python - <<'PY'
+import os
+import sys
+
+from transformers import AutoTokenizer
+
+model = os.environ["MODEL"]
+tok = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+if not hasattr(tok, "all_special_tokens_extended"):
+    sys.exit(
+        f"INCOMPATIBLE: {type(tok).__name__} has no `all_special_tokens_extended`, "
+        "which vLLM 0.8.5 calls at startup. Pin transformers==4.51.3 "
+        "(TRANSFORMERS_VERSION=... to override)."
+    )
+print(f"tokenizer OK: {type(tok).__name__}, vocab {len(tok)}")
+PY
 
     echo "setup done. Next: DATASETS=\"nq\" LENGTH=32k LIMIT=3 SERVERS=1 $0 auto"
     exit 0
