@@ -41,10 +41,22 @@ They also have **no scheduler**, and the GPUs are shared and unreserved. Nothing
 restarts a dead run and nothing stops another user claiming a card mid-setup, so
 run everything under `tmux`.
 
+**Clone onto scratch, not `$HOME`.** `$HOME` is a small NFS quota on these hosts;
+the venv alone (torch + vLLM) is ~15 GB and the model weights another ~8 GB.
+
 ```bash
+cd /mnt/nas/$USER
+git clone -b rlm-scratchpad-loft128k https://github.com/Rahul-Chhabra-27/benchmark.git
+cd benchmark
+
 tmux new -s rlm
+bash evaluation/rlm/loft128k/run_infolab.sh setup
 bash evaluation/rlm/loft128k/run_infolab.sh auto
 ```
+
+Use the `setup` subcommand rather than running `uv sync` by hand: it redirects the
+pip/uv/HF caches to scratch *before* installing anything. Those caches default to
+`$HOME` and are several GB, so the ordering is the whole point.
 
 `auto` picks every card with ≥30 GB free (ranked by **utilisation**, not free
 memory — an idle-looking card can be pegged at 99% SM by a small-footprint job),

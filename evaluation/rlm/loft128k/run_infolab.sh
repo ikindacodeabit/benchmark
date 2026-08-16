@@ -44,6 +44,16 @@ export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export TOKENIZERS_PARALLELISM=false
 export PYTHONUNBUFFERED=1
 
+# Validate the subcommand first, so a typo reports itself rather than surfacing as
+# a scratch or missing-activate error.
+case "${1:-}" in
+auto | serve | run | setup) ;;
+*)
+    echo "usage: $0 {setup|auto|serve|run}" >&2
+    exit 2
+    ;;
+esac
+
 # --- keep caches off $HOME ----------------------------------------------------
 # $HOME is a small NFS quota on these hosts and `quota -u` prints nothing, so the
 # cap is invisible and `df` is misleading. Model weights (~8 GB) plus the LOFT
@@ -67,20 +77,53 @@ export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-$XDG_CACHE_HOME/triton}"
 export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-$XDG_CACHE_HOME/inductor}"
 mkdir -p "$HF_HOME" "$XDG_CACHE_HOME"
 
-# Validate the subcommand before touching the venv, so a typo reports itself
-# rather than surfacing as a missing-activate error.
-case "${1:-}" in
-auto | serve | run) ;;
-*)
-    echo "usage: $0 {auto|serve|run}" >&2
-    exit 2
-    ;;
-esac
-
 mkdir -p "$RESULTS" "$LOGS"
 
+# --- setup --------------------------------------------------------------------
+# Runs AFTER the cache redirection above, which is the whole point: `uv sync` and
+# `pip install` write several GB of wheels and unpacked packages, and their caches
+# default to $HOME. Doing the install through this subcommand is what keeps that
+# off the quota-capped home directory.
+if [ "$1" = "setup" ]; then
+    echo "scratch:  $RLM_SCRATCH"
+    echo "HF_HOME:  $HF_HOME"
+    echo "caches:   $XDG_CACHE_HOME"
+    df -BG "$RLM_SCRATCH" | tail -1
+
+    if [ ! -f "$VENV/bin/activate" ]; then
+        if command -v uv >/dev/null 2>&1; then
+            uv venv "$VENV"
+        else
+            # Not every infolab host has uv, and some Debian pythons ship without
+            # ensurepip.
+            python3 -m venv "$VENV" || {
+                python3 -m venv --without-pip "$VENV"
+                # shellcheck disable=SC1091
+                source "$VENV/bin/activate"
+                curl -sS https://bootstrap.pypa.io/get-pip.py | python3
+            }
+        fi
+    fi
+    # shellcheck disable=SC1091
+    source "$VENV/bin/activate"
+
+    pip install -e ".[eval]"
+    # Pin vLLM: an unpinned install resolves to a build whose torch targets a newer
+    # CUDA than some infolab drivers accept, and 0.8.5.post1 is the version the
+    # earlier Qwen3-8B numbers were produced with, so results stay comparable.
+    pip install "vllm==${VLLM_VERSION:-0.8.5.post1}"
+
+    python - <<'PY'
+import torch
+print(f"torch {torch.__version__}, cuda {torch.version.cuda}, devices {torch.cuda.device_count()}")
+print("capabilities:", {torch.cuda.get_device_capability(i) for i in range(torch.cuda.device_count())})
+PY
+    echo "setup done. Next: DATASETS=\"nq\" LENGTH=32k LIMIT=3 SERVERS=1 $0 auto"
+    exit 0
+fi
+
 if [ ! -f "$VENV/bin/activate" ]; then
-    echo "ERROR: no venv at $VENV. Run 'uv sync --extra eval' first, or set VENV=<path>." >&2
+    echo "ERROR: no venv at $VENV. Run '$0 setup' first, or set VENV=<path>." >&2
     exit 1
 fi
 # shellcheck disable=SC1091
