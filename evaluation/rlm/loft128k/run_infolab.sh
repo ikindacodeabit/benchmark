@@ -37,12 +37,35 @@ MIN_FREE_MIB="${MIN_FREE_MIB:-30000}"
 # Leave headroom so a co-tenant's job growing slightly does not OOM the server.
 HEADROOM_MIB="${HEADROOM_MIB:-2000}"
 
-# bee and fox mix A6000 (sm_86) and RTX 6000 Ada (sm_89). CUDA orders devices
-# FASTEST_FIRST by default while nvidia-smi reports PCI order, so without this the
-# index measured as idle is not the index CUDA selects.
+# Some infolab hosts mix A6000 (sm_86) and RTX 6000 Ada (sm_89). CUDA orders
+# devices FASTEST_FIRST by default while nvidia-smi reports PCI order, so without
+# this the index measured as idle is not the index CUDA selects.
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export TOKENIZERS_PARALLELISM=false
 export PYTHONUNBUFFERED=1
+
+# --- keep caches off $HOME ----------------------------------------------------
+# $HOME is a small NFS quota on these hosts and `quota -u` prints nothing, so the
+# cap is invisible and `df` is misleading. Model weights (~8 GB) plus the LOFT
+# parquet will blow through it, and a large write to a stalled filer mount is
+# uninterruptible (hard,timeo=600 -> D-state, Ctrl-C does nothing) and has taken
+# the home directory down host-wide before. Everything cacheable is redirected.
+RLM_SCRATCH="${RLM_SCRATCH:-/mnt/nas/$USER}"
+if [ ! -d "$RLM_SCRATCH" ]; then
+    echo "WARNING: RLM_SCRATCH=$RLM_SCRATCH does not exist." >&2
+    echo "  Caches would fall back to \$HOME, which is quota-capped on these hosts." >&2
+    echo "  Set RLM_SCRATCH=<a big writable path> before running, or create that dir." >&2
+    exit 1
+fi
+export HF_HOME="${HF_HOME:-$RLM_SCRATCH/hf_cache}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$RLM_SCRATCH/cache}"
+export PIP_CACHE_DIR="${PIP_CACHE_DIR:-$XDG_CACHE_HOME/pip}"
+export UV_CACHE_DIR="${UV_CACHE_DIR:-$XDG_CACHE_HOME/uv}"
+export TORCH_HOME="${TORCH_HOME:-$XDG_CACHE_HOME/torch}"
+export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-$XDG_CACHE_HOME/vllm}"
+export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-$XDG_CACHE_HOME/triton}"
+export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-$XDG_CACHE_HOME/inductor}"
+mkdir -p "$HF_HOME" "$XDG_CACHE_HOME"
 
 # Validate the subcommand before touching the venv, so a typo reports itself
 # rather than surfacing as a missing-activate error.
