@@ -118,6 +118,14 @@ import torch
 print(f"torch {torch.__version__}, cuda {torch.version.cuda}, devices {torch.cuda.device_count()}")
 print("capabilities:", {torch.cuda.get_device_capability(i) for i in range(torch.cuda.device_count())})
 PY
+
+    # Pre-fetch the weights HERE, with a visible progress bar, rather than letting
+    # the first `vllm serve` download ~8 GB inside the readiness window. That window
+    # is 15 minutes by default, which a cold download can easily exceed -- and the
+    # failure reads as "server never became ready", which points at the wrong thing.
+    echo "pre-fetching $MODEL into $HF_HOME ..."
+    hf download "$MODEL" || huggingface-cli download "$MODEL"
+
     echo "setup done. Next: DATASETS=\"nq\" LENGTH=32k LIMIT=3 SERVERS=1 $0 auto"
     exit 0
 fi
@@ -166,7 +174,7 @@ serve_on() {
 
 wait_ready() {
     local port="$1"
-    for _ in $(seq 1 90); do
+    for _ in $(seq 1 "${READY_TRIES:-90}"); do
         curl -sf -o /dev/null --max-time 5 "http://localhost:$port/v1/models" && return 0
         sleep 10
     done

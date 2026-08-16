@@ -44,7 +44,7 @@ exec > >(tee -a "$LOGS/$DATASET.$STAMP.out") 2>&1
 echo "=== $(date '+%F %T') :: loft ${DATASET}_${LENGTH} :: $MODEL :: port $PORT ==="
 
 # --- wait for the server ------------------------------------------------------
-for _ in $(seq 1 90); do
+for _ in $(seq 1 "${READY_TRIES:-90}"); do
     if curl -sf -o /dev/null --max-time 5 "http://localhost:$PORT/v1/models"; then
         echo "vLLM ready on port $PORT"
         break
@@ -52,7 +52,7 @@ for _ in $(seq 1 90); do
     sleep 10
 done
 if ! curl -sf -o /dev/null --max-time 5 "http://localhost:$PORT/v1/models"; then
-    echo "ERROR: no vLLM on port $PORT after 15 minutes" >&2
+    echo "ERROR: no vLLM on port $PORT after $(( ${READY_TRIES:-90} * 10 / 60 )) minutes" >&2
     exit 1
 fi
 
