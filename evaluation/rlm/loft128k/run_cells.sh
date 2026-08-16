@@ -47,15 +47,22 @@ exec > >(tee -a "$LOGS/$DATASET.$STAMP${KVPRESS_ARMS:+.kvpress}.out") 2>&1
 echo "=== $(date '+%F %T') :: loft ${DATASET}_${LENGTH} :: $MODEL :: port $PORT ==="
 
 # --- wait for the server ------------------------------------------------------
+# The grep for $MODEL is load-bearing: on a shared host another user's server can
+# hold the port, and a bare 200-check would accept it -- every request then 404s
+# with "model does not exist" while readiness claims all is well.
+serves_our_model() {
+    curl -sf --max-time 5 "http://localhost:$PORT/v1/models" | grep -qF "\"$MODEL\""
+}
 for _ in $(seq 1 "${READY_TRIES:-90}"); do
-    if curl -sf -o /dev/null --max-time 5 "http://localhost:$PORT/v1/models"; then
-        echo "vLLM ready on port $PORT"
+    if serves_our_model; then
+        echo "vLLM serving $MODEL on port $PORT"
         break
     fi
     sleep 10
 done
-if ! curl -sf -o /dev/null --max-time 5 "http://localhost:$PORT/v1/models"; then
-    echo "ERROR: no vLLM on port $PORT after $(( ${READY_TRIES:-90} * 10 / 60 )) minutes" >&2
+if ! serves_our_model; then
+    echo "ERROR: no server for $MODEL on port $PORT after $(( ${READY_TRIES:-90} * 10 / 60 )) minutes." >&2
+    echo "  If /v1/models answers but with a different model, the port belongs to another user." >&2
     exit 1
 fi
 

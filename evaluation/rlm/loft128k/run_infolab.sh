@@ -319,13 +319,32 @@ serve_on() {
         --enforce-eager -O0
 }
 
+# Readiness must verify WHICH model answers, not just that something does. On a
+# shared host another user can already hold the port: our vllm then dies at bind
+# ("address already in use"), a bare 200-check happily accepts THEIR server, and
+# every request 404s with "model does not exist" -- which is exactly how this
+# failed on bee. The model-name grep makes a foreign server fail readiness.
 wait_ready() {
     local port="$1"
     for _ in $(seq 1 "${READY_TRIES:-90}"); do
-        curl -sf -o /dev/null --max-time 5 "http://localhost:$port/v1/models" && return 0
+        if curl -sf --max-time 5 "http://localhost:$port/v1/models" | grep -qF "\"$MODEL\""; then
+            return 0
+        fi
         sleep 10
     done
     return 1
+}
+
+# Fail FAST (not after a 15-minute readiness timeout) when the port is taken.
+port_must_be_free() {
+    local port="$1"
+    if curl -sf -o /dev/null --max-time 2 "http://localhost:$port/v1/models" ||
+        curl -s -o /dev/null --max-time 2 "http://localhost:$port/"; then
+        echo "ERROR: port $port is already in use (another user's server?)." >&2
+        echo "  Pick a free base port: PORT=<port> $0 ..." >&2
+        return 1
+    fi
+    return 0
 }
 
 case "${1:-}" in
@@ -336,6 +355,7 @@ serve)
         echo "ERROR: GPU $GPU has only ${FREE} MiB free, need ${MIN_FREE_MIB}" >&2
         exit 1
     fi
+    port_must_be_free "$PORT" || exit 1
     serve_on "$GPU" "$PORT"
     ;;
 
@@ -362,6 +382,10 @@ auto)
         exit 1
     fi
     echo "using GPUs: ${GPUS[*]} for ${#DS_ARR[@]} datasets"
+
+    for i in "${!GPUS[@]}"; do
+        port_must_be_free $((PORT + i)) || exit 1
+    done
 
     PIDS=()
     cleanup() {
