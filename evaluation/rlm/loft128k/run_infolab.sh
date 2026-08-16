@@ -388,11 +388,22 @@ auto)
     done
 
     PIDS=()
+    # Two subtleties, both learned from a stuck Ctrl-C on bee: (1) after an INT
+    # trap runs, bash RESUMES the interrupted loop unless the handler exits, so
+    # ^C looked acknowledged but the script kept polling forever; (2) each PID
+    # here is the backgrounded subshell, and killing it orphans the vllm child
+    # inside -- the children must be killed too (pkill -P).
     cleanup() {
+        trap - EXIT INT TERM
         echo "shutting down servers: ${PIDS[*]-}"
-        for p in "${PIDS[@]-}"; do kill "$p" 2>/dev/null || true; done
+        for p in "${PIDS[@]-}"; do
+            pkill -TERM -P "$p" 2>/dev/null || true
+            kill "$p" 2>/dev/null || true
+        done
+        exit "${1:-0}"
     }
-    trap cleanup EXIT INT TERM
+    trap 'cleanup 130' INT TERM
+    trap 'cleanup $?' EXIT
 
     for i in "${!GPUS[@]}"; do
         p=$((PORT + i))
