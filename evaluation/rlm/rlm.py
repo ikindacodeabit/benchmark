@@ -52,12 +52,7 @@ RULES:
   interactive shell, the value of a bare final expression is echoed back to you.
 - Useful tools available in the REPL:
     * `context` (str): the full document.
-    * `llm_query(prompt: str) -> str`: ask a sub-LLM about text. IMPORTANT: the
-      sub-LLM CANNOT see `context` or any of your variables — it sees ONLY the
-      prompt string you pass. You MUST embed the actual text snippet inside the
-      prompt, e.g. llm_query("Answer X based on this text:\\n" + context[i:j])
-      (keep each call under ~8000 characters). Capture the result:
-      ans = llm_query(...) then print(ans).
+{llm_query_help}
     * `print(...)`: anything you print is shown back to you in the NEXT message
       (truncated to {obs_limit} chars), so print only what you need to see.{note_tool}
 - Strategy: peek at structure first (e.g. `print(context[:2000])`,
@@ -82,7 +77,7 @@ Example of a correct session (3 turns):
         ```
   REPL: ...The invoice total for March was $4,210 including tax...
   You:  ```python
-        ans = llm_query("What was the March invoice total? Answer from this text:\\n" + context[idx-200:idx+500])
+{example_llm_query}
         print(ans)
         ```
   REPL: $4,210
@@ -93,6 +88,37 @@ Example of a correct session (3 turns):
 The user's task is:
 {task}
 """
+
+# The llm_query help/example rendered into ROOT_SYSTEM_PROMPT depends on the sub
+# backend. The DENSE variants must stay byte-identical to the pre-split prompt
+# (arms 2/3 are mid-campaign and a wording change would confound them); the
+# SPLIT variants teach the two-arg form used when the sub client compresses the
+# context's KV separately from the question (see kvpress_backend.py).
+LLM_QUERY_HELP_DENSE = """\
+    * `llm_query(prompt: str) -> str`: ask a sub-LLM about text. IMPORTANT: the
+      sub-LLM CANNOT see `context` or any of your variables — it sees ONLY the
+      prompt string you pass. You MUST embed the actual text snippet inside the
+      prompt, e.g. llm_query("Answer X based on this text:\\n" + context[i:j])
+      (keep each call under ~8000 characters). Capture the result:
+      ans = llm_query(...) then print(ans)."""
+
+EXAMPLE_LLM_QUERY_DENSE = (
+    '        ans = llm_query("What was the March invoice total? Answer from this text:\\n"'
+    " + context[idx-200:idx+500])"
+)
+
+LLM_QUERY_HELP_SPLIT = """\
+    * `llm_query(question: str, context_text: str) -> str`: ask a sub-LLM a
+      question about a piece of text. IMPORTANT: the sub-LLM CANNOT see
+      `context` or any of your variables — it sees ONLY what you pass. Put the
+      question in the FIRST argument and the raw document slice in the SECOND,
+      e.g. llm_query("What is X?", context[i:j]). The slice is read through a
+      compressed attention cache, so big slices are cheap: use up to
+      ~{max_chars} characters per call, and prefer FEWER, BIGGER slices over
+      many small ones. Capture the result: ans = llm_query(...) then
+      print(ans)."""
+
+EXAMPLE_LLM_QUERY_SPLIT = '        ans = llm_query("What was the March invoice total?", context[idx-200:idx+500])'
 
 SUB_SYSTEM_PROMPT = (
     "You are a helpful sub-model. Answer the question using ONLY the text "
@@ -134,9 +160,7 @@ def _raise_exec_timeout(signum, frame):  # pragma: no cover - signal handler
 CODE_RE = re.compile(r"```(?:python|repl|py)?[ \t]*\n?(.*?)```", re.DOTALL)
 STMT_KEYWORDS = r"print|import|from|for|while|if|elif|try|except|finally|with|return|FINAL_VAR|FINAL"
 ONELINE_FIX_RE = re.compile(rf"(?<=[\)\w'\"])\s+(?=(?:{STMT_KEYWORDS})\b)")
-TEXT_FINAL_RE = re.compile(
-    r"FINAL\(\s*(?:\"\"\"|'''|\"|')(.*?)(?:\"\"\"|'''|\"|')\s*\)", re.DOTALL
-)
+TEXT_FINAL_RE = re.compile(r"FINAL\(\s*(?:\"\"\"|'''|\"|')(.*?)(?:\"\"\"|'''|\"|')\s*\)", re.DOTALL)
 TEXT_FINAL_VAR_RE = re.compile(r"FINAL_VAR\(\s*[\"'](\w+)[\"']\s*\)")
 
 
@@ -232,6 +256,7 @@ class RLM:
         exec_timeout: Optional[float] = 60.0,
         run_timeout: Optional[float] = 900.0,
         max_sub_calls: Optional[int] = 40,
+        subcall_deadline_check: bool = False,
     ):
         self.root = root_client
         self.sub = sub_client or root_client
@@ -253,6 +278,12 @@ class RLM:
         # stall a job for hours. None disables.
         self.run_timeout = run_timeout
         self.max_sub_calls = max_sub_calls
+        # Check the run_timeout deadline INSIDE llm_query too. Off by default:
+        # the NIM/vLLM arms take their per-step deadline check between turns, and
+        # changing that mid-campaign would confound them. The kvpress arm turns it
+        # on because one code cell can loop over many multi-minute in-process
+        # sub-calls without ever reaching the per-step check.
+        self.subcall_deadline_check = subcall_deadline_check
         self._sub_call_budget: Optional[int] = None
         self._deadline: Optional[float] = None
         self.tok = TokenCounter(token_counter)
@@ -264,11 +295,15 @@ class RLM:
     def _make_env(self, context: str, metrics: dict, cache: dict, notes: list) -> dict:
         final_box: dict = {"value": None, "done": False}
 
-        def llm_query(prompt: str) -> str:
-            # Key on the FULL prompt. Keying on the TRUNCATED one makes two different
-            # calls that share a 32k-char prefix collide -- e.g. context[0:100000] and
-            # context[0:200000] -- silently returning one slice's answer for the other.
-            key = str(prompt)
+        def llm_query(prompt: str, context: str | None = None) -> str:
+            # Key on the FULL strings. Keying on the TRUNCATED ones makes two
+            # different calls that share a 32k-char prefix collide -- e.g.
+            # context[0:100000] and context[0:200000] -- silently returning one
+            # slice's answer for the other. The key is a (question, slice) pair so
+            # the same question over two slices never collides either.
+            question = str(prompt)
+            chunk = None if context is None else str(context)
+            key = (question, chunk)
             if self.cache_subcalls and key in cache:
                 metrics["sub_cache_hits"] += 1
                 return cache[key]
@@ -278,11 +313,30 @@ class RLM:
                     "available for this example. Answer from what you have already "
                     "seen, or use plain string/regex operations on `context`."
                 )
-            prompt = key[: self.max_subcall_chars]
-            if len(key) > self.max_subcall_chars:
-                prompt += (
-                    f"\n[NOTE: your prompt was truncated at "
-                    f"{self.max_subcall_chars} chars; pass a smaller snippet]"
+            if self.subcall_deadline_check and self._deadline is not None and time.monotonic() > self._deadline:
+                return (
+                    "[TIME LIMIT REACHED] The per-example time budget is exhausted; "
+                    "no further llm_query calls are available. Answer NOW from what "
+                    "you have already seen, or use plain string/regex operations on "
+                    "`context`."
+                )
+            if chunk is not None and not hasattr(self.sub, "chat_split"):
+                # Two-arg call against a plain chat backend (arms without a
+                # split-capable sub): fold the slice into the prompt so the call
+                # still behaves like the documented one-arg form.
+                question = f"{question}\n\n{chunk}"
+                chunk = None
+            truncated = len(question) > self.max_subcall_chars or (
+                chunk is not None and len(chunk) > self.max_subcall_chars
+            )
+            question = question[: self.max_subcall_chars]
+            if chunk is not None:
+                chunk = chunk[: self.max_subcall_chars]
+            if truncated:
+                # Always on the QUESTION side: on the split path the context slice
+                # is what gets compressed, and a notice buried there can be evicted.
+                question += (
+                    f"\n[NOTE: your prompt was truncated at " f"{self.max_subcall_chars} chars; pass a smaller snippet]"
                 )
             # Pause the code-exec watchdog (armed in _exec) around this blocking
             # sub-LLM call: a slow-but-legit network call / rate-limit sleep must
@@ -292,12 +346,19 @@ class RLM:
             if self._alarm_active:
                 remaining, _ = signal.setitimer(signal.ITIMER_REAL, 0)
             try:
-                ans = self.sub.chat(
-                    [
-                        {"role": "system", "content": SUB_SYSTEM_PROMPT},
-                        {"role": "user", "content": prompt},
-                    ]
-                )
+                if chunk is not None:
+                    # The client seam is duck-typed (hasattr-guarded above), so the
+                    # NIMClient annotation legitimately lacks this method.
+                    ans = self.sub.chat_split(  # type: ignore[attr-defined]
+                        question=question, context=chunk, system=SUB_SYSTEM_PROMPT
+                    )
+                else:
+                    ans = self.sub.chat(
+                        [
+                            {"role": "system", "content": SUB_SYSTEM_PROMPT},
+                            {"role": "user", "content": question},
+                        ]
+                    )
             finally:
                 # `remaining is not None`, not `remaining` -- setitimer returns 0.0
                 # for an already-expired timer, and a truthiness test then skips
@@ -306,7 +367,11 @@ class RLM:
                 if self._alarm_active and remaining is not None:
                     signal.setitimer(signal.ITIMER_REAL, max(remaining, 0.05))
             metrics["sub_calls"] += 1
-            metrics["sub_call_tokens"] += self.tok.count(prompt) + self.tok.count(ans)
+            metrics["sub_call_tokens"] += (
+                self.tok.count(question) + (self.tok.count(chunk) if chunk else 0) + self.tok.count(ans)
+            )
+            if chunk is not None:
+                metrics["sub_split_calls"] = metrics.get("sub_split_calls", 0) + 1
             if self.cache_subcalls:
                 cache[key] = ans
             return ans
@@ -436,11 +501,7 @@ class RLM:
         out = buf.getvalue()
         if len(out) > obs_limit:
             half = obs_limit // 2
-            out = (
-                out[:half]
-                + f"\n...[truncated {len(out) - obs_limit} chars]...\n"
-                + out[-half:]
-            )
+            out = out[:half] + f"\n...[truncated {len(out) - obs_limit} chars]...\n" + out[-half:]
         return (out if out.strip() else "[no output]") + note
 
     # ---------------- budget / context view ----------------
@@ -489,6 +550,12 @@ class RLM:
         if self.scratchpad is not None:
             metrics["scratchpad"] = True
             metrics["notes_saved"] = 0
+        # A split-capable sub client (kvpress backend) accepts the context slice as
+        # a separate argument so the press compresses it apart from the question;
+        # the system prompt must teach whichever llm_query form is actually wired.
+        split_capable = hasattr(self.sub, "chat_split")
+        if split_capable:
+            metrics["sub_split_calls"] = 0
         cache: dict = {}
         notes: list = []
         self._sub_call_budget = self.max_sub_calls
@@ -504,6 +571,12 @@ class RLM:
                 task=task,
                 budget_note=self._budget_note(),
                 note_tool=(NOTE_TOOL_HELP if self.scratchpad is not None else ""),
+                llm_query_help=(
+                    LLM_QUERY_HELP_SPLIT.format(max_chars=self.max_subcall_chars)
+                    if split_capable
+                    else LLM_QUERY_HELP_DENSE
+                ),
+                example_llm_query=(EXAMPLE_LLM_QUERY_SPLIT if split_capable else EXAMPLE_LLM_QUERY_DENSE),
             ),
         }
         begin_msg = {"role": "user", "content": "Begin. Write your first code block."}
@@ -554,9 +627,7 @@ class RLM:
                             }
                         )
                 elif fold_n > 0:
-                    msgs.append(
-                        {"role": "user", "content": FOLD_MARKER.format(n=fold_n)}
-                    )
+                    msgs.append({"role": "user", "content": FOLD_MARKER.format(n=fold_n)})
                 for p in kept_pairs:
                     msgs.extend(p)
                 return msgs
@@ -564,9 +635,7 @@ class RLM:
             fold_n = n_pairs - len(kept)
             sent = assemble(kept, fold_n)
             # squeeze: drop more recent pairs until within budget
-            while (
-                self.tok.count_messages(sent) > self.budget.max_context_tokens and kept
-            ):
+            while self.tok.count_messages(sent) > self.budget.max_context_tokens and kept:
                 kept = kept[1:]
                 fold_n = n_pairs - len(kept)
                 sent = assemble(kept, fold_n)
@@ -586,9 +655,7 @@ class RLM:
             sent, _ = build_sent()
             ctx_tokens = self.tok.count_messages(sent)
             metrics["root_prompt_tokens"] += ctx_tokens
-            metrics["peak_context_tokens"] = max(
-                metrics["peak_context_tokens"], ctx_tokens
-            )
+            metrics["peak_context_tokens"] = max(metrics["peak_context_tokens"], ctx_tokens)
 
             reply = self.root.chat(sent)
             metrics["root_completion_tokens"] += self.tok.count(reply)
@@ -597,9 +664,7 @@ class RLM:
             # adaptive observation limit: never let one observation exceed the budget
             obs_limit = self.obs_limit
             if self.budget is not None:
-                obs_limit = max(
-                    512, min(self.obs_limit, self.budget.max_context_tokens * 3)
-                )
+                obs_limit = max(512, min(self.obs_limit, self.budget.max_context_tokens * 3))
 
             # --- No code block in the reply ---
             if not blocks:
@@ -615,9 +680,7 @@ class RLM:
                                 "observation": "[FINAL parsed from prose]",
                             }
                         )
-                        return RLMResult(
-                            val, step, True, transcript, "final_in_prose", metrics
-                        )
+                        return RLMResult(val, step, True, transcript, "final_in_prose", metrics)
                     nudges += 1
                     transcript.append(
                         {
@@ -628,9 +691,7 @@ class RLM:
                         }
                     )
                     if nudges > 2:
-                        return RLMResult(
-                            None, step, False, transcript, "ungrounded_final", metrics
-                        )
+                        return RLMResult(None, step, False, transcript, "ungrounded_final", metrics)
                     full_history.append({"role": "assistant", "content": reply})
                     full_history.append(
                         {
@@ -654,9 +715,7 @@ class RLM:
                             "observation": "[FINAL_VAR parsed from prose]",
                         }
                     )
-                    return RLMResult(
-                        val, step, True, transcript, "final_var_in_prose", metrics
-                    )
+                    return RLMResult(val, step, True, transcript, "final_var_in_prose", metrics)
                 nudges += 1
                 transcript.append(
                     {
@@ -696,25 +755,17 @@ class RLM:
                     "executed. Anything you wrote after it (including any 'output' you "
                     "predicted) did NOT happen.)"
                 )
-            transcript.append(
-                {"step": step, "reply": reply, "code": code, "observation": obs}
-            )
+            transcript.append({"step": step, "reply": reply, "code": code, "observation": obs})
             seen_output += "\n" + obs
 
             if env["_final_box"]["done"]:
                 val = env["_final_box"]["value"]
-                if (
-                    val in (env.get("_rlm_final_literals") or [])
-                    and val not in seen_output
-                    and val not in task
-                ):
+                if val in (env.get("_rlm_final_literals") or []) and val not in seen_output and val not in task:
                     env["_final_box"]["done"] = False
                     env["_final_box"]["value"] = None
                     nudges += 1
                     if nudges > 2:
-                        return RLMResult(
-                            None, step, False, transcript, "ungrounded_final", metrics
-                        )
+                        return RLMResult(None, step, False, transcript, "ungrounded_final", metrics)
                     full_history.append({"role": "assistant", "content": reply})
                     full_history.append(
                         {
@@ -749,19 +800,34 @@ class RLM:
                 # accumulated so far (grounded), plus the task. Bypasses FINAL()'s
                 # literal-grounding guard deliberately — this is the escape hatch.
                 material = seen_output.strip()[-self.max_subcall_chars :]
-                fb_prompt = (
-                    "Answer the task using ONLY the material below, which was extracted "
-                    "from a long document by prior code. Be concise and factual.\n\n"
-                    f"Task: {task}\n\nExtracted material:\n{material}"
-                )
-                ans = self.sub.chat(
-                    [
-                        {"role": "system", "content": SUB_SYSTEM_PROMPT},
-                        {"role": "user", "content": fb_prompt},
-                    ]
-                )
+                if hasattr(self.sub, "chat_split"):
+                    # Split backend: the extracted material is the compressible
+                    # context, the task rides the uncompressed question side.
+                    fb_question = (
+                        "Answer the task using ONLY the provided material, which was "
+                        "extracted from a long document by prior code. Be concise and "
+                        f"factual.\n\nTask: {task}"
+                    )
+                    ans = self.sub.chat_split(  # type: ignore[attr-defined]
+                        question=fb_question, context=material, system=SUB_SYSTEM_PROMPT
+                    )
+                    fb_tokens = self.tok.count(fb_question) + self.tok.count(material)
+                    metrics["sub_split_calls"] = metrics.get("sub_split_calls", 0) + 1
+                else:
+                    fb_prompt = (
+                        "Answer the task using ONLY the material below, which was extracted "
+                        "from a long document by prior code. Be concise and factual.\n\n"
+                        f"Task: {task}\n\nExtracted material:\n{material}"
+                    )
+                    ans = self.sub.chat(
+                        [
+                            {"role": "system", "content": SUB_SYSTEM_PROMPT},
+                            {"role": "user", "content": fb_prompt},
+                        ]
+                    )
+                    fb_tokens = self.tok.count(fb_prompt)
                 metrics["sub_calls"] += 1
-                metrics["sub_call_tokens"] += self.tok.count(fb_prompt) + self.tok.count(ans)
+                metrics["sub_call_tokens"] += fb_tokens + self.tok.count(ans)
                 transcript.append(
                     {
                         "step": step,

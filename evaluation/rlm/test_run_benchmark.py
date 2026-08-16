@@ -6,13 +6,14 @@ Run from the repository root (the module uses absolute `evaluation.*` imports):
     python -m pytest evaluation/rlm/test_run_benchmark.py
 """
 
+import argparse
 import json
 import tempfile
 import unittest
 from pathlib import Path
 
-from evaluation.rlm.rlm import vanilla_answer
-from evaluation.rlm.run_benchmark import load_done, write_run_artifacts
+from evaluation.rlm.rlm import Scratchpad, vanilla_answer
+from evaluation.rlm.run_benchmark import build_run_dir_components, load_done, write_run_artifacts
 
 
 def _checkpoint(records: list[dict]) -> tuple[Path, Path]:
@@ -81,6 +82,104 @@ class ErroredRecordTest(unittest.TestCase):
         path, run_dir = _checkpoint([_answered("a", "x", "x", peak=4000), _answered("b", "y", "y", peak=4200)])
         metrics = write_run_artifacts(path, run_dir, "synthetic_kv_32k", {"backend": "rlm"})
         self.assertAlmostEqual(metrics["runtime"]["average_peak_context_tokens"], 4100.0)
+
+
+def _args(**overrides) -> argparse.Namespace:
+    base = dict(
+        dataset="loft",
+        legacy_dataset=None,
+        data_dir="nq_128k",
+        root_model="Qwen/Qwen3-4B-Instruct-2507",
+        max_context_tokens=None,
+        sub_backend="nim",
+        press="kvzip",
+        compression_ratio=0.5,
+        max_subcall_chars=32000,
+    )
+    base.update(overrides)
+    return argparse.Namespace(**base)
+
+
+class RunDirComponentsTest(unittest.TestCase):
+    """Anything that changes results must land in the directory name, or two
+    configurations share a checkpoint.jsonl and silently merge."""
+
+    def test_nim_backend_keeps_the_legacy_layout(self):
+        self.assertEqual(
+            build_run_dir_components(_args(), "rlm", Scratchpad()),
+            ["loft", "nq_128k", "Qwen_Qwen3-4B-Instruct-2507", "rlm", "scratchpad"],
+        )
+
+    def test_kvpress_backend_stamps_press_ratio_and_nondefault_chunk(self):
+        args = _args(sub_backend="kvpress", compression_ratio=0.75, max_subcall_chars=131072)
+        self.assertEqual(
+            build_run_dir_components(args, "rlm", Scratchpad()),
+            ["loft", "nq_128k", "Qwen_Qwen3-4B-Instruct-2507", "rlm", "scratchpad", "kvzip0.75", "sub131072"],
+        )
+
+    def test_default_chunk_size_adds_no_suffix(self):
+        args = _args(sub_backend="kvpress")
+        self.assertEqual(
+            build_run_dir_components(args, "rlm", None)[-1],
+            "kvzip0.5",
+        )
+
+    def test_vanilla_mode_ignores_rlm_only_knobs(self):
+        args = _args(sub_backend="kvpress", max_subcall_chars=131072, max_context_tokens=4096)
+        self.assertEqual(
+            build_run_dir_components(args, "vanilla", Scratchpad()),
+            ["loft", "nq_128k", "Qwen_Qwen3-4B-Instruct-2507", "vanilla"],
+        )
+
+
+class SubKvAggregationTest(unittest.TestCase):
+    """The run-level sub-side retention stats are the RLM analogue of KVPress's
+    average_retained_context_tokens; near-zero split fraction is the tell that
+    the arm degenerated to dense one-arg calls."""
+
+    @staticmethod
+    def _with_sub_kv(example_id: str, sub_kv: dict | None) -> dict:
+        record = _answered(example_id, "x", "x")
+        record["metrics"] = {"peak_context_tokens": 4096, "sub_kv": sub_kv}
+        return record
+
+    def test_sub_kv_is_averaged_into_runtime(self):
+        records = [
+            self._with_sub_kv(
+                "a",
+                {
+                    "calls": 4,
+                    "split_calls": 3,
+                    "average_context_tokens": 8000.0,
+                    "average_retained_context_tokens": 4000.0,
+                    "average_compression_ratio": 0.5,
+                },
+            ),
+            self._with_sub_kv(
+                "b",
+                {
+                    "calls": 2,
+                    "split_calls": 0,
+                    "average_context_tokens": 6000.0,
+                    "average_retained_context_tokens": 3000.0,
+                    "average_compression_ratio": 0.5,
+                },
+            ),
+            self._with_sub_kv("c", None),  # an example whose run made no sub-calls
+        ]
+        path, run_dir = _checkpoint(records)
+        metrics = write_run_artifacts(path, run_dir, "synthetic_kv_32k", {"backend": "rlm"})
+
+        runtime = metrics["runtime"]
+        self.assertAlmostEqual(runtime["average_sub_context_tokens"], 7000.0)
+        self.assertAlmostEqual(runtime["average_sub_retained_context_tokens"], 3500.0)
+        self.assertAlmostEqual(runtime["average_sub_compression_ratio"], 0.5)
+        self.assertAlmostEqual(runtime["sub_split_call_fraction"], 0.5)
+
+    def test_runs_without_sub_kv_report_nothing(self):
+        path, run_dir = _checkpoint([_answered("a", "x", "x")])
+        metrics = write_run_artifacts(path, run_dir, "synthetic_kv_32k", {"backend": "rlm"})
+        self.assertNotIn("average_sub_retained_context_tokens", metrics["runtime"])
 
 
 class _ContextOverflow(Exception):

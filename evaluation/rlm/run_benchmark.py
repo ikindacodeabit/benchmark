@@ -6,6 +6,7 @@ Usage:
   python -m evaluation.rlm.run_benchmark --dataset niah --mode rlm --limit 1 --debug
   python -m evaluation.rlm.run_benchmark --dataset ruler32k --data-dir niah_single_1 --limit 5
 """
+
 from __future__ import annotations
 
 import argparse
@@ -13,6 +14,7 @@ import json
 import time
 from dataclasses import asdict
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 import yaml
@@ -76,6 +78,7 @@ def write_run_artifacts(
     errored = frame["error"].notna() if "error" in frame else pd.Series(False, index=frame.index)
     scored_frame = frame[~errored]
 
+    metrics: dict
     if dataset_name in SCORER_REGISTRY:
         metrics = score_prediction_frame(dataset_name, scored_frame) if len(scored_frame) else {}
     else:
@@ -116,10 +119,60 @@ def write_run_artifacts(
             retained = scored_frame["context_chars_used"] / scored_frame["context_chars"]
             runtime["average_context_chars_retained"] = float(retained.mean())
 
+    # Sub-side KV retention: the direct analogue of KVPress's
+    # `average_retained_context_tokens`, but measured over llm_query sub-calls --
+    # "how much of each context slice did the sub model effectively attend to".
+    if scored and "metrics" in scored_frame:
+        sub_kv = [
+            m["sub_kv"]
+            for m in scored_frame["metrics"]
+            if isinstance(m, dict) and isinstance(m.get("sub_kv"), dict) and m["sub_kv"]
+        ]
+        if sub_kv:
+            n_kv = len(sub_kv)
+            total_calls = sum(s.get("calls", 0) for s in sub_kv)
+            runtime["average_sub_context_tokens"] = float(
+                sum(s.get("average_context_tokens", 0.0) for s in sub_kv) / n_kv
+            )
+            runtime["average_sub_retained_context_tokens"] = float(
+                sum(s.get("average_retained_context_tokens", 0.0) for s in sub_kv) / n_kv
+            )
+            runtime["average_sub_compression_ratio"] = float(
+                sum(s.get("average_compression_ratio", 0.0) for s in sub_kv) / n_kv
+            )
+            # How often the root actually used the two-arg form. Near 0 means the
+            # arm degenerated to dense one-arg calls and is NOT measuring the press.
+            runtime["sub_split_call_fraction"] = (
+                float(sum(s.get("split_calls", 0) for s in sub_kv) / total_calls) if total_calls else 0.0
+            )
+
     metrics["runtime"] = runtime
     (run_dir / "metrics.json").write_text(json.dumps(metrics, indent=2) + "\n")
     (run_dir / "config.yaml").write_text(yaml.safe_dump(config, sort_keys=False))
     return metrics
+
+
+def build_run_dir_components(args: argparse.Namespace, mode: str, scratchpad: Scratchpad | None) -> list[str]:
+    """Name the run directory after everything that changes results.
+
+    Two configurations that differ in any result-affecting knob must land in
+    different directories, or they share a checkpoint.jsonl and silently merge.
+    (compare.py reads config.yaml, not this name, so nothing else depends on the
+    format.)
+    """
+    dataset_name = canonical_dataset_name(args.dataset or args.legacy_dataset)
+    model_slug = args.root_model.replace("/", "_")
+    task_slug = (args.data_dir or "default").replace("/", "_")
+    components = [dataset_name, task_slug, model_slug, mode]
+    if mode == "rlm" and args.max_context_tokens is not None:
+        components.append(f"ctx{args.max_context_tokens}")
+    if mode == "rlm" and scratchpad is not None:
+        components.append("scratchpad")
+    if mode == "rlm" and args.sub_backend == "kvpress":
+        components.append(f"{args.press}{args.compression_ratio:g}")
+    if mode == "rlm" and args.max_subcall_chars != 32000:
+        components.append(f"sub{args.max_subcall_chars}")
+    return components
 
 
 def main() -> None:
@@ -209,6 +262,60 @@ def main() -> None:
         help="cap on llm_query calls per example; further calls return a notice instead of "
         "hitting the API. 0 disables",
     )
+    # --- Sub-call backend (arm 4: KV-compressed sub-calls; see kvpress_backend.py) ---
+    # `nim` keeps today's behavior: sub-calls go to the same OpenAI-compatible
+    # server as the root. `kvpress` loads the sub model IN-PROCESS through the
+    # kvpress pipeline so each llm_query context slice is read through a
+    # compressed KV cache; requires the kvpress venv (transformers>=4.56), which
+    # the root path does not, because the root stays on the HTTP server.
+    ap.add_argument("--sub-backend", default="nim", choices=["nim", "kvpress"])
+    ap.add_argument(
+        "--press",
+        default="kvzip",
+        choices=["kvzip", "kvzip_plus", "snapkv", "fastkvzip", "no_press"],
+        help="press for --sub-backend kvpress; no_press = same pipeline, dense (press control)",
+    )
+    ap.add_argument(
+        "--compression-ratio",
+        type=float,
+        default=0.5,
+        help="fraction of context KV the press evicts per sub-call (kvpress backend)",
+    )
+    ap.add_argument(
+        "--max-subcall-chars",
+        type=int,
+        default=32000,
+        help="char cap per llm_query prompt/context slice (was constructor-only); the split "
+        "prompt advertises this cap to the root, so raising it is what makes the "
+        "'compression enables bigger reads' arm real",
+    )
+    ap.add_argument(
+        "--sub-max-tokens",
+        type=int,
+        default=512,
+        help="max_new_tokens per kvpress sub-call; HF greedy decode is ~30-40 tok/s, so the "
+        "NIM default of 4096 is a wall-clock hazard in-process",
+    )
+    ap.add_argument("--sub-attn", default="sdpa", choices=["sdpa", "flash_attention_2"])
+    ap.add_argument(
+        "--sub-device",
+        default=None,
+        help="torch device for the in-process sub model (default: cuda:0 if available; "
+        "normally pinned via CUDA_VISIBLE_DEVICES)",
+    )
+    ap.add_argument(
+        "--sub-max-context-tokens",
+        type=int,
+        default=34000,
+        help="token-level truncation inside the kvpress pipeline (a 131072-char slice of dense "
+        "text can exceed 32k tokens)",
+    )
+    ap.add_argument(
+        "--press-min-tokens",
+        type=int,
+        default=1024,
+        help="one-arg llm_query prompts below this many tokens skip the press",
+    )
     ap.add_argument("--out", default="evaluation/results/rlm")
     ap.add_argument("--debug", action="store_true", help="print every RLM step (model reply, code, REPL output) live")
     ap.add_argument(
@@ -238,7 +345,26 @@ def main() -> None:
     limiter = RateLimiter(args.rpm)
     client_kw = dict(base_url=args.base_url, rpm=args.rpm, limiter=limiter)
     root = NIMClient(model=args.root_model, **client_kw)
-    sub = NIMClient(model=args.sub_model, **client_kw)
+    sub: Any
+    if args.sub_backend == "kvpress":
+        if modes == ["vanilla"]:
+            ap.error("--sub-backend kvpress only affects RLM sub-calls; use --mode rlm (or both)")
+        # Imported lazily: the nim path must stay importable in the vLLM-pinned
+        # venv, which has neither torch nor a kvpress-compatible transformers.
+        from .kvpress_backend import KVPressSubClient
+
+        sub = KVPressSubClient(
+            model=args.sub_model,
+            press_name=args.press,
+            compression_ratio=args.compression_ratio,
+            device=args.sub_device,
+            attn_implementation=args.sub_attn,
+            max_new_tokens=args.sub_max_tokens,
+            max_context_tokens=args.sub_max_context_tokens,
+            press_min_tokens=args.press_min_tokens,
+        )
+    else:
+        sub = NIMClient(model=args.sub_model, **client_kw)
     if args.no_think:
         eb = {"chat_template_kwargs": {"enable_thinking": False}}
         root.extra_body = sub.extra_body = eb
@@ -261,20 +387,14 @@ def main() -> None:
         exec_timeout=args.exec_timeout or None,
         run_timeout=args.run_timeout or None,
         max_sub_calls=args.max_sub_calls or None,
+        max_subcall_chars=args.max_subcall_chars,
+        # In-process sub-calls can take minutes each; without an in-call check a
+        # single code cell looping over slices sails past the per-step deadline.
+        subcall_deadline_check=(args.sub_backend == "kvpress"),
     )
 
     for mode in modes:
-        slug = args.root_model.replace("/", "_")
-        task_slug = (args.data_dir or "default").replace("/", "_")
-        # Anything that changes results must be in the directory name, or two
-        # configurations share a checkpoint.jsonl and silently merge. (compare.py
-        # reads config.yaml, not this name, so nothing else depends on the format.)
-        components = [dataset_name, task_slug, slug, mode]
-        if mode == "rlm" and args.max_context_tokens is not None:
-            components.append(f"ctx{args.max_context_tokens}")
-        if mode == "rlm" and scratchpad is not None:
-            components.append("scratchpad")
-        run_dir = out_dir / "__".join(components)
+        run_dir = out_dir / "__".join(build_run_dir_components(args, mode, scratchpad))
         run_dir.mkdir(parents=True, exist_ok=True)
         res_path = run_dir / "checkpoint.jsonl"
         tdir = run_dir / "transcripts"
@@ -326,6 +446,8 @@ def main() -> None:
                         record.update(vstats)
                     else:
                         r = rlm.run(ex["context"], question)
+                        if hasattr(sub, "pop_example_stats"):
+                            r.metrics["sub_kv"] = sub.pop_example_stats() or None
                         record.update(
                             pred=r.answer,
                             steps=r.steps,
@@ -396,6 +518,14 @@ def main() -> None:
             "exec_timeout": args.exec_timeout or None,
             "run_timeout": args.run_timeout or None,
             "max_sub_calls": args.max_sub_calls or None,
+            "sub_backend": args.sub_backend,
+            "press": args.press if args.sub_backend == "kvpress" else None,
+            "compression_ratio": args.compression_ratio if args.sub_backend == "kvpress" else None,
+            "max_subcall_chars": args.max_subcall_chars,
+            "sub_max_tokens": args.sub_max_tokens if args.sub_backend == "kvpress" else None,
+            "sub_attn": args.sub_attn if args.sub_backend == "kvpress" else None,
+            "sub_max_context_tokens": args.sub_max_context_tokens if args.sub_backend == "kvpress" else None,
+            "press_min_tokens": args.press_min_tokens if args.sub_backend == "kvpress" else None,
         }
         metrics = write_run_artifacts(
             res_path,
