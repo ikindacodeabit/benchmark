@@ -32,10 +32,38 @@ DATASETS="${DATASETS:-nq hotpotqa musique qampari quest}"
 RESULTS="${RESULTS:-evaluation/results/loft128k}"
 LOGS="${LOGS:-$RESULTS/logs}"
 VENV="${VENV:-.venv}"
-# 8 GB of weights plus enough KV for at least one 128k sequence.
-MIN_FREE_MIB="${MIN_FREE_MIB:-30000}"
+# Second venv for the kvpress-backed arm 4 and the kvzip vanilla baseline. The
+# RLM venv above pins transformers==4.51.3 for the vLLM server; kvpress needs
+# >=4.56 (new Cache API), so the two cannot share an environment. The benchmark
+# DRIVER imports neither vllm nor transformers by itself, so arm 4 runs the
+# driver from THIS venv (hosting the compressed sub model in-process) while the
+# root still talks HTTP to the vLLM server from the other venv.
+KVPRESS_VENV="${KVPRESS_VENV:-.venv-kvpress}"
+
+# --- arm-4 colocation mode (KVPRESS_ARMS=1) -----------------------------------
+# Arm 4 puts TWO models on one card: the vLLM root server plus the in-process HF
+# sub model. The root never sees the document (it reads REPL observations, ~6k
+# chars/turn), so its window shrinks from 139264 to KV_ROOT_MAX_LEN and its
+# memory ceiling drops to leave SUB_RESERVE_MIB for the sub model. Budget on an
+# empty 48 GB (49140 MiB) card:
+#   vLLM at util<=0.44           -> ~21.6 GB (8 weights + overhead + KV pool;
+#                                   one 65536-token sequence needs ~9.2 GB of KV
+#                                   and vLLM refuses to start if it cannot fit)
+#   HF sub reservation ~16 GB    -> 8.1 weights + 4.9 GB KV for a 34k-token call
+#                                   (KVzip MASKS keys, it does not free them, so
+#                                   plan for the full uncompressed KV) + ~2.5 GB
+#                                   scoring transient
+#   total ~37 GB, ~11 GB margin for co-tenants.
+if [ -n "${KVPRESS_ARMS:-}" ]; then
+    MIN_FREE_MIB="${MIN_FREE_MIB:-38000}"
+else
+    # 8 GB of weights plus enough KV for at least one 128k sequence.
+    MIN_FREE_MIB="${MIN_FREE_MIB:-30000}"
+fi
 # Leave headroom so a co-tenant's job growing slightly does not OOM the server.
 HEADROOM_MIB="${HEADROOM_MIB:-2000}"
+SUB_RESERVE_MIB="${SUB_RESERVE_MIB:-16000}"
+KV_ROOT_MAX_LEN="${KV_ROOT_MAX_LEN:-65536}"
 
 # Some infolab hosts mix A6000 (sm_86) and RTX 6000 Ada (sm_89). CUDA orders
 # devices FASTEST_FIRST by default while nvidia-smi reports PCI order, so without
@@ -47,9 +75,9 @@ export PYTHONUNBUFFERED=1
 # Validate the subcommand first, so a typo reports itself rather than surfacing as
 # a scratch or missing-activate error.
 case "${1:-}" in
-auto | serve | run | setup) ;;
+auto | serve | run | setup | kvzip-baseline) ;;
 *)
-    echo "usage: $0 {setup|auto|serve|run}" >&2
+    echo "usage: $0 {setup|auto|serve|run|kvzip-baseline}" >&2
     exit 2
     ;;
 esac
@@ -156,7 +184,75 @@ if not hasattr(tok, "all_special_tokens_extended"):
 print(f"tokenizer OK: {type(tok).__name__}, vocab {len(tok)}")
 PY
 
+    # --- kvpress venv (arm 4 + kvzip baseline) --------------------------------
+    # Installed via explicit $KVPRESS_VENV/bin paths, not activate, so the RLM
+    # venv sourced above stays the active one for the rest of setup.
+    echo "--- setting up $KVPRESS_VENV (kvpress arm) ---"
+    if [ ! -f "$KVPRESS_VENV/bin/activate" ]; then
+        if command -v uv >/dev/null 2>&1; then
+            uv venv "$KVPRESS_VENV"
+        else
+            python3 -m venv "$KVPRESS_VENV" || {
+                python3 -m venv --without-pip "$KVPRESS_VENV"
+                curl -sS https://bootstrap.pypa.io/get-pip.py | "$KVPRESS_VENV/bin/python"
+            }
+        fi
+    fi
+    # Torch FIRST and pinned: 2.6.0 ships cu124 wheels, which the infolab
+    # CUDA-12.5 driver accepts (an unpinned resolve can grab a cu13x build that
+    # dies at init with "driver too old"). It satisfies kvpress's >=2.3.1,<3, so
+    # the editable install below keeps it.
+    "$KVPRESS_VENV/bin/pip" install "torch==${KVPRESS_TORCH_VERSION:-2.6.0}"
+    "$KVPRESS_VENV/bin/pip" install -e ".[eval]"
+    if [ -n "${TRANSFORMERS_KVPRESS_VERSION:-}" ]; then
+        # Escape hatch if a fresh transformers release breaks kvpress.
+        "$KVPRESS_VENV/bin/pip" install "transformers==$TRANSFORMERS_KVPRESS_VERSION"
+    fi
+
+    # Probe the exact seams arm 4 depends on, HERE, where the error message can
+    # say what to fix -- not five minutes into a GPU run.
+    MODEL="$MODEL" "$KVPRESS_VENV/bin/python" - <<'PY'
+import os
+
+import torch
+import transformers
+
+print(f"torch {torch.__version__}, cuda {torch.version.cuda}")
+print(f"transformers {transformers.__version__}")
+
+from transformers import DynamicCache
+
+assert hasattr(DynamicCache(), "layers"), (
+    "transformers too old for kvpress (no Cache.layers); "
+    "need >=4.56 in this venv (TRANSFORMERS_KVPRESS_VERSION=... to override)"
+)
+
+from kvpress import KVzipPress
+
+press = KVzipPress()
+press.compression_ratio = 0.5
+print(f"kvpress OK: {type(press).__name__}(compression_ratio={press.compression_ratio})")
+
+from evaluation.rlm.kvpress_backend import SUB_PRESS_CHOICES  # import-graph check
+
+print(f"kvpress_backend OK: presses {SUB_PRESS_CHOICES}")
+
+from transformers import AutoTokenizer
+
+tok = AutoTokenizer.from_pretrained(os.environ["MODEL"], trust_remote_code=True)
+rendered = tok.apply_chat_template(
+    [{"role": "user", "content": "probe"}],
+    add_generation_prompt=True,
+    tokenize=False,
+    enable_thinking=False,
+)
+assert "probe" in rendered
+print("chat template OK (tolerates enable_thinking)")
+PY
+
     echo "setup done. Next: DATASETS=\"nq\" LENGTH=32k LIMIT=3 SERVERS=1 $0 auto"
+    echo "arm 4:      KVPRESS_ARMS=1 KV_RATIOS=0.5 DATASETS=nq LENGTH=32k LIMIT=1 SERVERS=1 $0 auto"
+    echo "cell 5:     DATASETS=nq KV_RATIOS=0.5 $0 kvzip-baseline"
     exit 0
 fi
 
@@ -188,16 +284,37 @@ util_for() {
         'BEGIN{u=(f-h)/t; if(u>0.85)u=0.85; if(u<0.50)u=0.50; printf "%.2f", u}'
 }
 
+# Colocation variant: additionally subtract the HF sub model's reservation, and
+# clamp lower -- the server shares the card with a ~16 GB in-process tenant.
+# When SUB_GPUS is set the sub model has its own card and the plain shape is used.
+kv_util_for() {
+    local idx="$1" free total
+    free=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits -i "$idx")
+    total=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits -i "$idx")
+    awk -v f="$free" -v t="$total" -v h="$HEADROOM_MIB" -v s="$SUB_RESERVE_MIB" \
+        'BEGIN{u=(f-h-s)/t; if(u>0.44)u=0.44; if(u<0.30)u=0.30; printf "%.2f", u}'
+}
+
 serve_on() {
-    local idx="$1" port="$2" util
-    util=$(util_for "$idx")
-    echo "GPU $idx -> port $port, --gpu-memory-utilization $util"
-    # --max-model-len 139264 = 131072 of LOFT context + headroom. Qwen3-4B-2507 is
-    # natively 262144, so no YaRN. No --reasoning-parser: 2507 is non-thinking.
+    local idx="$1" port="$2" util maxlen
+    if [ -n "${KVPRESS_ARMS:-}" ] && [ -z "${SUB_GPUS:-}" ]; then
+        # Arm-4 colocation: root shares the card with the in-process sub model.
+        # The root only ever sees REPL transcripts, never the document, so a
+        # smaller window is safe; an overlong transcript 400s, is recorded as an
+        # error, and is retried on resume (raise KV_ROOT_MAX_LEN if it recurs).
+        util=$(kv_util_for "$idx")
+        maxlen="$KV_ROOT_MAX_LEN"
+    else
+        util=$(util_for "$idx")
+        # --max-model-len 139264 = 131072 of LOFT context + headroom. Qwen3-4B-2507
+        # is natively 262144, so no YaRN. No --reasoning-parser: 2507 is non-thinking.
+        maxlen=139264
+    fi
+    echo "GPU $idx -> port $port, --max-model-len $maxlen, --gpu-memory-utilization $util"
     CUDA_VISIBLE_DEVICES="$idx" vllm serve "$MODEL" \
         --served-model-name "$MODEL" \
         --port "$port" \
-        --max-model-len 139264 \
+        --max-model-len "$maxlen" \
         --gpu-memory-utilization "$util" \
         --enforce-eager -O0
 }
@@ -226,6 +343,7 @@ run)
     for ds in $DATASETS; do
         DATASET="$ds" LENGTH="$LENGTH" PORT="$PORT" LIMIT="$LIMIT" \
             RESULTS="$RESULTS" MODEL="$MODEL" LOGS="$LOGS" \
+            KVPRESS_PYTHON="$KVPRESS_VENV/bin/python" \
             bash evaluation/rlm/loft128k/run_cells.sh
     done
     ;;
@@ -267,15 +385,26 @@ auto)
         echo "server ready on port $p"
     done
 
+    # In arm-4 mode the sub model colocates with its lane's server by default;
+    # SUB_GPUS="i j ..." instead deals dedicated sub cards to the lanes (and the
+    # servers then keep the full 139264 window).
+    read -r -a SUB_ARR <<<"${SUB_GPUS:-}"
+
     WPIDS=()
     for i in "${!GPUS[@]}"; do
         p=$((PORT + i))
+        sub_gpu="${GPUS[$i]}"
+        if [ "${#SUB_ARR[@]}" -gt 0 ]; then
+            sub_gpu="${SUB_ARR[$((i % ${#SUB_ARR[@]}))]}"
+        fi
         (
             for j in "${!DS_ARR[@]}"; do
                 # Deal datasets round-robin so each server gets a fair share.
                 if [ $((j % ${#GPUS[@]})) -eq "$i" ]; then
                     DATASET="${DS_ARR[$j]}" LENGTH="$LENGTH" PORT="$p" LIMIT="$LIMIT" \
                         RESULTS="$RESULTS" MODEL="$MODEL" LOGS="$LOGS" \
+                        KVPRESS_PYTHON="$KVPRESS_VENV/bin/python" \
+                        RLM_SUB_GPU="$sub_gpu" \
                         bash evaluation/rlm/loft128k/run_cells.sh || true
                 fi
             done
@@ -289,8 +418,58 @@ auto)
     exit "$FAILED"
     ;;
 
+kvzip-baseline)
+    # Cell 5: vanilla model + KVzip through the standard kvpress evaluate.py
+    # path -- the press-only baseline the RLM arms are compared against. Pure
+    # launcher: all logic already exists in evaluation/evaluate.py. LOFT shares
+    # ONE corpus per subset, so each (dataset, ratio) pays a single ~119k-token
+    # KVzip prefill (KVzip scores in extra passes, expect 10-20 min) amortized
+    # over all questions. Resumable: evaluate.py skips completed run dirs.
+    if [ ! -f "$KVPRESS_VENV/bin/python" ]; then
+        echo "ERROR: no venv at $KVPRESS_VENV. Run '$0 setup' first." >&2
+        exit 1
+    fi
+    KVPY_ABS="$(cd "$KVPRESS_VENV" && pwd)/bin/python"
+    # One 119k-token prefill needs ~17 GB of KV on top of ~8 GB of weights.
+    BASELINE_MIN_FREE_MIB="${BASELINE_MIN_FREE_MIB:-33000}"
+    MIN_FREE_MIB="$BASELINE_MIN_FREE_MIB"
+    GPU_PICK="$(pick_gpus 1)"
+    if [ -z "$GPU_PICK" ]; then
+        echo "ERROR: no GPU has ${MIN_FREE_MIB} MiB free. Current state:" >&2
+        nvidia-smi --query-gpu=index,memory.free,utilization.gpu --format=csv >&2
+        exit 1
+    fi
+    echo "kvzip baseline on GPU $GPU_PICK"
+    OUT_ABS="$(pwd)/${KV_BASELINE_RESULTS:-evaluation/results/loft128k_kvpress}"
+    mkdir -p "$OUT_ABS"
+    FAILED=0
+    for ds in $DATASETS; do
+        for R in ${KV_RATIOS:-0.5 0.75}; do
+            echo "=== $(date '+%F %T') :: kvzip baseline :: ${ds}_${LENGTH} ratio $R ==="
+            # evaluate.py's imports are flat (from benchmarks... import), so it
+            # must run with cwd=evaluation/.
+            (
+                cd evaluation &&
+                    CUDA_VISIBLE_DEVICES="$GPU_PICK" "$KVPY_ABS" evaluate.py \
+                        --dataset loft \
+                        --data_dir "${ds}_${LENGTH}" \
+                        --model "$MODEL" \
+                        --press_name "${KV_PRESS:-kvzip}" \
+                        --compression_ratio "$R" \
+                        --device cuda:0 \
+                        --fraction "${FRACTION:-1.0}" \
+                        --output_dir "$OUT_ABS"
+            ) || {
+                echo "WARN: kvzip baseline ${ds}_${LENGTH} ratio $R failed" >&2
+                FAILED=1
+            }
+        done
+    done
+    exit "$FAILED"
+    ;;
+
 *)
-    echo "usage: $0 {auto|serve|run}" >&2
+    echo "usage: $0 {setup|auto|serve|run|kvzip-baseline}" >&2
     exit 2
     ;;
 esac

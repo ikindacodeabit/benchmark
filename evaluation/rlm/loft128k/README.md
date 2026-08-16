@@ -1,18 +1,21 @@
-# LOFT-128k: vanilla vs RLM vs RLM+scratchpad
+# LOFT-128k: vanilla vs RLM vs RLM+scratchpad vs RLM+scratchpad+KV-compression
 
-Three arms on LOFT's five RAG subsets at 128k context, served by
-`Qwen/Qwen3-4B-Instruct-2507`.
+Experiment arms on LOFT's five RAG subsets at 128k context, all on
+`Qwen/Qwen3-4B-Instruct-2507`:
 
 | arm | invocation | what it tests |
 |---|---|---|
 | `vanilla` | `--mode both` | the whole 131k-token document in the context window |
 | `rlm` | `--mode both` | document held in a REPL variable, root model chunks and recurses |
 | `rlm+scratchpad` | `--mode rlm --scratchpad` | same, plus a persistent `note()` buffer that survives eviction |
+| `rlm+scratchpad+press` (4a) | `... --sub-backend kvpress` | sub-calls read their slice through a KVzip-compressed KV cache, same 32k-char chunks as arms 2–3 (isolates the press effect) |
+| `rlm+scratchpad+press` (4b) | `... --sub-backend kvpress --max-subcall-chars 131072` | same, but ~32k-TOKEN chunks — fewer, bigger reads, the regime compression is supposed to enable |
+| `vanilla+press` (cell 5) | `run_infolab.sh kvzip-baseline` | the press alone, through the standard kvpress `evaluate.py` path |
 
 `--mode both` produces the first two arms in one pass, so the vanilla arm is not
-recomputed for the scratchpad comparison. The three land in separate run
-directories (the run-dir name carries a `scratchpad` component), and each is
-resumable through its own `checkpoint.jsonl`.
+recomputed for the scratchpad comparison. Every arm lands in its own run
+directory (the run-dir name carries `scratchpad` / press+ratio / `subN`
+components), and each is resumable through its own `checkpoint.jsonl`.
 
 ## Why this model
 
@@ -89,6 +92,89 @@ cards.
 Each subset is 110 examples: `_load_loft` concatenates **dev (10) then test
 (100)**, in that order. So `LIMIT` values of 10 or less sample the dev split only
 — fine for a smoke test, not a result. `LIMIT=110` is the whole subset.
+
+## The KV-compression arms (4a/4b and the kvzip baseline)
+
+### Two venvs, one driver
+
+The vLLM **server** needs `transformers==4.51.3` (5.x removed
+`all_special_tokens_extended`); kvpress needs `transformers>=4.56` (the new
+`Cache.layers` API). They cannot share an environment, so `setup` creates two:
+`.venv` serves vLLM, `.venv-kvpress` runs everything press-related. The trick
+that makes arm 4 work with no HTTP shim: the benchmark **driver** imports
+neither vllm nor transformers on its own, so it runs from `.venv-kvpress`,
+talks to the vLLM ROOT server over HTTP, and hosts the compressed SUB model
+in-process (`evaluation/rlm/kvpress_backend.py`).
+
+### What actually changes inside the RLM
+
+With `--sub-backend kvpress` the REPL tool becomes
+`llm_query(question, context_text)`: the slice rides through
+`KVPressTextGenerationPipeline`, which compresses ONLY the slice's KV during
+prefill; the question (and `SUB_SYSTEM_PROMPT`) stay uncompressed. Two
+documented deviations from the NIM path:
+
+1. the kvpress pipeline has no system-role support, so the sub system prompt is
+   prepended to the question side (identical across 4a/4b/ratios, so internal
+   comparisons stay valid);
+2. **KVzip here is logical compression** — evicted keys are masked via the
+   attention patch, not freed — so `retained`-token metrics are quality knobs,
+   not memory savings. Budget GPU memory for the full uncompressed KV.
+
+### Colocation budget (one 48 GB card, `KVPRESS_ARMS=1`)
+
+The root never sees the document (only REPL transcripts), so its server shrinks
+to make room for the in-process sub model:
+
+| tenant | memory |
+|---|---|
+| vLLM root, `--max-model-len 65536`, util ≤ 0.44 | ~21.6 GB (8 weights + overhead + KV pool) |
+| HF sub model | ~8.1 GB weights |
+| one 34k-token sub prefill (full KV — KVzip masks, doesn't free) | ~4.9 GB |
+| KVzip scoring transient | ~2.5 GB |
+| **total** | **~37 GB** (≈11 GB margin for co-tenants) |
+
+A root transcript that outgrows 65536 tokens gets a 400, is recorded as a
+harness error, and is retried on resume — raise `KV_ROOT_MAX_LEN` if it
+recurs. `SUB_GPUS="i j"` instead deals dedicated sub cards to the lanes and the
+servers keep the full 139264 window.
+
+### Running
+
+```bash
+# one-example smoke, arm 4a then 4b, at 32k
+KVPRESS_ARMS=1 KV_RATIOS=0.5 KV_ARMS=4a DATASETS=nq LENGTH=32k LIMIT=1 SERVERS=1 \
+    bash evaluation/rlm/loft128k/run_infolab.sh auto
+KVPRESS_ARMS=1 KV_RATIOS=0.5 KV_ARMS=4b DATASETS=nq LENGTH=32k LIMIT=1 SERVERS=1 \
+    bash evaluation/rlm/loft128k/run_infolab.sh auto
+
+# the real grid: 5 datasets x {0.5, 0.75} x {4a, 4b}
+KVPRESS_ARMS=1 LENGTH=128k bash evaluation/rlm/loft128k/run_infolab.sh auto
+
+# cell 5: press-only baseline through evaluate.py (smoke with FRACTION=0.02)
+DATASETS=nq KV_RATIOS=0.5 FRACTION=0.02 bash evaluation/rlm/loft128k/run_infolab.sh kvzip-baseline
+bash evaluation/rlm/loft128k/run_infolab.sh kvzip-baseline
+```
+
+`KVPRESS_ARMS=1` runs ONLY the arm-4 lanes. Deliberate: the colocated server has
+a reduced window, and a vanilla arm pointed at it would shrink-retry and merge
+truncated rows into the existing vanilla checkpoints.
+
+KVzip pays 2–3 extra prefill passes for its scoring, so a 4b sub-call on a
+32k-token slice runs about a minute; the lanes budget for it
+(`--run-timeout 2400/3600`, `--sub-max-tokens 512`, `--max-sub-calls 40/16`).
+
+### Reading the results
+
+Two run-level numbers in `metrics.json → runtime` decide whether the arm
+measured anything:
+
+- **`sub_split_call_fraction`** — how often the root actually used the two-arg
+  form. Near 0 means the arm degenerated to dense one-arg calls and is NOT
+  measuring the press.
+- **`average_sub_retained_context_tokens`** vs `average_sub_context_tokens` —
+  the sub-side analogue of KVPress's `average_retained_context_tokens`; the
+  ratio between them should track `--compression-ratio`.
 
 ### Prajna
 
