@@ -3,11 +3,24 @@
 
 import json
 import logging
+import os
 import random
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
+
+
+# Optional torchao/kernels are not required by KVPress evaluation.  On this
+# cluster the installed torchao wheel contains extensions for a different
+# build, so loading them produces noisy warnings before Transformers falls
+# back to ordinary PyTorch kernels.  Slurm launchers enable this guard; the
+# environment check preserves the previous behavior for other callers.
+if os.getenv("KVPRESS_DISABLE_OPTIONAL_KERNEL_WARNINGS") == "1":
+    os.environ.setdefault("TORCHAO_FORCE_SKIP_LOADING_SO_FILES", "1")
+    os.environ.setdefault("USE_HUB_KERNELS", "NO")
+    logging.getLogger("torchao").setLevel(logging.ERROR)
+    logging.getLogger("transformers.integrations.hub_kernels").setLevel(logging.ERROR)
 
 import numpy as np
 import pandas as pd
@@ -37,6 +50,52 @@ from kvpress import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _validate_finegrained_fp8_hardware(model_config: Any, model_kwargs: Dict[str, Any]) -> None:
+    """Fail early when a pre-quantized FP8 checkpoint is placed on an old GPU.
+
+    Qwen's fine-grained FP8 checkpoints require NVIDIA compute capability
+    8.9 or newer for the FP8 matrix-multiply path.  In particular, DGX A100
+    nodes are SM80.  Letting Transformers load the checkpoint on SM80 first
+    causes a long weight materialization followed by the opaque
+    ``grouped_mm`` Float8_e4m3fn error.  This guard affects only FP8 models;
+    all ordinary and AWQ/GPTQ model paths are unchanged.
+    """
+    configured_quantization = model_kwargs.get("quantization_config")
+    checkpoint_quantization = getattr(model_config, "quantization_config", None)
+    quantization_sources = (configured_quantization, checkpoint_quantization)
+    quantization_methods = []
+    for source in quantization_sources:
+        if source is None:
+            continue
+        method = getattr(source, "quant_method", None)
+        if method is None and isinstance(source, dict):
+            method = source.get("quant_method")
+        quantization_methods.append(str(method or "").lower())
+    is_fp8 = any("fp8" in method for method in quantization_methods)
+    if not is_fp8:
+        return
+
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "This checkpoint uses fine-grained FP8 weights and requires a CUDA GPU. "
+            "Use an NVIDIA GPU with compute capability >= 8.9 (for example L40/H100), "
+            "or use a BF16/AWQ/GPTQ checkpoint."
+        )
+
+    capability = torch.cuda.get_device_capability()
+    if capability >= (8, 9):
+        return
+
+    raise RuntimeError(
+        "Unsupported hardware for fine-grained FP8 checkpoint: detected CUDA compute "
+        f"capability {capability[0]}.{capability[1]} (SM{capability[0]}{capability[1]}). "
+        "This FP8 path requires compute capability >= 8.9. DGX A100/SM80 nodes "
+        "cannot run Qwen3 FP8 grouped_mm; submit the L40 job instead, or use a "
+        "BF16/AWQ/GPTQ checkpoint. This is a model/backend hardware limitation, "
+        "not a KVPress compression error."
+    )
 
 
 def _reference_for_log(df: pd.DataFrame, index: Any) -> Any:
@@ -79,7 +138,7 @@ class EvaluationConfig:
     hidden_states_buffer_size: Optional[int] = None
 
     # Output and logging
-    output_dir: str = "./results"
+    output_dir: str = "../benchmark_artifacts/results/default"
     log_level: str = "INFO"
 
     # Model-specific parameters
@@ -442,7 +501,10 @@ class EvaluationRunner:
             device = "auto" if torch.cuda.is_available() else "cpu"
             logger.info(f"No device specified, auto-detected device: {device}")
 
-        model_kwargs = self.config.model_kwargs or {}
+        # Keep the configured mapping reusable across matrix runs.  Loader-only
+        # controls are removed from this copy before calling Transformers.
+        model_kwargs = dict(self.config.model_kwargs or {})
+        gptq_backend = model_kwargs.pop("gptq_backend", None)
 
         if self.config.fp8:
             model_kwargs["quantization_config"] = FineGrainedFP8Config()
@@ -479,18 +541,143 @@ class EvaluationRunner:
 
         logger.info(f"Loading model pipeline for: {model_name} on device: {device} with model_kwargs: {model_kwargs}")
         model_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+        _validate_finegrained_fp8_hardware(model_config, model_kwargs)
         if model_config.model_type == "qwen3_5":
-            # Qwen3.5 checkpoints advertise a conditional-generation class.  Use
-            # its text-only path explicitly; no image/video tensors are supplied.
-            from transformers import Qwen3_5ForConditionalGeneration
+            quantization_config = getattr(model_config, "quantization_config", None)
+            is_prequantized = quantization_config is not None
+            quantization_dict = (
+                quantization_config.to_dict()
+                if hasattr(quantization_config, "to_dict")
+                else dict(quantization_config or {})
+            )
+            is_dynamic_gptq = (
+                str(quantization_dict.get("quant_method", "")).lower() == "gptq"
+                and bool(quantization_dict.get("dynamic"))
+            )
+
+            if is_dynamic_gptq:
+                # Qwen3.5's selective GPTQ checkpoint uses the newer hybrid
+                # model/GPTQ integration.  Transformers 5.2 can materialize
+                # the model but produces invalid generations; fail before any
+                # benchmark answers are written instead of silently scoring
+                # corrupted output.
+                import transformers
+                from packaging.version import Version
+
+                if Version(transformers.__version__) < Version("5.3.0"):
+                    raise RuntimeError(
+                        "Qwen3.5 dynamic GPTQ requires Transformers >= 5.3.0. "
+                        f"Found {transformers.__version__}; use the isolated "
+                        "kvpress-tf515 environment or a newer Transformers runtime."
+                    )
+                # The official dense Qwen3.5 GPTQ checkpoint stores only its
+                # MLP projections as qweight/qzeros/scales/g_idx and excludes
+                # every attention/DeltaNet projection through `dynamic`.
+                # Transformers 5.2.0's Optimum bridge does not carry that
+                # GPTQModel-specific field into layer conversion, but it does
+                # honor modules_in_block_to_quantize. Translate the equivalent
+                # rule before loading the text-only model.
+                dynamic = quantization_dict["dynamic"]
+                if "-:.*attn.*" not in dynamic:
+                    raise NotImplementedError(
+                        "This Qwen3.5 selective GPTQ layout is not supported: "
+                        "expected the checkpoint to exclude all attention modules"
+                    )
+                quantization_dict["modules_in_block_to_quantize"] = [
+                    ["mlp.gate_proj", "mlp.up_proj"],
+                    ["mlp.down_proj"],
+                ]
+                # The CUDA Triton kernel is available on the benchmark GPUs;
+                # selecting it avoids probing the unavailable CPU/HF kernel.
+                quantization_dict["backend"] = (gptq_backend or "triton").lower()
+                # The checkpoint's quantization_config has no `checkpoint_format`
+                # field. GPTQModel's from_quant_config() treats a missing field
+                # as "compat: default to gptq(v1) when loading models" and, for
+                # kernels that require v2 (TritonV2QuantLinear does), silently
+                # adds +1 to every packed zero-point to correct a v1-era
+                # off-by-one convention. This checkpoint was not produced by
+                # that legacy pipeline, so nothing needs correcting; treat it
+                # as already gptq_v2 to skip that transform.
+                quantization_dict["checkpoint_format"] = "gptq_v2"
+                model_config.quantization_config = quantization_dict
+                logger.info(
+                    "Loading selective Qwen3.5 GPTQ checkpoint with only MLP projections quantized "
+                    "(backend=%s)",
+                    quantization_dict["backend"],
+                )
 
             tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
             load_kwargs = dict(model_kwargs)
-            if device == "auto":
-                load_kwargs["device_map"] = "auto"
-            model = Qwen3_5ForConditionalGeneration.from_pretrained(model_name, **load_kwargs)
+
+            # Text-only Qwen3.5/3.6 checkpoints are published with the
+            # conditional-generation (vision + language) configuration, but
+            # this benchmark never supplies images or videos.  Loading the
+            # conditional class needlessly materializes the vision tower and
+            # can also leave the text FP8 scale tensors unmapped.  Use the
+            # Transformers text class with the embedded text configuration;
+            # its checkpoint conversion mapping handles the
+            # ``model.language_model.*`` prefixes.
+            #
+            # Dynamic GPTQ Qwen3.5 checkpoints must also use the text class.
+            # Loading them through Qwen3_5ForConditionalGeneration causes the
+            # GPTQ projection names to be reported as MISSING/UNEXPECTED and
+            # produces invalid generations.  The nested text config preserves
+            # the checkpoint's model.language_model.* mapping.
+            use_text_only_qwen = hasattr(model_config, "text_config")
+            if use_text_only_qwen:
+                from transformers import Qwen3_5ForCausalLM
+
+                text_config = model_config.text_config
+                # The parent config carries the official FP8 metadata on
+                # some checkpoints.  Preserve it when the nested text config
+                # does not expose its own copy; this is metadata reuse, not a
+                # new quantization operation.
+                text_quantization_config = getattr(text_config, "quantization_config", None)
+                text_quantization_dict = (
+                    text_quantization_config.to_dict()
+                    if hasattr(text_quantization_config, "to_dict")
+                    else dict(text_quantization_config or quantization_dict)
+                )
+                if quantization_config is not None:
+                    # Qwen3.6 stores linear-attention in_proj_a/in_proj_b in
+                    # BF16, while in_proj_qkv/in_proj_z have FP8 weights plus
+                    # weight_scale_inv tensors.  The generic FP8 replacer
+                    # otherwise converts a/b and creates scale parameters
+                    # that do not exist in the checkpoint (LOAD REPORT:
+                    # MISSING).  Match the checkpoint layout by leaving only
+                    # these two projections in their stored BF16 form.
+                    modules_to_not_convert = list(
+                        text_quantization_dict.get("modules_to_not_convert", []) or []
+                    )
+                    for module_suffix in (
+                        "linear_attn.in_proj_a",
+                        "linear_attn.in_proj_b",
+                    ):
+                        if module_suffix not in modules_to_not_convert:
+                            modules_to_not_convert.append(module_suffix)
+                    text_quantization_dict["modules_to_not_convert"] = modules_to_not_convert
+                    text_config.quantization_config = text_quantization_dict
+                load_kwargs["config"] = text_config
+                if device == "auto":
+                    load_kwargs["device_map"] = "auto"
+                elif is_prequantized:
+                    load_kwargs["device_map"] = {"": device}
+                model = Qwen3_5ForCausalLM.from_pretrained(model_name, **load_kwargs)
+                logger.info("Loaded Qwen3.5 text-only model; vision inputs/tower are disabled.")
+            else:
+                # Preserve the existing selective-GPTQ path and its checkpoint
+                # parameter layout.  It still receives text tokens only.
+                from transformers import Qwen3_5ForConditionalGeneration
+
+                load_kwargs["config"] = model_config
+                if device == "auto":
+                    load_kwargs["device_map"] = "auto"
+                elif is_prequantized:
+                    load_kwargs["device_map"] = {"": device}
+                model = Qwen3_5ForConditionalGeneration.from_pretrained(model_name, **load_kwargs)
+                logger.info("Loaded Qwen3.5 conditional-generation model in text-only input mode.")
             pipeline_kwargs = {"model": model, "tokenizer": tokenizer}
-            if device != "auto":
+            if device != "auto" and not is_prequantized:
                 pipeline_kwargs["device"] = device
             self.pipeline = KVPressTextGenerationPipeline(**pipeline_kwargs)
         else:

@@ -101,6 +101,7 @@ class KVPressTextGenerationPipeline(Pipeline):
         assert question is None or questions is None, "Either question or questions should be provided, not both."
         questions = questions or ([question] if question else [""])
         requested_max_context_length = max_context_length
+
         if max_context_length is None:
             max_context_length = min(self.tokenizer.model_max_length, int(1e10))  # 1e10 to avoid overflow
         logger.info(
@@ -291,9 +292,10 @@ class KVPressTextGenerationPipeline(Pipeline):
         adapter = get_model_adapter(self.model)
         if cache is None:
             cache = adapter.create_cache(self.model)
-        
+
         bytes_per_token = self._compute_kv_bytes_per_token()
         compression_ratio = float(getattr(press, "compression_ratio", 0.0)) if press is not None else 0.0
+
         retained_context_tokens = max(1, int(context_length * (1 - compression_ratio)))
         budget_stats: dict[str, Any] = {}
 
@@ -371,7 +373,11 @@ class KVPressTextGenerationPipeline(Pipeline):
         get_model_adapter(self.model).truncate_cache(cache, cache_seq_lengths)
 
     def generate_answer(
-        self, question_ids: torch.Tensor, cache: Cache, context_length: int, max_new_tokens: int
+        self,
+        question_ids: torch.Tensor,
+        cache: Cache,
+        context_length: int,
+        max_new_tokens: int,
     ) -> str:
         """
         Generate an answer to a question using greedy decoding.
@@ -386,7 +392,6 @@ class KVPressTextGenerationPipeline(Pipeline):
             The length of the context.
         max_new_tokens : int
             The maximum number of new tokens to generate.
-
         Returns
         -------
         str
@@ -410,12 +415,17 @@ class KVPressTextGenerationPipeline(Pipeline):
             )
 
         # if the user doesn't provide a question, skip forward pass
-        outputs = self.model(
-            input_ids=question_ids.to(self.model.device),
-            past_key_values=cache,
-            position_ids=position_ids,
-            num_logits_to_keep=1,
-        )
+        adapter = get_model_adapter(self.model)
+        # NVIDIA KVPress forwards the complete question in one cached model
+        # call.  The standard adapter preserves that call exactly; Qwen3.5
+        # makes only its DeltaNet layers retain state across that continuation.
+        with adapter.cached_continuation(self.model):
+            outputs = self.model(
+                input_ids=question_ids.to(self.model.device),
+                past_key_values=cache,
+                position_ids=position_ids,
+                **adapter.kvzip_forward_kwargs(),
+            )
 
         if debug_generation:
             logits = outputs.logits[0, -1].float()

@@ -113,7 +113,7 @@ def main() -> None:
         default=3,
         help="recent (assistant,observation) pairs to keep verbatim under budget",
     )
-    ap.add_argument("--out", default="evaluation/results/rlm")
+    ap.add_argument("--out", default="benchmark_artifacts/results/rlm")
     ap.add_argument("--debug", action="store_true", help="print every RLM step (model reply, code, REPL output) live")
     ap.add_argument(
         "--no-think",

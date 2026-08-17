@@ -1,0 +1,19 @@
+# Select one registry dataset and one or more tasks/configurations.
+dataset: ruler32k
+data_dir:
+  - cwe
+  - niah_single_1
+model: /path/to/any-hugging-face-causal-lm
+output_dir: /path/to/direct-baseline-results
+device: cuda:0
+dtype: auto
+attn_implementation: sdpa
+local_files_only: true
+max_context_length: 32768
+max_new_tokens: null
+limit: null
+fraction: 1.0
+seed: 42
+enable_thinking: false
+do_sample: false
+log_level: INFO

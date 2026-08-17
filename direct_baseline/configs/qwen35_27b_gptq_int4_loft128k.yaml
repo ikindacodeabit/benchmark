@@ -1,0 +1,21 @@
+dataset: loft
+data_dir:
+  - nq_128k
+  - hotpotqa_128k
+  - musique_128k
+  - qampari_128k
+  - quest_128k
+model: /home/rethinkingai-self/25m0820/kvpress/Qwen3.5-27B-GPTQ-Int4
+output_dir: /home/rethinkingai-self/25m0820/kvpress/direct_baseline/outputs/qwen35_27b_gptq_int4_loft128k
+device: cuda:0
+dtype: auto
+attn_implementation: sdpa
+local_files_only: true
+max_context_length: null
+max_new_tokens: null
+limit: null
+fraction: 1.0
+seed: 42
+enable_thinking: false
+do_sample: false
+log_level: INFO

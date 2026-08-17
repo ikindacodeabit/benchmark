@@ -11,7 +11,7 @@ from pathlib import Path
 import yaml
 
 
-def main(results_dir: str = "evaluation/results/rlm") -> None:
+def main(results_dir: str = "benchmark_artifacts/results/rlm") -> None:
     result_root = Path(results_dir)
     common_runs = []
     for metrics_path in sorted(result_root.rglob("metrics.json")):
@@ -74,4 +74,4 @@ def main(results_dir: str = "evaluation/results/rlm") -> None:
 
 
 if __name__ == "__main__":
-    main(sys.argv[1] if len(sys.argv) > 1 else "evaluation/results/rlm")
+    main(sys.argv[1] if len(sys.argv) > 1 else "benchmark_artifacts/results/rlm")

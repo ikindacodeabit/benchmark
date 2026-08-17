@@ -1,0 +1,31 @@
+# Full synthetic-kv 64k matrix for Qwen3.5-27B-GPTQ-Int4: baseline (no_press)
+# + every SYNTHETIC_ALL_BUDGETS budget under KVzip, one model load. Driven by
+# run_matrix.py --profile=synthetic-kv-64k-qwen35-27b-gptq-all-budgets, which
+# validates dataset/exact_tasks/fraction/press_name/model_basename against
+# this file (see matrix_constants.py) and substitutes press_name=no_press for
+# the baseline pass automatically. Uses the updated 64k dataset id
+# (ollamaweights/synthetic-dataset-1208-64k, set in registry.py).
+output_dir: "../benchmark_artifacts/results/synthetic_kv/64k/runs/results_synthetic_kv_64k_qwen35_27b_gptq_all_budgets"
+
+model: "/home/rethinkingai-self/25m0820/kvpress/Qwen3.5-27B-GPTQ-Int4"
+dataset: "synthetic_kv"
+data_dir:
+  - "64k"
+
+press_name: "kvzip"
+compression_ratio: 0.01
+memory_budget: null
+
+fraction: 1.0
+max_new_tokens: null
+max_context_length: null
+query_aware: false
+needle_depth: null
+synthetic_kv_metadata_override: false
+seed: 42
+
+device: "cuda:0"
+fp8: false
+int8: false
+int4: false
+model_kwargs: {}

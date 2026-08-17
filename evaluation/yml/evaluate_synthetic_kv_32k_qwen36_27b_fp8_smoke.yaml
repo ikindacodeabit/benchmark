@@ -1,0 +1,28 @@
+# Smoke test: confirm the Qwen3.6-27B-FP8 checkpoint produces coherent
+# generations under the official Transformers loading path in evaluate.py.
+output_dir: "../benchmark_artifacts/results/synthetic_kv/32k/runs/results_synthetic_kv_32k_qwen36_27b_fp8_smoke"
+
+model: "/home/rethinkingai-self/25m0820/kvpress/Qwen3.6-27B-FP8"
+dataset: "synthetic_kv_32k"
+data_dir:
+  - "32k"
+
+press_name: "no_press"
+compression_ratio: 0.0
+memory_budget: null
+
+# Same fraction used by the existing "smoke5" jobs for this dataset/task
+# (866 total rows -> 5 sampled rows).
+fraction: 0.005773672055427252
+max_new_tokens: 32
+max_context_length: null
+query_aware: false
+needle_depth: null
+synthetic_kv_metadata_override: false
+seed: 42
+
+device: "cuda:0"
+fp8: false
+int8: false
+int4: false
+model_kwargs: {}

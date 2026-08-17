@@ -214,19 +214,21 @@ Qwen2.5-7B-Instruct-1M/
 Added benchmark files:
 
 ```text
-evaluation/benchmarks/synthetic_kv/slurm/
-├── evaluate_synthetic_kv_32k_qwen25_1m_baseline.yaml
-├── evaluate_synthetic_kv_64k_qwen25_1m_baseline.yaml
-├── synthetic-kv-32k-qwen25-1m-baseline-l40.sh
-└── synthetic-kv-64k-qwen25-1m-baseline-l40.sh
+benchmark_artifacts/
+├── yml/synthetic_kv/
+│   ├── 32k/all_tasks/qwen25_1m/evaluate_synthetic_kv_32k_qwen25_1m_baseline.yaml
+│   └── 64k/all_tasks/qwen25_1m/evaluate_synthetic_kv_64k_qwen25_1m_baseline.yaml
+└── slurm_jobs/synthetic_kv/
+    ├── 32k/all_tasks/qwen25_1m/synthetic-kv-32k-qwen25-1m-baseline-l40.sh
+    └── 64k/all_tasks/qwen25_1m/synthetic-kv-64k-qwen25-1m-baseline-l40.sh
 ```
 
 Both use `no_press`, `max_context_length: null`, and one L40 GPU. Results are
 written to:
 
 ```text
-evaluation/results/results_synthetic_kv_32k_qwen25_1m_baseline/
-evaluation/results/results_synthetic_kv_64k_qwen25_1m_baseline/
+benchmark_artifacts/results/synthetic_kv/32k/runs/results_synthetic_kv_32k_qwen25_1m_baseline/
+benchmark_artifacts/results/synthetic_kv/64k/runs/results_synthetic_kv_64k_qwen25_1m_baseline/
 ```
 
 The large local model directory is excluded through the `Qwen2.5-*` entry in

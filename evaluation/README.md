@@ -19,7 +19,8 @@ Running evaluation is straightforward! Make sure you are in the `evaluation` dir
 
 Model-running commands read `evaluate_config.yaml`. The active default is the
 non-quantized Synthetic-KV 32K native-context baseline. Local reference
-templates can be kept in `yml/`, which is intentionally ignored by Git.
+templates can be kept in `../benchmark_artifacts/yml/`, which is intentionally
+ignored by Git.
 If you want, you can override the settings via command line, for instance:
 
 ```bash
@@ -27,16 +28,17 @@ python evaluate.py --dataset loogle --data_dir shortdep_qa --model meta-llama/Me
 ```
 
 💡 Results (predictions and metrics) are automatically saved to the configured
-`output_dir`. Repository configurations keep every generated run under
-`evaluation/results/`, with one subdirectory per experiment. This directory is
-ignored by Git so local predictions and logs are not accidentally committed.
+`output_dir`. Repository configurations keep every generated run under the
+single `benchmark_artifacts/results/` tree, grouped by dataset and task/context.
+The complete `benchmark_artifacts/` directory is ignored by Git.
 
 
 ### Configuration 
 
 Use `evaluate_config.yaml` as the single, self-contained global entry point.
 Change settings such as the dataset fraction or model arguments directly in
-this file. The ignored `yml/` directory is only for local reference copies.
+this file. The ignored `../benchmark_artifacts/yml/` directory is only for
+local reference copies.
 
 Memory-budget matrices use one shared runner and one constants module. After
 setting the matching dataset in `evaluate_config.yaml`, select a profile:
@@ -73,7 +75,8 @@ At the moment, we support the following standard popular benchmarks:
 - [longbench](benchmarks/longbench/README.md)([hf link](https://huggingface.co/datasets/Xnhyacinth/LongBench))
 - [longbench-v2](benchmarks/longbenchv2/README.md)([hf link](https://huggingface.co/datasets/simonjegou/LongBench-v2))
 - [Needle in a Haystack](benchmarks/needle_in_haystack/README.md)([hf link][Paul Graham's essays](https://huggingface.co/datasets/alessiodevoto/paul_graham_essays))
-- [Synthetic-KV](benchmarks/synthetic_kv/README.md)
+- [Synthetic 32K](benchmarks/synthetic32k/README.md)
+- [Synthetic-KV 64K](benchmarks/synthetickv64k/README.md)
 
 Each dataset directory is structured as follows:
 
@@ -81,11 +84,15 @@ Each dataset directory is structured as follows:
 $dataset
 ├── README.md
 ├── calculate_metrics.py
-├── create_huggingface_dataset.py
+├── synthetic32k/
+│   └── download_dataset.sh
+└── synthetickv64k/
+    ├── create_huggingface_dataset.py
+    └── download_dataset.sh
 ```
 
 Where:
-- `create_huggingface_dataset.py` is a script that generates the Hugging Face dataset from the original dataset. Each dataset is associated with a set of parquet files with the following structure:
+- `synthetickv64k/create_huggingface_dataset.py` generates the formatted 64K Hugging Face dataset. The 32K dataset is published-only and is prepared by `synthetic32k/prepare_dataset.py`. Each compact dataset contains:
   - `context`: ... 
   - `question`: ...
   - `answer_prefix`: ...

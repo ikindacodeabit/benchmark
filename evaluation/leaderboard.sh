@@ -5,7 +5,7 @@
 dataset="ruler"
 data_dir="4096"
 model="Qwen/Qwen3-8B"
-output_dir="./results_lb"
+output_dir="../benchmark_artifacts/results/leaderboard"
 
 # Loop 1: presses not requiring to include the questions in the compression
 press_names=("random" "knorm" "snapkv" "expected_attention" "streaming_llm" "tova" "observed_attention" "qfilter" "pyramidkv" "lagkv" "keydiff" "adakv_compactor" "cur" "kvzip")

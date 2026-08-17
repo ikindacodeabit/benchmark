@@ -64,6 +64,18 @@ def main() -> int:
 
     adapter_cache = adapter.create_cache(qwen_model)
     check(isinstance(adapter_cache, Qwen3_5DynamicCache), "adapter creates the installed Qwen3.5 cache")
+    check(adapter_cache.transformer_layers == [0, 2], "cache transformer_layers matches full-attention layers")
+
+    # Exercise the exact transformer_layers assumption used by
+    # Qwen35ModelAdapter.cache_seq_lengths/truncate_cache.
+    adapter_cache.key_cache[0] = torch.zeros(1, 2, 5, 64)
+    adapter_cache.value_cache[0] = torch.zeros(1, 2, 5, 64)
+    adapter_cache.key_cache[2] = torch.zeros(1, 2, 7, 64)
+    adapter_cache.value_cache[2] = torch.zeros(1, 2, 7, 64)
+    check(adapter.cache_seq_lengths(adapter_cache) == [5, 7], "full-attention cache lengths are readable")
+    adapter.truncate_cache(adapter_cache, [3, 4])
+    check(adapter_cache.key_cache[0].shape[-2] == 3, "first full-attention cache truncates correctly")
+    check(adapter_cache.key_cache[2].shape[-2] == 4, "second full-attention cache truncates correctly")
 
     standard_model = SimpleNamespace(
         config=SimpleNamespace(
@@ -101,4 +113,3 @@ if __name__ == "__main__":
     # Transformers can leave optional kernel-loader threads alive in this
     # environment; use an explicit process exit after all checks are printed.
     os._exit(exit_code)
-

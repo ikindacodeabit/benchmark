@@ -30,8 +30,8 @@ DATASET_REGISTRY = {
     "loft": "f20180301/loft-rag",
     "ruler32k": "xAlg-AI/att-hub-ruler-32k",
     "ruler64k": "ollamaweights/Ruler-64k",
-    "synthetic_kv": "ollamaweights/synthetickv_formated",
-    "synthetic_kv_32k": "ollamaweights/synthetickv_32l",
+    "synthetic_kv": "ollamaweights/synthetic-dataset-1208-64k",
+    "synthetic_kv_32k": "ollamaweights/synthetic-dataset-1208",
 }
 
 
@@ -49,8 +49,8 @@ SCORER_REGISTRY = {
     "loft": _lazy_scorer("loft"),
     "ruler32k": _lazy_scorer("ruler32k"),
     "ruler64k": _lazy_scorer("ruler32k"),
-    "synthetic_kv": _lazy_scorer("synthetic_kv"),
-    "synthetic_kv_32k": _lazy_scorer("synthetic_kv"),
+    "synthetic_kv": _lazy_scorer("synthetickv64k"),
+    "synthetic_kv_32k": _lazy_scorer("synthetic32k"),
 }
 
 

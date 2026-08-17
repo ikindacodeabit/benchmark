@@ -43,6 +43,12 @@ def get_prerope_query_states(module: nn.Module, hidden_states: torch.Tensor) -> 
     if isinstance(module, Phi3Attention):
         qkv = module.qkv_proj(hidden_states)
         query_states = qkv[..., : num_heads * head_dim]
+    elif isinstance(module, Qwen3_5Attention):
+        # Qwen3.5 packs query and the attention gate into q_proj.  KVzip's
+        # query statistics must use only the first half (the gate is applied
+        # after attention in Qwen3_5Attention.forward).
+        q_proj = module.q_proj(hidden_states).view(bsz, q_len, -1, head_dim * 2)
+        query_states = torch.chunk(q_proj, 2, dim=-1)[0]
     elif hasattr(module, "q_proj"):
         # Assume Llama-like attention layer
         query_states = module.q_proj(hidden_states)

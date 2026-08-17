@@ -13,6 +13,8 @@ from typing import Any, Iterator, Mapping, Optional
 import pandas as pd
 from datasets import load_dataset
 
+from evaluation.benchmarks.registry import RULER_32K_TASKS
+
 logger = logging.getLogger(__name__)
 
 
@@ -110,6 +112,21 @@ def _load_synthetic_kv(
     return pd.DataFrame(expanded_rows)
 
 
+def _load_ruler32k(dataset_id: str, task: str) -> pd.DataFrame:
+    """Load one task using sparse-attention-hub's RULER32K layout."""
+    if task not in RULER_32K_TASKS:
+        valid_tasks = ", ".join(RULER_32K_TASKS)
+        raise ValueError(f"Unknown RULER32K task {task!r}; expected one of: {valid_tasks}")
+
+    logger.info("Loading RULER32K dataset: %s (config=%s, split=%s)", dataset_id, task, task)
+    # Source contract:
+    # https://github.com/skylight-org/sparse-attention-hub/tree/main/benchmark/ruler32k
+    # Each task is stored under a same-named Hugging Face config and split.
+    df = load_dataset(dataset_id, task, split=task).to_pandas()
+    df["context_length"] = 32768
+    return df
+
+
 def load_benchmark_dataset(
     dataset_name: str,
     task: Optional[str],
@@ -130,6 +147,8 @@ def load_benchmark_dataset(
             _require_task(dataset_name, task),
             synthetic_metadata_override,
         )
+    elif dataset_name == "ruler32k":
+        df = _load_ruler32k(dataset_id, _require_task(dataset_name, task))
     else:
         logger.info("Loading dataset: %s (data_dir: %s)", dataset_id, task)
         df = load_dataset(dataset_id, data_dir=task, split="test").to_pandas()

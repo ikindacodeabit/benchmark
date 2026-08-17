@@ -40,18 +40,18 @@ download datasets (HF) ──> /scratch ──> SLURM array job: run_benchmark.p
    - `uv sync --extra eval`
    - `source .venv/bin/activate`
 3. **Connectivity check** — HPC compute nodes often have no outbound internet.
-   Run `sbatch evaluation/rlm/slurm/check_net.slurm`. If it fails, ask hpc@iitb.ac.in about an
+   Run `sbatch benchmark_artifacts/slurm_jobs/rlm/setup/check_net.slurm`. If it fails, ask hpc@iitb.ac.in about an
    HTTP proxy for compute nodes, or run the harness on the login node ONLY for
    tiny smoke tests (API orchestration is light, but per Prajna policy real runs
    must not live on login nodes).
 4. **Data prep** (login node, since it needs internet):
-   - `bash evaluation/rlm/slurm/download_data.sh` — caches the shared LongBench-v2 and RULER-32K datasets under `$HF_HOME`
+   - `bash benchmark_artifacts/slurm_jobs/rlm/setup/download_data.sh` — caches the shared LongBench-v2 and RULER-32K datasets under `$HF_HOME`
    - Synthetic NIAH/RULER-style tasks are generated locally (no download needed).
 5. **Smoke test** (~5 examples): `python -m evaluation.rlm.run_benchmark --dataset niah --limit 5 --mode both`
    For a shared RULER-32K subset, use:
    `python -m evaluation.rlm.run_benchmark --dataset ruler32k --data-dir niah_single_1 --limit 5 --mode both`.
-6. **Full runs**: `sbatch evaluation/rlm/slurm/run_eval.slurm`.
-7. **Score & compare**: `python -m evaluation.rlm.score evaluation/results/rlm`
+6. **Full runs**: `sbatch benchmark_artifacts/slurm_jobs/rlm/all_tasks/run_eval.slurm`.
+7. **Score & compare**: `python -m evaluation.rlm.score benchmark_artifacts/results/rlm`
 
 Each RLM run gets its own directory containing a resumable `checkpoint.jsonl`,
 the three common result artifacts, and (for RLM mode) per-example transcripts.

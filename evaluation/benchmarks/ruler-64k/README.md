@@ -24,7 +24,8 @@ The compute-node job uses the same `HF_HOME` with Hugging Face offline mode.
 
 ## Evaluation
 
-The dedicated configuration is `evaluation/yml/evaluate_ruler64k_config.yaml`.
+The dedicated configuration is
+`benchmark_artifacts/yml/ruler/64k/all_tasks/evaluate_ruler64k_config.yaml`.
 Each array task evaluates one RULER task six times:
 
 1. KVzip reference run with compression ratio `0.01`.
@@ -48,8 +49,8 @@ reuses that model for all of its assigned tasks and budgets. Dataset text is
 loaded once per task, while every configuration receives a fresh dataframe,
 KVzip state, and KV cache.
 
-Logs are written to `kvpress/running_log/ruler64k.<job>_<task>.out` and
-`.err`. Results are written under `kvpress/evaluation/results_ruler64k_qwen`.
+Logs are kept under `kvpress/benchmark_artifacts/logs/`. Results are written
+under `kvpress/benchmark_artifacts/results/ruler/64k/`.
 
 The reported retained KV size is a logical/equivalent KVzip size. This KVPress
 implementation uses head-specific masking and does not physically reduce the

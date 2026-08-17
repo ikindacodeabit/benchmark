@@ -10,11 +10,15 @@ from typing import Generator, List
 
 import torch
 from torch import nn
+# ORIGINAL: from transformers import AutoTokenizer, Gemma3PreTrainedModel, PreTrainedModel, PreTrainedTokenizer, QuantizedCache
+# QWEN3.5 CHANGE: Cache reads/writes are delegated to the model adapter.
 from transformers import AutoTokenizer, Gemma3PreTrainedModel, PreTrainedModel, PreTrainedTokenizer
 from transformers.models.llama.modeling_llama import rotate_half
 
+# QWEN3.5 CHANGE: Qwen3.5 has hybrid full-attention and linear-attention layers.
 from kvpress.model_adapter import get_model_adapter
 from kvpress.presses.base_press import SUPPORTED_MODELS, BasePress
+# ORIGINAL: from kvpress.utils import extract_keys_and_values, get_prerope_query_states
 from kvpress.utils import get_prerope_query_states
 
 logger = logging.getLogger(__name__)
@@ -75,6 +79,8 @@ class KVzipPress(BasePress):
         self.causal_mask_score = None
         self.start_idx = 0
         self.end_idx = 0
+
+        # QWEN3.5 CHANGE: Map physical full-attention layers to dense KVzip score rows.
         self._model_adapter = None
         self._attention_layer_indices = []
         self._score_layer_position = {}
@@ -88,6 +94,8 @@ class KVzipPress(BasePress):
         1. First yield: allows initial prefilling with context
         2. After yield: performs KVzip scoring and compression using context reconstruction
         """
+        # ORIGINAL: if not isinstance(model, SUPPORTED_MODELS):
+        # QWEN3.5 CHANGE: Qwen3.5 is supported through its adapter.
         adapter = get_model_adapter(model)
         if not isinstance(model, SUPPORTED_MODELS) and not adapter.is_qwen35:
             logger.warning(f"Model {type(model)} not tested, supported models: {SUPPORTED_MODELS}")
@@ -95,7 +103,10 @@ class KVzipPress(BasePress):
         if isinstance(model, Gemma3PreTrainedModel):
             raise ValueError("KVzipPress is not supported for Gemma3ForCausalLM")
 
+        self.post_init_from_model(model)
+
         # Store model reference for later use
+        # QWEN3.5 CHANGE: Only full-attention layers receive KVzip hooks/scores.
         self._model_adapter = adapter
         self._attention_layer_indices = [idx for idx, _ in adapter.iter_kv_attention_layers(model)]
         self._score_layer_position = {
@@ -144,6 +155,11 @@ class KVzipPress(BasePress):
             # After yield: KVzip scoring and compression phase
             if self.compression_ratio > 0 and self._context_ids is not None:
                 # Now register attention hooks for compression
+                # ORIGINAL:
+                # for layer in model.model.layers:
+                #     layer.self_attn.rotary_emb = model.model.rotary_emb
+                #     hooks.append(layer.self_attn.register_forward_hook(self.forward_hook, with_kwargs=True))
+                # QWEN3.5 CHANGE: Skip DeltaNet layers, which have no growing K/V cache.
                 language_model = adapter.get_language_model(model)
                 for layer_idx, attention in adapter.iter_kv_attention_layers(model):
                     attention.rotary_emb = language_model.rotary_emb
@@ -164,17 +180,33 @@ class KVzipPress(BasePress):
         """
 
         hidden_states = kwargs["hidden_states"]
+        # ORIGINAL: cache = kwargs.get("past_key_values", None) or kwargs.get("past_key_value", None)
+        # ORIGINAL: cache_layer = cache.layers[module.layer_idx]
+        # QWEN3.5 CHANGE: The installed Qwen3.5 cache exposes top-level cache lists.
         cache = kwargs.get("past_key_values", None)
         if cache is None:
             cache = kwargs.get("past_key_value", None)
         adapter = self._model_adapter
 
+        # ORIGINAL: keys, values = extract_keys_and_values(cache, module.layer_idx)
         keys, values = adapter.get_keys_and_values(cache, module.layer_idx)
 
         # Compute importance scores for KV pairs in the prefilled context,
         # retaining only the originally prefilled KV pairs.
         keys, values = self.score_kvzip(module, hidden_states, keys, values, output[1], kwargs)
 
+        # ORIGINAL:
+        # if isinstance(cache, QuantizedCache):
+        #     cache_layer._quantized_keys = cache_layer._quantize(keys, axis=cache_layer.axis_key)
+        #     cache_layer._quantized_values = cache_layer._quantize(values, axis=cache_layer.axis_value)
+        #     cache_layer.keys = torch.zeros(0, dtype=keys.dtype, device=keys.device)
+        #     cache_layer.values = torch.zeros(0, dtype=keys.dtype, device=keys.device)
+        #     cache_layer.cumulative_length = keys.shape[2]
+        # else:
+        #     cache_layer.keys = keys
+        #     cache_layer.values = values
+        # QWEN3.5 CHANGE: Adapter preserves the original standard/quantized behavior
+        # and handles Qwen3.5's top-level key_cache/value_cache layout.
         adapter.set_keys_and_values(cache, module.layer_idx, keys, values)
 
         return output
@@ -191,33 +223,37 @@ class KVzipPress(BasePress):
         # Perform scoring through context reconstruction
         # Use the stored cache from the initial forward pass
         self.start_idx = self.prefix_length
-        total_chunks = len(chunked_context_pairs)
-        logger.info(
-            "KVzip reconstruction scoring started: %d chunks for %d context tokens",
-            total_chunks,
-            self.context_length,
-        )
-        for chunk_number, (prefill_ids, repeat_ids) in enumerate(chunked_context_pairs, start=1):
-            logger.info(
-                "KVzip reconstruction chunk %d/%d started (tokens=%d)",
-                chunk_number,
-                total_chunks,
-                prefill_ids.shape[1],
-            )
-            self.end_idx = self.start_idx + prefill_ids.shape[1]
-            # Pass the cache that was used in the initial forward pass
-            model(
-                input_ids=repeat_ids.to(model.device),
-                past_key_values=self._cache,
-                num_logits_to_keep=1,
-            )
-            self.start_idx = self.end_idx
-            logger.info("KVzip reconstruction chunk %d/%d completed", chunk_number, total_chunks)
+        # ORIGINAL:
+        # for prefill_ids, repeat_ids in chunked_context_pairs:
+        #     self.end_idx = self.start_idx + prefill_ids.shape[1]
+        #     model(
+        #         input_ids=repeat_ids.to(model.device),
+        #         past_key_values=self._cache,
+        #         num_logits_to_keep=1,
+        #     )
+        #     self.start_idx = self.end_idx
+        # QWEN3.5 CHANGE: Adapter operations are no-ops for standard models,
+        # preserving the original Qwen3 reconstruction behavior exactly.
+        context_snapshot = self._model_adapter.kvzip_snapshot_reconstruction_state(self._cache)
+        try:
+            # Keep NVIDIA KVPress's reconstruction chunks unchanged.  On
+            # Qwen3.5, only the DeltaNet layers receive their restored context
+            # state when processing each chunk.
+            with self._model_adapter.cached_continuation(model):
+                for prefill_ids, repeat_ids in chunked_context_pairs:
+                    self.end_idx = self.start_idx + prefill_ids.shape[1]
+                    self._model_adapter.kvzip_restore_reconstruction_state(self._cache, context_snapshot)
+                    model(
+                        input_ids=repeat_ids.to(model.device),
+                        past_key_values=self._cache,
+                        **self._model_adapter.kvzip_forward_kwargs(),
+                    )
+                    self.start_idx = self.end_idx
+        finally:
+            self._model_adapter.kvzip_restore_reconstruction_state(self._cache, context_snapshot)
 
         # Perform final compression
-        logger.info("KVzip score selection started")
         self.compress_post(model)
-        logger.info("KVzip score selection completed")
 
     def _chunk_fn(self, ctx_ids: torch.Tensor, chunk_size: int) -> List[torch.Tensor]:
         """
@@ -253,6 +289,9 @@ class KVzipPress(BasePress):
         ctx_ids = self._context_ids[:, self.prefix_length :].to("cpu")
 
         # initialize score values
+        # ORIGINAL: model.config.num_hidden_layers,
+        # ORIGINAL: model.config.num_key_value_heads,
+        # QWEN3.5 CHANGE: Score only full-attention layers and read the text config.
         text_config = self._model_adapter.get_text_config(model)
         self.score_val = torch.zeros(
             (
@@ -329,7 +368,10 @@ class KVzipPress(BasePress):
 
         # Apply RoPE
         cos, sin = kwargs["position_embeddings"]
-        queries = (queries * cos.unsqueeze(1)) + (rotate_half(queries) * sin.unsqueeze(1))
+        # ORIGINAL: queries = (queries * cos.unsqueeze(1)) + (rotate_half(queries) * sin.unsqueeze(1))
+        # QWEN3.5 CHANGE: The standard adapter executes the original line;
+        # Qwen3.5's adapter handles only its partial-RoPE dimensions.
+        queries = self._model_adapter.kvzip_apply_query_rope(queries, cos, sin)
         queries = queries.view(bsz, num_heads_kv, num_key_value_groups, q_len, head_dim)
 
         # Subsample keys
@@ -369,6 +411,9 @@ class KVzipPress(BasePress):
         attn_weights = attn_weights[..., sink : sink + ctx_len]
         scores = attn_weights.amax(dim=(-3, -2))  # max over group, q
 
+        # ORIGINAL: layer_idx = int(module.layer_idx)
+        # ORIGINAL: self.score_val[layer_idx][..., self.start_idx : self.end_idx] = scores
+        # QWEN3.5 CHANGE: Physical layer indices are sparse; score rows are dense.
         layer_position = self._score_layer_position[int(module.layer_idx)]
         self.score_val[layer_position][..., self.start_idx : self.end_idx] = scores  # update score
 
@@ -394,15 +439,22 @@ class KVzipPress(BasePress):
                 n_tokens_per_layer = bsz * num_key_value_heads * ctx_len
                 n_pruned_layers = torch.bincount(pruned_indices // n_tokens_per_layer, minlength=n_layer).int()
 
+            # ORIGINAL:
+            # for layer in model.model.layers:
+            #     module = layer.self_attn
+            #     layer_idx = int(module.layer_idx)
+            # QWEN3.5 CHANGE: Iterate only full-attention layers.
             adapter = self._model_adapter
             for layer_idx, module in adapter.iter_kv_attention_layers(model):
                 layer_idx = int(layer_idx)
 
                 assert module.config._attn_implementation != "eager", "eager mode not supported"
 
+                # ORIGINAL: scores = self.score_val[layer_idx]
                 scores = self.score_val[self._score_layer_position[layer_idx]]
 
                 # Compute bottom-k across heads
+                # ORIGINAL: n_pruned = n_pruned_layers[layer_idx].cpu()
                 layer_position = self._score_layer_position[layer_idx]
                 n_pruned = n_pruned_layers[layer_position].cpu()
                 indices = torch.topk(-scores.reshape(bsz, -1), n_pruned, dim=1).indices.flatten().cpu()

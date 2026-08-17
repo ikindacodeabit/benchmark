@@ -1,8 +1,25 @@
 dev_notebooks/
+# Generated logs and benchmark outputs. Keep source, configs, and job definitions.
 running_log/
-results/
-results_new/
+running_logs/
+logs/
 reports/
+results_new/
+evaluation/result_readmes/
+# Generated benchmark outputs may also be written by legacy runners here.
+results/
+results
+evaluation/results/
+evaluation/results
+**/results/
+benchmark_artifacts/*
+!benchmark_artifacts/README.md
+
+# Slurm scripts/configs are source; only scheduler output is generated.
+slurm-*.out
+slurm-*.err
+*.slurm.out
+*.slurm.err
 .DS_Store
 uv.lock
 *.parquet
@@ -31,16 +48,13 @@ var/
 wheels/
 share/python-wheels/
 evaluation/loogle/results/
-evaluation/results/
-evaluation/result_readmes/
-evaluation/yml/
-evaluation/results_new/
 *.egg-info/
 .installed.cfg
 *.egg
 MANIFEST
 Qwen3-*
 Qwen3.5-*
+Qwen3.6-*
 Qwen2.5-*
 meta-llama
 

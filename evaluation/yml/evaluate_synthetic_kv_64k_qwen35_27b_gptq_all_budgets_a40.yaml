@@ -1,0 +1,29 @@
+# Same as evaluate_synthetic_kv_64k_qwen35_27b_gptq_all_budgets.yaml, but with
+# a distinct output_dir so an a40 test run doesn't race with the dgx run
+# (284763) on the same predictions.csv/metrics.json files. Used to check
+# whether this workload actually fits in a40's 48GB (vs dgx's higher-memory
+# GPUs) before committing to it as the primary run.
+output_dir: "../benchmark_artifacts/results/synthetic_kv/64k/runs/results_synthetic_kv_64k_qwen35_27b_gptq_all_budgets_a40"
+
+model: "/home/rethinkingai-self/25m0820/kvpress/Qwen3.5-27B-GPTQ-Int4"
+dataset: "synthetic_kv"
+data_dir:
+  - "64k"
+
+press_name: "kvzip"
+compression_ratio: 0.01
+memory_budget: null
+
+fraction: 1.0
+max_new_tokens: null
+max_context_length: null
+query_aware: false
+needle_depth: null
+synthetic_kv_metadata_override: false
+seed: 42
+
+device: "cuda:0"
+fp8: false
+int8: false
+int4: false
+model_kwargs: {}

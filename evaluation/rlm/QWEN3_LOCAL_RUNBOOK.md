@@ -45,13 +45,13 @@ ls "$HF_HOME/hub" | grep -i qwen3   # expect: models--Qwen--Qwen3-8B
 niah + multikey are generated in-process (no download). Shared Hugging Face
 benchmarks such as LongBench-v2 and RULER-32K use the same cache as KVPress:
 ```bash
-bash evaluation/rlm/slurm/download_data.sh  # populates $HF_HOME
+bash benchmark_artifacts/slurm_jobs/rlm/setup/download_data.sh  # populates $HF_HOME
 ```
 
 ## Step 4 — Smoke test (40-min GPU job)
 Validates the whole path on ONE example before you spend GPU quota on the full grid.
 ```bash
-sbatch evaluation/rlm/slurm/serve_smoke.slurm
+sbatch benchmark_artifacts/slurm_jobs/rlm/smoke/serve_smoke.slurm
 squeue --me                                  # watch it schedule / start
 tail -f logs/serve-smoke.<JOBID>.out         # main log
 tail -f logs/vllm.<JOBID>.log                # vLLM model load
@@ -65,21 +65,21 @@ If you see `<think>` blocks, thinking-disable isn't working — see Troubleshoot
 
 ## Step 5 — Full benchmark grid
 ```bash
-sbatch evaluation/rlm/slurm/run_eval_local.slurm
+sbatch benchmark_artifacts/slurm_jobs/rlm/all_tasks/run_eval_local.slurm
 tail -f logs/rlm-local.<JOBID>.out
 ```
 Runs {niah, multikey, longbench_v2} × {vanilla, rlm}, 50 examples each. Resumable —
 re-submitting skips examples already in the JSONL.
 
 Outputs:
-- `evaluation/results/rlm/<condition>/<run>/checkpoint.jsonl` — resumable per-example records
-- `evaluation/results/rlm/<condition>/<run>/{predictions.csv,metrics.json,config.yaml}` — common artifacts
-- `evaluation/results/rlm/<condition>/transcripts/<task>.rlm.Qwen_Qwen3-8B/<id>.json` — full RLM transcripts
+- `benchmark_artifacts/results/rlm/<condition>/<run>/checkpoint.jsonl` — resumable per-example records
+- `benchmark_artifacts/results/rlm/<condition>/<run>/{predictions.csv,metrics.json,config.yaml}` — common artifacts
+- `benchmark_artifacts/results/rlm/<condition>/transcripts/<task>.rlm.Qwen_Qwen3-8B/<id>.json` — full RLM transcripts
 
 ## Step 6 — Score
 ```bash
 source .venv/bin/activate
-python -m evaluation.rlm.score evaluation/results/rlm
+python -m evaluation.rlm.score benchmark_artifacts/results/rlm
 ```
 
 ---
@@ -108,9 +108,9 @@ You do **not** need to redo these — they're committed in the working tree:
    `chat()` now falls back to it when no per-call `extra_body` is given.
 2. **`evaluation/rlm/run_benchmark.py`** — added a `--no-think` flag that sets
    `extra_body={"chat_template_kwargs": {"enable_thinking": False}}` on the root and sub clients.
-3. **`evaluation/rlm/slurm/run_eval_local.slurm`** — `MODEL=Qwen/Qwen3-8B`, `--served-model-name "$MODEL"` on
+3. **`benchmark_artifacts/slurm_jobs/rlm/all_tasks/run_eval_local.slurm`** — `MODEL=Qwen/Qwen3-8B`, `--served-model-name "$MODEL"` on
    the `vllm serve` line, `--no-think` on the benchmark line.
-4. **`evaluation/rlm/slurm/serve_smoke.slurm`** — `MODEL="Qwen/Qwen3-8B"`, `--no-think` on the benchmark line.
+4. **`benchmark_artifacts/slurm_jobs/rlm/smoke/serve_smoke.slurm`** — `MODEL="Qwen/Qwen3-8B"`, `--no-think` on the benchmark line.
 
 Why `--no-think`: Qwen3 emits `<think>…</think>` reasoning by default. The RLM harness parses
 a single fenced code block per step and requires the FINAL answer literal to appear in real
