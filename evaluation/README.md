@@ -11,6 +11,8 @@ independent inference path. See the [RLM benchmark guide](rlm/README.md).
 
 ### Quick Start 🚀
 > Evaluation requires some additional packages. You can install them with `uv sync --extra eval`
+> Dataset caching and generation dependencies are documented in
+> [benchmarks/README.md](benchmarks/README.md).
 
 Running evaluation is straightforward! Make sure you are in the `evaluation` directory, then:
 
@@ -75,30 +77,31 @@ At the moment, we support the following standard popular benchmarks:
 - [longbench](benchmarks/longbench/README.md)([hf link](https://huggingface.co/datasets/Xnhyacinth/LongBench))
 - [longbench-v2](benchmarks/longbenchv2/README.md)([hf link](https://huggingface.co/datasets/simonjegou/LongBench-v2))
 - [Needle in a Haystack](benchmarks/needle_in_haystack/README.md)([hf link][Paul Graham's essays](https://huggingface.co/datasets/alessiodevoto/paul_graham_essays))
-- [Synthetic 32K](benchmarks/synthetic32k/README.md)
+- [Synthetic 32K](benchmarks/synthetickv32k/README.md)
 - [Synthetic-KV 64K](benchmarks/synthetickv64k/README.md)
 
-Each dataset directory is structured as follows:
+The long-context dataset directories are self-contained:
 
 ```bash
-$dataset
+ruler32k/ or ruler64k/
 ├── README.md
 ├── calculate_metrics.py
-├── synthetic32k/
-│   └── download_dataset.sh
-└── synthetickv64k/
-    ├── create_huggingface_dataset.py
-    └── download_dataset.sh
+└── prepare_dataset.py
+
+synthetickv32k/ or synthetickv64k/
+├── README.md
+├── calculate_metrics.py
+├── generate_dataset.py
+└── prepare_dataset.py
 ```
 
-Where:
-- `synthetickv64k/create_huggingface_dataset.py` generates the formatted 64K Hugging Face dataset. The 32K dataset is published-only and is prepared by `synthetic32k/prepare_dataset.py`. Each compact dataset contains:
+Each compact Synthetic-KV dataset contains:
   - `context`: ... 
   - `question`: ...
   - `answer_prefix`: ...
   - `answer`:  ...
   - `max_new_tokens`:  ...
-- `calculate_metrics.py` is a script that calculates the metrics based on the output of `evaluate.py`
+`calculate_metrics.py` calculates metrics from the output of `evaluate.py`.
 
 
 ### Multi GPU Evaluation

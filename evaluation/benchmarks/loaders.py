@@ -127,6 +127,21 @@ def _load_ruler32k(dataset_id: str, task: str) -> pd.DataFrame:
     return df
 
 
+def _load_ruler64k(dataset_id: str, task: str) -> pd.DataFrame:
+    """Load one task from the Qwen-tokenized RULER64K dataset."""
+    logger.info("Loading RULER64K dataset: %s (config=65536, task=%s)", dataset_id, task)
+    dataset = load_dataset(dataset_id, "65536", split="test")
+
+    available_tasks = set(dataset.unique("task"))
+    if task not in available_tasks:
+        valid_tasks = ", ".join(sorted(available_tasks))
+        raise ValueError(f"Unknown RULER64K task {task!r}; expected one of: {valid_tasks}")
+
+    df = dataset.filter(lambda example: example["task"] == task).to_pandas()
+    df["context_length"] = 65536
+    return df
+
+
 def load_benchmark_dataset(
     dataset_name: str,
     task: Optional[str],
@@ -149,6 +164,8 @@ def load_benchmark_dataset(
         )
     elif dataset_name == "ruler32k":
         df = _load_ruler32k(dataset_id, _require_task(dataset_name, task))
+    elif dataset_name == "ruler64k":
+        df = _load_ruler64k(dataset_id, _require_task(dataset_name, task))
     else:
         logger.info("Loading dataset: %s (data_dir: %s)", dataset_id, task)
         df = load_dataset(dataset_id, data_dir=task, split="test").to_pandas()

@@ -1,4 +1,4 @@
-"""Download or offline-validate the Synthetic-KV 64K dataset."""
+"""Download or offline-validate the Synthetic-KV 32K dataset."""
 
 import argparse
 import os
@@ -6,7 +6,7 @@ import os
 from datasets import DownloadConfig, load_dataset
 
 
-DATASET_ID = "ollamaweights/synthetic-dataset-1208-64k"
+DATASET_ID = "ollamaweights/synthetic-dataset-1208"
 
 
 def main() -> None:
@@ -43,7 +43,7 @@ def main() -> None:
     missing = required.difference(dataset.column_names)
     if len(dataset) != 1 or missing or len(row["questions"]) != len(row["answers"]):
         raise RuntimeError(
-            f"Invalid Synthetic-KV 64K dataset; missing columns: {sorted(missing)}"
+            f"Invalid Synthetic-KV 32K dataset; missing columns: {sorted(missing)}"
         )
     print(
         f"Ready {DATASET_ID}: contexts=1, questions={len(row['questions'])}, "

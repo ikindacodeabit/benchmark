@@ -3,9 +3,15 @@
 
 # This is the only YAML file passed to model-running commands. Local reference
 # configurations under yml/ are intentionally excluded from Git.
-output_dir: "../benchmark_artifacts/results/synthetic_kv/64k/runs/results_synthetic_kv_64k_yarn2_awq_all_budgets"
+#
+# Default target: Qwen3.5-27B-GPTQ-Int4, synthetic-kv 64k, KVzip reference
+# pass (compression_ratio=0.01). max_new_tokens/max_context_length are null
+# (native/per-row defaults) and fraction is 1.0 (full dataset), matching
+# yml/evaluate_synthetic_kv_64k_qwen35_27b_gptq_all_budgets.yaml -- same
+# output_dir, so results/skip-if-exists are shared between the two.
+output_dir: "../benchmark_artifacts/results/synthetic_kv/64k/runs/results_synthetic_kv_64k_qwen35_27b_gptq_all_budgets"
 
-model: "/home/rethinkingai-self/25m0820/kvpress/Qwen3-8B-AWQ"
+model: "/home/rethinkingai-self/25m0820/kvpress/Qwen3.5-27B-GPTQ-Int4"
 dataset: "synthetic_kv"
 data_dir:
   - "64k"
@@ -17,7 +23,7 @@ memory_budget_unit: "MB"
 
 fraction: 1.0
 max_new_tokens: null
-max_context_length: 65536
+max_context_length: null
 query_aware: false
 needle_depth: null
 synthetic_kv_metadata_override: false
@@ -27,12 +33,4 @@ device: "cuda:0"
 fp8: false
 int8: false
 int4: false
-model_kwargs:
-  attn_implementation: null
-  dtype: "auto"
-  rope_scaling:
-    rope_type: "yarn"
-    rope_theta: 1000000.0
-    factor: 2.0
-    original_max_position_embeddings: 32768
-  max_position_embeddings: 65536
+model_kwargs: {}

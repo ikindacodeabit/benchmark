@@ -1,0 +1,43 @@
+# RULER-64k matrix for Qwen3.5-27B-GPTQ-Int4: reference (compression_ratio=0.01)
+# + every RULER_64K_BUDGETS budget (512MB/1GB/2GB/3GB/4GB) under KVzip, across
+# all 13 RULER-64k tasks, sharded across 5 workers via --worker-id/
+# --worker-count (matches the existing ruler64k-job.sh convention: workers
+# 0-2 get 3 tasks each, workers 3-4 get 2 tasks each). fraction=0.5 matches
+# this dataset's documented design (kvpress/evaluation/benchmarks/ruler64k/
+# README.md): 250 of 500 examples per task, deterministic seed 42.
+output_dir: "../benchmark_artifacts/results/ruler64k/runs/results_ruler64k_qwen35_27b_gptq_all_budgets"
+
+model: "/home/rethinkingai-self/25m0820/kvpress/Qwen3.5-27B-GPTQ-Int4"
+dataset: "ruler64k"
+data_dir:
+  - "cwe"
+  - "fwe"
+  - "niah_multikey_1"
+  - "niah_multikey_2"
+  - "niah_multikey_3"
+  - "niah_multiquery"
+  - "niah_multivalue"
+  - "niah_single_1"
+  - "niah_single_2"
+  - "niah_single_3"
+  - "qa_1"
+  - "qa_2"
+  - "vt"
+
+press_name: "kvzip"
+compression_ratio: 0.01
+memory_budget: null
+
+fraction: 0.5
+max_new_tokens: null
+max_context_length: null
+query_aware: false
+needle_depth: null
+synthetic_kv_metadata_override: false
+seed: 42
+
+device: "cuda:0"
+fp8: false
+int8: false
+int4: false
+model_kwargs: {}

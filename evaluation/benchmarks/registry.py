@@ -50,7 +50,7 @@ SCORER_REGISTRY = {
     "ruler32k": _lazy_scorer("ruler32k"),
     "ruler64k": _lazy_scorer("ruler32k"),
     "synthetic_kv": _lazy_scorer("synthetickv64k"),
-    "synthetic_kv_32k": _lazy_scorer("synthetic32k"),
+    "synthetic_kv_32k": _lazy_scorer("synthetickv32k"),
 }
 
 

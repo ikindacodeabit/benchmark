@@ -12,8 +12,8 @@ export HF_DATASETS_OFFLINE=false
 
 test -x "${PRAJNA_PYTHON}"
 mkdir -p "${HF_DATASETS_CACHE}"
-"${PRAJNA_PYTHON}" "${PRAJNA_REPO}/evaluation/benchmarks/synthetic32k/prepare_dataset.py"
+"${PRAJNA_PYTHON}" "${PRAJNA_REPO}/evaluation/benchmarks/synthetickv32k/prepare_dataset.py"
 
 export HF_HUB_OFFLINE=true
 export HF_DATASETS_OFFLINE=true
-"${PRAJNA_PYTHON}" "${PRAJNA_REPO}/evaluation/benchmarks/synthetic32k/prepare_dataset.py" --offline-check
+"${PRAJNA_PYTHON}" "${PRAJNA_REPO}/evaluation/benchmarks/synthetickv32k/prepare_dataset.py" --offline-check

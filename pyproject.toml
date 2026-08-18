@@ -37,6 +37,24 @@ eval = [
 flash-attn = [
     "flash-attn"
 ]
+# Qwen3.5-27B-GPTQ-Int4 hybrid-attention (DeltaNet + full-attention) support
+# needs transformers>=5.3 for the unified Cache/DynamicCache layer_types API,
+# which conflicts with this project's own transformers<5.3 pin above. Install
+# in an isolated environment (e.g. `kvpress-tf515`), not the main one:
+#   pip install transformers==5.15.0 kernels==0.16.0 optimum==2.2.0 \
+#       accelerate==1.14.0
+#   pip install -U setuptools wheel packaging  # gptqmodel's sdist build
+#       # checks the setuptools version and fails on older ones
+#   pip install --no-build-isolation gptqmodel==5.8.0
+#   pip install -e . --no-deps  # --no-deps so pip doesn't "fix" transformers
+#       # back down to satisfy the <5.3 pin above
+qwen35-gptq = [
+    "transformers==5.15.0",
+    "kernels==0.16.0",
+    "gptqmodel==5.8.0",
+    "optimum==2.2.0",
+    "accelerate==1.14.0",
+]
 
 [dependency-groups]
 dev = [
