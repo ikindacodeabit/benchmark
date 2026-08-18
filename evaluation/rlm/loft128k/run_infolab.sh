@@ -46,7 +46,7 @@ KVPRESS_VENV="${KVPRESS_VENV:-.venv-kvpress}"
 # chars/turn), so its window shrinks from 139264 to KV_ROOT_MAX_LEN and its
 # memory ceiling drops to leave SUB_RESERVE_MIB for the sub model. Budget on an
 # empty 48 GB (49140 MiB) card:
-#   vLLM at util<=0.44           -> ~21.6 GB (8 weights + overhead + KV pool;
+#   vLLM at ROOT_BUDGET_MIB      -> ~21 GB (8 weights + overhead + KV pool;
 #                                   one 65536-token sequence needs ~9.2 GB of KV
 #                                   and vLLM refuses to start if it cannot fit)
 #   HF sub reservation ~16 GB    -> 8.1 weights + 4.9 GB KV for a 34k-token call
@@ -64,6 +64,11 @@ fi
 HEADROOM_MIB="${HEADROOM_MIB:-2000}"
 SUB_RESERVE_MIB="${SUB_RESERVE_MIB:-16000}"
 KV_ROOT_MAX_LEN="${KV_ROOT_MAX_LEN:-65536}"
+# What the colocated root may take for itself: ~8 GB of weights, ~9.2 GB of KV
+# for one KV_ROOT_MAX_LEN sequence, and ~3 GB of activations and non-torch
+# overhead. Capping it stops a near-empty card from handing the root a KV pool
+# far larger than its window can ever use.
+ROOT_BUDGET_MIB="${ROOT_BUDGET_MIB:-21000}"
 
 # Some infolab hosts mix A6000 (sm_86) and RTX 6000 Ada (sm_89). CUDA orders
 # devices FASTEST_FIRST by default while nvidia-smi reports PCI order, so without
@@ -274,25 +279,36 @@ pick_gpus() {
         sort -n -k1,1 -k2,2 | head -n "$want" | awk '{print $3}'
 }
 
-# --gpu-memory-utilization is a ceiling on TOTAL DEVICE memory, not on our own
-# allocation, so it must be derived from total-minus-other-tenants, not from free.
+# --gpu-memory-utilization is a ceiling on TOTAL DEVICE memory, and vLLM charges
+# EVERY tenant's bytes against it -- ours and other users' alike. So the fraction
+# is (what the co-tenants already hold) + (what we want for ourselves), over
+# total. Deriving it from `free` instead subtracts the co-tenants a SECOND time,
+# because `free` is already net of them, and the KV pool is what absorbs the
+# shortfall. That is not theoretical: on bee 2026-08-18, util 0.44 on a card with
+# ~10 GB of co-tenants left the root 1.40 GiB of KV against the 9.00 GiB one
+# 65536-token sequence needs, and the engine core refused to start.
 util_for() {
     local idx="$1" free total
     free=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits -i "$idx")
     total=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits -i "$idx")
     awk -v f="$free" -v t="$total" -v h="$HEADROOM_MIB" \
-        'BEGIN{u=(f-h)/t; if(u>0.85)u=0.85; if(u<0.50)u=0.50; printf "%.2f", u}'
+        'BEGIN{u=(t-f+f-h)/t; if(u>0.90)u=0.90; if(u<0.50)u=0.50; printf "%.2f", u}'
 }
 
-# Colocation variant: additionally subtract the HF sub model's reservation, and
-# clamp lower -- the server shares the card with a ~16 GB in-process tenant.
+# Colocation variant: the root shares the card with the ~16 GB in-process sub
+# model, so its share is what is free less that reservation and the headroom,
+# capped at ROOT_BUDGET_MIB. Same total-device correction as above: add back what
+# the co-tenants hold. The ceiling this produces leaves SUB_RESERVE_MIB +
+# HEADROOM_MIB of the card unclaimed by construction, whatever the co-tenants do.
 # When SUB_GPUS is set the sub model has its own card and the plain shape is used.
 kv_util_for() {
     local idx="$1" free total
     free=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits -i "$idx")
     total=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits -i "$idx")
     awk -v f="$free" -v t="$total" -v h="$HEADROOM_MIB" -v s="$SUB_RESERVE_MIB" \
-        'BEGIN{u=(f-h-s)/t; if(u>0.44)u=0.44; if(u<0.30)u=0.30; printf "%.2f", u}'
+        -v b="$ROOT_BUDGET_MIB" \
+        'BEGIN{own=f-h-s; if(own>b)own=b; u=(t-f+own)/t;
+               if(u>0.90)u=0.90; if(u<0.30)u=0.30; printf "%.2f", u}'
 }
 
 serve_on() {

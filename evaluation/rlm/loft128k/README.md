@@ -128,7 +128,7 @@ to make room for the in-process sub model:
 
 | tenant | memory |
 |---|---|
-| vLLM root, `--max-model-len 65536`, util ≤ 0.44 | ~21.6 GB (8 weights + overhead + KV pool) |
+| vLLM root, `--max-model-len 65536`, capped at `ROOT_BUDGET_MIB` | ~21 GB (8 weights + overhead + KV pool) |
 | HF sub model | ~8.1 GB weights |
 | one 34k-token sub prefill (full KV — KVzip masks, doesn't free) | ~4.9 GB |
 | KVzip scoring transient | ~2.5 GB |
