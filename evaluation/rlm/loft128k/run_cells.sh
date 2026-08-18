@@ -25,6 +25,25 @@ export NVIDIA_API_KEY="${NVIDIA_API_KEY:-local-dummy}"
 export TOKENIZERS_PARALLELISM=false
 export PYTHONUNBUFFERED=1
 
+# Caches must never land on $HOME: it is a small, invisible NFS quota on the
+# infolab hosts, and the kvpress arm pulls ~8 GB of sub-model weights. run_infolab.sh
+# redirects them, but the usage note above advertises driving this script directly
+# against an already-running server, and that path bypassed the redirect -- on bee
+# 2026-08-18 the sub model downloaded into $HOME and died with EDQUOT mid-symlink,
+# taking the whole 4a lane with it. Repeat the redirect here so both entry points
+# are safe, and fail loudly rather than filling a quota-capped home.
+RLM_SCRATCH="${RLM_SCRATCH:-/mnt/nas/$USER}"
+export HF_HOME="${HF_HOME:-$RLM_SCRATCH/hf_cache}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$RLM_SCRATCH/cache}"
+case "$HF_HOME" in
+"$HOME" | "$HOME"/*)
+    echo "ERROR: HF_HOME=$HF_HOME is under \$HOME, which is quota-capped here." >&2
+    echo "  Set HF_HOME (or RLM_SCRATCH) to a big writable path before running." >&2
+    exit 1
+    ;;
+esac
+mkdir -p "$HF_HOME" "$XDG_CACHE_HOME"
+
 mkdir -p "$RESULTS" "$LOGS"
 
 # --- duplicate-run guard ------------------------------------------------------
