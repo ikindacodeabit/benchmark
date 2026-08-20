@@ -69,8 +69,18 @@ class NIMClient:
 
     def __post_init__(self) -> None:
         key = self.api_key or os.environ.get("NVIDIA_API_KEY")
+        # Only the hosted NVIDIA catalog actually authenticates; a local
+        # vLLM/NIM server accepts any string, so don't make a laptop/infolab run
+        # fail on a key it never needed.
         if not key:
-            raise RuntimeError("Set NVIDIA_API_KEY (get one at build.nvidia.com).")
+            if "api.nvidia.com" in self.base_url:
+                raise RuntimeError(
+                    "NVIDIA_API_KEY is not set, and base_url points at the hosted NVIDIA catalog "
+                    f"({self.base_url}), which requires one (get it at build.nvidia.com). "
+                    "If you meant a local server, pass --base-url http://localhost:8000/v1 — "
+                    "no key is needed there."
+                )
+            key = "EMPTY"  # placeholder; local OpenAI-compatible servers ignore it
         self._client = OpenAI(base_url=self.base_url, api_key=key, timeout=self.timeout)
         self._limiter = self.limiter or RateLimiter(self.rpm)
 

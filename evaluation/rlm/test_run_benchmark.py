@@ -110,22 +110,22 @@ class RunDirComponentsTest(unittest.TestCase):
             ["loft", "nq_128k", "Qwen_Qwen3-4B-Instruct-2507", "rlm", "scratchpad"],
         )
 
-    def test_kvpress_backend_stamps_press_ratio_and_nondefault_chunk(self):
-        args = _args(sub_backend="kvpress", compression_ratio=0.75, max_subcall_chars=131072)
+    def test_kvzip_backend_stamps_press_ratio_and_nondefault_chunk(self):
+        args = _args(sub_backend="kvzip", compression_ratio=0.75, max_subcall_chars=131072)
         self.assertEqual(
             build_run_dir_components(args, "rlm", Scratchpad()),
-            ["loft", "nq_128k", "Qwen_Qwen3-4B-Instruct-2507", "rlm", "scratchpad", "kvzip0.75", "sub131072"],
+            ["loft", "nq_128k", "Qwen_Qwen3-4B-Instruct-2507", "rlm", "scratchpad", "kvzip-kvzip0.75", "sub131072"],
         )
 
     def test_default_chunk_size_adds_no_suffix(self):
-        args = _args(sub_backend="kvpress")
+        args = _args(sub_backend="kvzip")
         self.assertEqual(
             build_run_dir_components(args, "rlm", None)[-1],
-            "kvzip0.5",
+            "kvzip-kvzip0.5",
         )
 
     def test_vanilla_mode_ignores_rlm_only_knobs(self):
-        args = _args(sub_backend="kvpress", max_subcall_chars=131072, max_context_tokens=4096)
+        args = _args(sub_backend="kvzip", max_subcall_chars=131072, max_context_tokens=4096)
         self.assertEqual(
             build_run_dir_components(args, "vanilla", Scratchpad()),
             ["loft", "nq_128k", "Qwen_Qwen3-4B-Instruct-2507", "vanilla"],

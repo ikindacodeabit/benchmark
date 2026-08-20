@@ -32,12 +32,12 @@ DATASETS="${DATASETS:-nq hotpotqa musique qampari quest}"
 RESULTS="${RESULTS:-evaluation/results/loft128k}"
 LOGS="${LOGS:-$RESULTS/logs}"
 VENV="${VENV:-.venv}"
-# Second venv for the kvpress-backed arm 4 and the kvzip vanilla baseline. The
+# Second venv for the cell-5 kvzip vanilla baseline (kvpress evaluate.py). The
 # RLM venv above pins transformers==4.51.3 for the vLLM server; kvpress needs
-# >=4.56 (new Cache API), so the two cannot share an environment. The benchmark
-# DRIVER imports neither vllm nor transformers by itself, so arm 4 runs the
-# driver from THIS venv (hosting the compressed sub model in-process) while the
-# root still talks HTTP to the vLLM server from the other venv.
+# >=4.56 (new Cache API), so the two cannot share an environment. Arm 4 no
+# longer uses this venv: its sub-calls go through standalone KVzip (cloned by
+# setup into $KVZIP_DIR), which pins the same 4.51.3 as the server, so the
+# arm-4 driver runs from the MAIN venv.
 KVPRESS_VENV="${KVPRESS_VENV:-.venv-kvpress}"
 
 # --- arm-4 colocation mode (KVPRESS_ARMS=1) -----------------------------------
@@ -50,8 +50,9 @@ KVPRESS_VENV="${KVPRESS_VENV:-.venv-kvpress}"
 #                                   one 65536-token sequence needs ~9.2 GB of KV
 #                                   and vLLM refuses to start if it cannot fit)
 #   HF sub reservation ~16 GB    -> 8.1 weights + 4.9 GB KV for a 34k-token call
-#                                   (KVzip MASKS keys, it does not free them, so
-#                                   plan for the full uncompressed KV) + ~2.5 GB
+#                                   (standalone KVzip frees evicted KV, but only
+#                                   AFTER prefill+scoring, so the PEAK is still
+#                                   the full uncompressed KV) + ~2.5 GB
 #                                   scoring transient
 #   total ~37 GB, ~11 GB margin for co-tenants.
 if [ -n "${KVPRESS_ARMS:-}" ]; then
@@ -151,8 +152,44 @@ if [ "$1" = "setup" ]; then
     # at tokenizer init with "Qwen2Tokenizer has no attribute
     # all_special_tokens_extended". pip will warn about the kvpress conflict; that is
     # expected and harmless here, because the RLM arm never imports the presses.
-    # Consequence: this venv is for the RLM path only. Keep a separate one for kvpress.
+    # Bonus: standalone KVzip pins the SAME 4.51.3, so the arm-4 driver (which
+    # hosts the KVzip sub model in-process) runs from THIS venv too; only the
+    # cell-5 kvpress baseline still needs the separate venv below.
     pip install "transformers==${TRANSFORMERS_VERSION:-4.51.3}"
+
+    # --- standalone KVzip (arm 4 sub-call backend) ----------------------------
+    # Clone + build its CUDA kernel, but do NOT `pip install -e` the repo: its
+    # pyproject pins torch==2.3.0 and would clobber vLLM's torch. The backend
+    # imports the checkout via KVZIP_DIR instead.
+    KVZIP_DIR="${KVZIP_DIR:-KVzip}"
+    if [ ! -f "$KVZIP_DIR/model/wrapper.py" ]; then
+        git clone --depth 1 https://github.com/snu-mllab/KVzip "$KVZIP_DIR"
+    fi
+    # flash-attn: KVzip's evict cache decodes through flash_attn_varlen_func;
+    # there is no sdpa fallback. Prebuilt wheels exist for torch 2.6 + cu12x.
+    pip install ninja packaging
+    pip install "flash-attn==${FLASH_ATTN_VERSION:-2.7.4.post1}" --no-build-isolation
+    # tiny_api_cuda: KVzip's kernel for flattening the pruned cache.
+    (cd "$KVZIP_DIR/csrc" && python build.py install)
+
+    # Probe the exact seams arm 4 depends on, HERE, where the error message can
+    # say what to fix -- not five minutes into a GPU run.
+    KVZIP_DIR="$KVZIP_DIR" python - <<'PY'
+import os
+import sys
+
+sys.path.insert(0, os.path.abspath(os.environ["KVZIP_DIR"]))
+
+import flash_attn  # noqa: F401
+import tiny_api_cuda  # noqa: F401
+from model import ModelKVzip  # noqa: F401
+
+print("KVzip OK: ModelKVzip, flash-attn and tiny_api_cuda importable")
+
+from evaluation.rlm.kvzip_backend import SUB_PRESS_CHOICES  # import-graph check
+
+print(f"kvzip_backend OK: presses {SUB_PRESS_CHOICES}")
+PY
 
     python - <<'PY'
 import torch
@@ -189,10 +226,10 @@ if not hasattr(tok, "all_special_tokens_extended"):
 print(f"tokenizer OK: {type(tok).__name__}, vocab {len(tok)}")
 PY
 
-    # --- kvpress venv (arm 4 + kvzip baseline) --------------------------------
+    # --- kvpress venv (cell-5 kvzip baseline only; arm 4 now runs from $VENV) --
     # Installed via explicit $KVPRESS_VENV/bin paths, not activate, so the RLM
     # venv sourced above stays the active one for the rest of setup.
-    echo "--- setting up $KVPRESS_VENV (kvpress arm) ---"
+    echo "--- setting up $KVPRESS_VENV (cell-5 kvzip baseline) ---"
     if [ ! -f "$KVPRESS_VENV/bin/activate" ]; then
         if command -v uv >/dev/null 2>&1; then
             uv venv "$KVPRESS_VENV"
@@ -237,10 +274,6 @@ from kvpress import KVzipPress
 press = KVzipPress()
 press.compression_ratio = 0.5
 print(f"kvpress OK: {type(press).__name__}(compression_ratio={press.compression_ratio})")
-
-from evaluation.rlm.kvpress_backend import SUB_PRESS_CHOICES  # import-graph check
-
-print(f"kvpress_backend OK: presses {SUB_PRESS_CHOICES}")
 
 from transformers import AutoTokenizer
 

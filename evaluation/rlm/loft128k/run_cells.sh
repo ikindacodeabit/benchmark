@@ -20,13 +20,13 @@ MODEL="${MODEL:-Qwen/Qwen3-4B-Instruct-2507}"
 MAX_NOTES_TOKENS="${MAX_NOTES_TOKENS:-1024}"
 LOGS="${LOGS:-$RESULTS/logs}"
 
-# client.py requires this even against a local server; the value is ignored.
-export NVIDIA_API_KEY="${NVIDIA_API_KEY:-local-dummy}"
+# client.py no longer needs NVIDIA_API_KEY for a local base_url; only the
+# hosted catalog requires one.
 export TOKENIZERS_PARALLELISM=false
 export PYTHONUNBUFFERED=1
 
 # Caches must never land on $HOME: it is a small, invisible NFS quota on the
-# infolab hosts, and the kvpress arm pulls ~8 GB of sub-model weights. run_infolab.sh
+# infolab hosts, and the kvzip arm pulls ~8 GB of sub-model weights. run_infolab.sh
 # redirects them, but the usage note above advertises driving this script directly
 # against an already-running server, and that path bypassed the redirect -- on bee
 # 2026-08-18 the sub model downloaded into $HOME and died with EDQUOT mid-symlink,
@@ -50,7 +50,7 @@ mkdir -p "$RESULTS" "$LOGS"
 # run_benchmark reads its checkpoint ONCE per cell, so a second concurrent run of
 # the same dataset cannot see the first's in-flight rows and would redo all the
 # remaining work, then interleave writes into the same checkpoint.jsonl.
-# The kvpress arm gets its OWN lock: its run dirs are disjoint from arms 1-3
+# The kvzip arm gets its OWN lock: its run dirs are disjoint from arms 1-3
 # (the slug carries press/ratio/chunk suffixes), so the checkpoint-merge hazard
 # is only between two runs of the SAME lane family.
 LOCK="$LOGS/.lock.$DATASET${KVPRESS_ARMS:+.kvpress}"
@@ -90,13 +90,21 @@ fi
 # served by a SMALL root server (see run_infolab.sh colocation sizing), and a
 # vanilla arm pointed at it would shrink-retry against the reduced window and
 # merge truncated rows into the existing vanilla checkpoints. The driver runs
-# from the kvpress venv; the sub model is hosted in-process on RLM_SUB_GPU.
+# from the MAIN venv (KVzip pins transformers==4.51.3, same as the vLLM server,
+# so no separate venv is needed); the sub model is hosted in-process on
+# RLM_SUB_GPU.
 if [ -n "${KVPRESS_ARMS:-}" ]; then
-    KVPY="${KVPRESS_PYTHON:-.venv-kvpress/bin/python}"
+    KVPY="${KVZIP_PYTHON:-.venv/bin/python}"
     if [ ! -x "$KVPY" ]; then
-        echo "ERROR: no kvpress venv python at $KVPY; run run_infolab.sh setup first" >&2
+        echo "ERROR: no venv python at $KVPY; run run_infolab.sh setup first (or set KVZIP_PYTHON)" >&2
         exit 1
     fi
+    KVZIP_DIR="${KVZIP_DIR:-KVzip}"
+    if [ ! -f "$KVZIP_DIR/model/wrapper.py" ]; then
+        echo "ERROR: no KVzip checkout at $KVZIP_DIR (run run_infolab.sh setup, or set KVZIP_DIR)" >&2
+        exit 1
+    fi
+    export KVZIP_DIR
     KV_BASE=(
         --dataset loft
         --data-dir "${DATASET}_${LENGTH}"
@@ -111,7 +119,7 @@ if [ -n "${KVPRESS_ARMS:-}" ]; then
         --mode rlm
         --scratchpad
         --max-notes-tokens "$MAX_NOTES_TOKENS"
-        --sub-backend kvpress
+        --sub-backend kvzip
         --press "${KV_PRESS:-kvzip}"
         --sub-max-tokens "${KV_SUB_MAX_TOKENS:-512}"
     )
@@ -140,7 +148,7 @@ if [ -n "${KVPRESS_ARMS:-}" ]; then
                 }
         done
     done
-    echo "=== $(date '+%F %T') :: ${DATASET}_${LENGTH} kvpress arms done (failed=$FAILED) ==="
+    echo "=== $(date '+%F %T') :: ${DATASET}_${LENGTH} kvzip arms done (failed=$FAILED) ==="
     exit "$FAILED"
 fi
 

@@ -93,7 +93,7 @@ The user's task is:
 # backend. The DENSE variants must stay byte-identical to the pre-split prompt
 # (arms 2/3 are mid-campaign and a wording change would confound them); the
 # SPLIT variants teach the two-arg form used when the sub client compresses the
-# context's KV separately from the question (see kvpress_backend.py).
+# context's KV separately from the question (see kvzip_backend.py).
 LLM_QUERY_HELP_DENSE = """\
     * `llm_query(prompt: str) -> str`: ask a sub-LLM about text. IMPORTANT: the
       sub-LLM CANNOT see `context` or any of your variables — it sees ONLY the
@@ -280,7 +280,7 @@ class RLM:
         self.max_sub_calls = max_sub_calls
         # Check the run_timeout deadline INSIDE llm_query too. Off by default:
         # the NIM/vLLM arms take their per-step deadline check between turns, and
-        # changing that mid-campaign would confound them. The kvpress arm turns it
+        # changing that mid-campaign would confound them. The kvzip arm turns it
         # on because one code cell can loop over many multi-minute in-process
         # sub-calls without ever reaching the per-step check.
         self.subcall_deadline_check = subcall_deadline_check
@@ -550,7 +550,7 @@ class RLM:
         if self.scratchpad is not None:
             metrics["scratchpad"] = True
             metrics["notes_saved"] = 0
-        # A split-capable sub client (kvpress backend) accepts the context slice as
+        # A split-capable sub client (kvzip backend) accepts the context slice as
         # a separate argument so the press compresses it apart from the question;
         # the system prompt must teach whichever llm_query form is actually wired.
         split_capable = hasattr(self.sub, "chat_split")

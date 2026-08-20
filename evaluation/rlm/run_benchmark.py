@@ -168,8 +168,12 @@ def build_run_dir_components(args: argparse.Namespace, mode: str, scratchpad: Sc
         components.append(f"ctx{args.max_context_tokens}")
     if mode == "rlm" and scratchpad is not None:
         components.append("scratchpad")
-    if mode == "rlm" and args.sub_backend == "kvpress":
-        components.append(f"{args.press}{args.compression_ratio:g}")
+    if mode == "rlm" and args.sub_backend == "kvzip":
+        # Backend-prefixed ("kvzip-kvzip0.5", not the old kvpress-era "kvzip0.5"):
+        # the standalone-KVzip backend produces different results (real eviction,
+        # its own template/scoring), so resuming into an old kvpress-backed
+        # checkpoint would silently merge two experiments.
+        components.append(f"{args.sub_backend}-{args.press}{args.compression_ratio:g}")
     if mode == "rlm" and args.max_subcall_chars != 32000:
         components.append(f"sub{args.max_subcall_chars}")
     return components
@@ -262,24 +266,26 @@ def main() -> None:
         help="cap on llm_query calls per example; further calls return a notice instead of "
         "hitting the API. 0 disables",
     )
-    # --- Sub-call backend (arm 4: KV-compressed sub-calls; see kvpress_backend.py) ---
+    # --- Sub-call backend (arm 4: KV-compressed sub-calls; see kvzip_backend.py) ---
     # `nim` keeps today's behavior: sub-calls go to the same OpenAI-compatible
-    # server as the root. `kvpress` loads the sub model IN-PROCESS through the
-    # kvpress pipeline so each llm_query context slice is read through a
-    # compressed KV cache; requires the kvpress venv (transformers>=4.56), which
-    # the root path does not, because the root stays on the HTTP server.
-    ap.add_argument("--sub-backend", default="nim", choices=["nim", "kvpress"])
+    # server as the root. `kvzip` loads the sub model IN-PROCESS through the
+    # standalone KVzip repo (snu-mllab/KVzip) so each llm_query context slice is
+    # read through a pruned KV cache that is PHYSICALLY evicted (real memory
+    # savings, unlike kvpress's masking). KVzip pins transformers==4.51.3, the
+    # same version the vLLM 0.8.5 root server uses.
+    ap.add_argument("--sub-backend", default="nim", choices=["nim", "kvzip"])
     ap.add_argument(
         "--press",
         default="kvzip",
-        choices=["kvzip", "kvzip_plus", "snapkv", "fastkvzip", "no_press"],
-        help="press for --sub-backend kvpress; no_press = same pipeline, dense (press control)",
+        choices=["kvzip", "no_press"],
+        help="for --sub-backend kvzip; no_press = same load/generate path, no pruning (press control)",
     )
     ap.add_argument(
         "--compression-ratio",
         type=float,
         default=0.5,
-        help="fraction of context KV the press evicts per sub-call (kvpress backend)",
+        help="fraction of context KV evicted per sub-call (kvzip backend; KVzip's own "
+        "prune(ratio) RETAINS that fraction — the conversion happens in the backend)",
     )
     ap.add_argument(
         "--max-subcall-chars",
@@ -293,21 +299,34 @@ def main() -> None:
         "--sub-max-tokens",
         type=int,
         default=512,
-        help="max_new_tokens per kvpress sub-call; HF greedy decode is ~30-40 tok/s, so the "
+        help="max_new_tokens per kvzip sub-call; HF greedy decode is ~30-40 tok/s, so the "
         "NIM default of 4096 is a wall-clock hazard in-process",
     )
-    ap.add_argument("--sub-attn", default="sdpa", choices=["sdpa", "flash_attention_2"])
     ap.add_argument(
         "--sub-device",
         default=None,
-        help="torch device for the in-process sub model (default: cuda:0 if available; "
-        "normally pinned via CUDA_VISIBLE_DEVICES)",
+        help="GPU for the in-process sub model, e.g. cuda:1 (default: auto-pick the GPU with "
+        "the most free memory; either way the choice is preflight-checked against "
+        "--sub-min-free-gib before the model loads)",
+    )
+    ap.add_argument(
+        "--sub-min-free-gib",
+        type=float,
+        default=14.0,
+        help="minimum free GPU memory (GiB) required by the preflight check before loading the "
+        "sub model (weights + KV headroom; ~14 covers Qwen3-4B bf16 at 34k-token sub-calls)",
+    )
+    ap.add_argument(
+        "--kvzip-dir",
+        default=None,
+        help="path to a snu-mllab/KVzip checkout (defaults to the KVZIP_DIR env var); KVzip has "
+        "no pip package",
     )
     ap.add_argument(
         "--sub-max-context-tokens",
         type=int,
         default=34000,
-        help="token-level truncation inside the kvpress pipeline (a 131072-char slice of dense "
+        help="token-level truncation of the sub-call context (a 131072-char slice of dense "
         "text can exceed 32k tokens)",
     )
     ap.add_argument(
@@ -346,22 +365,23 @@ def main() -> None:
     client_kw = dict(base_url=args.base_url, rpm=args.rpm, limiter=limiter)
     root = NIMClient(model=args.root_model, **client_kw)
     sub: Any
-    if args.sub_backend == "kvpress":
+    if args.sub_backend == "kvzip":
         if modes == ["vanilla"]:
-            ap.error("--sub-backend kvpress only affects RLM sub-calls; use --mode rlm (or both)")
-        # Imported lazily: the nim path must stay importable in the vLLM-pinned
-        # venv, which has neither torch nor a kvpress-compatible transformers.
-        from .kvpress_backend import KVPressSubClient
+            ap.error("--sub-backend kvzip only affects RLM sub-calls; use --mode rlm (or both)")
+        # Imported lazily: the nim path must stay importable in a venv without
+        # torch or KVzip's deps.
+        from .kvzip_backend import KVzipSubClient
 
-        sub = KVPressSubClient(
+        sub = KVzipSubClient(
             model=args.sub_model,
             press_name=args.press,
             compression_ratio=args.compression_ratio,
             device=args.sub_device,
-            attn_implementation=args.sub_attn,
             max_new_tokens=args.sub_max_tokens,
             max_context_tokens=args.sub_max_context_tokens,
             press_min_tokens=args.press_min_tokens,
+            kvzip_dir=args.kvzip_dir,
+            min_free_gib=args.sub_min_free_gib,
         )
     else:
         sub = NIMClient(model=args.sub_model, **client_kw)
@@ -390,7 +410,7 @@ def main() -> None:
         max_subcall_chars=args.max_subcall_chars,
         # In-process sub-calls can take minutes each; without an in-call check a
         # single code cell looping over slices sails past the per-step deadline.
-        subcall_deadline_check=(args.sub_backend == "kvpress"),
+        subcall_deadline_check=(args.sub_backend == "kvzip"),
     )
 
     for mode in modes:
@@ -519,13 +539,12 @@ def main() -> None:
             "run_timeout": args.run_timeout or None,
             "max_sub_calls": args.max_sub_calls or None,
             "sub_backend": args.sub_backend,
-            "press": args.press if args.sub_backend == "kvpress" else None,
-            "compression_ratio": args.compression_ratio if args.sub_backend == "kvpress" else None,
+            "press": args.press if args.sub_backend == "kvzip" else None,
+            "compression_ratio": args.compression_ratio if args.sub_backend == "kvzip" else None,
             "max_subcall_chars": args.max_subcall_chars,
-            "sub_max_tokens": args.sub_max_tokens if args.sub_backend == "kvpress" else None,
-            "sub_attn": args.sub_attn if args.sub_backend == "kvpress" else None,
-            "sub_max_context_tokens": args.sub_max_context_tokens if args.sub_backend == "kvpress" else None,
-            "press_min_tokens": args.press_min_tokens if args.sub_backend == "kvpress" else None,
+            "sub_max_tokens": args.sub_max_tokens if args.sub_backend == "kvzip" else None,
+            "sub_max_context_tokens": args.sub_max_context_tokens if args.sub_backend == "kvzip" else None,
+            "press_min_tokens": args.press_min_tokens if args.sub_backend == "kvzip" else None,
         }
         metrics = write_run_artifacts(
             res_path,

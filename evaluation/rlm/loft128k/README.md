@@ -8,8 +8,8 @@ Experiment arms on LOFT's five RAG subsets at 128k context, all on
 | `vanilla` | `--mode both` | the whole 131k-token document in the context window |
 | `rlm` | `--mode both` | document held in a REPL variable, root model chunks and recurses |
 | `rlm+scratchpad` | `--mode rlm --scratchpad` | same, plus a persistent `note()` buffer that survives eviction |
-| `rlm+scratchpad+press` (4a) | `... --sub-backend kvpress` | sub-calls read their slice through a KVzip-compressed KV cache, same 32k-char chunks as arms 2–3 (isolates the press effect) |
-| `rlm+scratchpad+press` (4b) | `... --sub-backend kvpress --max-subcall-chars 131072` | same, but ~32k-TOKEN chunks — fewer, bigger reads, the regime compression is supposed to enable |
+| `rlm+scratchpad+press` (4a) | `... --sub-backend kvzip` | sub-calls read their slice through a KVzip-compressed KV cache, same 32k-char chunks as arms 2–3 (isolates the press effect) |
+| `rlm+scratchpad+press` (4b) | `... --sub-backend kvzip --max-subcall-chars 131072` | same, but ~32k-TOKEN chunks — fewer, bigger reads, the regime compression is supposed to enable |
 | `vanilla+press` (cell 5) | `run_infolab.sh kvzip-baseline` | the press alone, through the standard kvpress `evaluate.py` path |
 
 `--mode both` produces the first two arms in one pass, so the vanilla arm is not
@@ -95,31 +95,41 @@ Each subset is 110 examples: `_load_loft` concatenates **dev (10) then test
 
 ## The KV-compression arms (4a/4b and the kvzip baseline)
 
-### Two venvs, one driver
+### Venvs
 
 The vLLM **server** needs `transformers==4.51.3` (5.x removed
-`all_special_tokens_extended`); kvpress needs `transformers>=4.56` (the new
-`Cache.layers` API). They cannot share an environment, so `setup` creates two:
-`.venv` serves vLLM, `.venv-kvpress` runs everything press-related. The trick
-that makes arm 4 work with no HTTP shim: the benchmark **driver** imports
-neither vllm nor transformers on its own, so it runs from `.venv-kvpress`,
-talks to the vLLM ROOT server over HTTP, and hosts the compressed SUB model
-in-process (`evaluation/rlm/kvpress_backend.py`).
+`all_special_tokens_extended`) — and standalone KVzip
+(https://github.com/snu-mllab/KVzip) pins the SAME version, so the arm-4
+driver runs from the main `.venv`: it talks to the vLLM ROOT server over HTTP
+and hosts the KVzip SUB model in-process
+(`evaluation/rlm/kvzip_backend.py`). `setup` clones KVzip into `$KVZIP_DIR`
+(default `KVzip/`), installs flash-attn (hard requirement — KVzip's evict
+cache decodes through `flash_attn_varlen_func`, no sdpa fallback), and builds
+its `tiny_api_cuda` kernel — WITHOUT pip-installing the KVzip repo, whose
+pyproject would force-downgrade torch to 2.3.0. Only the cell-5 baseline still
+uses `.venv-kvpress` (the kvpress library needs `transformers>=4.56`).
 
 ### What actually changes inside the RLM
 
-With `--sub-backend kvpress` the REPL tool becomes
-`llm_query(question, context_text)`: the slice rides through
-`KVPressTextGenerationPipeline`, which compresses ONLY the slice's KV during
-prefill; the question (and `SUB_SYSTEM_PROMPT`) stay uncompressed. Two
-documented deviations from the NIM path:
+With `--sub-backend kvzip` the REPL tool becomes
+`llm_query(question, context_text)`: the slice is prefilled into KVzip's
+`EvictCache`, scored by context reconstruction, pruned to the target ratio,
+and the question (and `SUB_SYSTEM_PROMPT`) decode against the pruned cache
+uncompressed. Documented deviations from the NIM path:
 
-1. the kvpress pipeline has no system-role support, so the sub system prompt is
-   prepended to the question side (identical across 4a/4b/ratios, so internal
-   comparisons stay valid);
-2. **KVzip here is logical compression** — evicted keys are masked via the
-   attention patch, not freed — so `retained`-token metrics are quality knobs,
-   not memory savings. Budget GPU memory for the full uncompressed KV.
+1. KVzip renders the context under its own fixed chat template (a generic
+   system prompt + QA instruction), so the sub system prompt is prepended to
+   the question side (identical across 4a/4b/ratios, so internal comparisons
+   stay valid);
+2. **eviction is physical**: pruned KV is freed before decoding — but only
+   AFTER prefill+scoring, so PEAK memory is still the full uncompressed KV;
+3. `--compression-ratio` keeps the kvpress convention (fraction EVICTED); the
+   backend converts to KVzip's `prune(ratio)` (fraction RETAINED);
+4. the backend preflights GPU choice: it pins to the requested (or freest)
+   GPU via `CUDA_VISIBLE_DEVICES`, refuses to load without
+   `--sub-min-free-gib` of free memory, and pre-checks each sub-call's KV
+   against actual free memory (too-big slices come back as a retry notice
+   instead of an OOM).
 
 ### Colocation budget (one 48 GB card, `KVPRESS_ARMS=1`)
 
@@ -130,7 +140,7 @@ to make room for the in-process sub model:
 |---|---|
 | vLLM root, `--max-model-len 65536`, capped at `ROOT_BUDGET_MIB` | ~21 GB (8 weights + overhead + KV pool) |
 | HF sub model | ~8.1 GB weights |
-| one 34k-token sub prefill (full KV — KVzip masks, doesn't free) | ~4.9 GB |
+| one 34k-token sub prefill (peak = full KV; eviction frees it only after scoring) | ~4.9 GB |
 | KVzip scoring transient | ~2.5 GB |
 | **total** | **~37 GB** (≈11 GB margin for co-tenants) |
 
