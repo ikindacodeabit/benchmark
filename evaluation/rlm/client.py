@@ -61,14 +61,28 @@ class NIMClient:
     temperature: float = 0.0
     max_tokens: int = 4096
     extra_body: dict | None = None
+    # Optional shared limiter: pass ONE RateLimiter to several clients (e.g. the
+    # RLM root + sub) so the rpm cap applies per ACCOUNT, not per client — two
+    # independent limiters would otherwise let the process issue ~2x rpm.
+    limiter: RateLimiter | None = None
     usage: Usage = field(default_factory=Usage)
 
     def __post_init__(self) -> None:
         key = self.api_key or os.environ.get("NVIDIA_API_KEY")
+        # Only the hosted NVIDIA catalog actually authenticates; a local
+        # vLLM/NIM server accepts any string, so don't make a laptop/infolab run
+        # fail on a key it never needed.
         if not key:
-            raise RuntimeError("Set NVIDIA_API_KEY (get one at build.nvidia.com).")
+            if "api.nvidia.com" in self.base_url:
+                raise RuntimeError(
+                    "NVIDIA_API_KEY is not set, and base_url points at the hosted NVIDIA catalog "
+                    f"({self.base_url}), which requires one (get it at build.nvidia.com). "
+                    "If you meant a local server, pass --base-url http://localhost:8000/v1 — "
+                    "no key is needed there."
+                )
+            key = "EMPTY"  # placeholder; local OpenAI-compatible servers ignore it
         self._client = OpenAI(base_url=self.base_url, api_key=key, timeout=self.timeout)
-        self._limiter = RateLimiter(self.rpm)
+        self._limiter = self.limiter or RateLimiter(self.rpm)
 
     def chat(self, messages: list[dict], **kw) -> str:
         """One chat completion with backoff. Returns assistant text."""
@@ -90,14 +104,19 @@ class NIMClient:
                 resp = self._client.chat.completions.create(**params)
                 self.usage.add(resp)
                 return resp.choices[0].message.content or ""
-            except (RateLimitError, APITimeoutError) as e:
+            except (RateLimitError, APITimeoutError):
                 if attempt == self.max_retries - 1:
                     raise
                 time.sleep(delay)
                 delay = min(delay * 2, 120)
             except APIError as e:
-                # 5xx are retryable; 4xx (bad request, context too long) are not
-                if getattr(e, "status_code", 500) and e.status_code < 500:
+                # 5xx are retryable; 4xx (bad request, context too long) are not.
+                # Connection errors (e.g. APIConnectionError) have no status_code
+                # at all -- treat those as retryable too. Exception: NIM returns
+                # 400 "DEGRADED function cannot be invoked" while an endpoint is
+                # unhealthy -- that's a transient service condition, retry it.
+                status = getattr(e, "status_code", None)
+                if status is not None and status < 500 and "DEGRADED" not in str(e):
                     raise
                 if attempt == self.max_retries - 1:
                     raise

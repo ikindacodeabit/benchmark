@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 """LOFT RAG evaluation metrics - exact implementation from LOFT.
 
 This module contains the exact evaluation functions from LOFT's evaluation codebase,
@@ -14,6 +16,8 @@ from typing import Any, Dict, List
 import numpy as np
 import pandas as pd
 import scipy.optimize
+
+from .answer_extraction import extract_answers
 
 
 def normalize_answer(s: str) -> str:
@@ -238,6 +242,18 @@ def calculate_metrics(df: pd.DataFrame) -> Dict[str, Any]:
         pred_answers_raw: List[str] = extract_prediction(
             predicted_output, answer_prefix.lower()
         )
+
+        if not pred_answers_raw:
+            # `extract_prediction` needs a bracketed list or a cue line. The RLM arm
+            # answers with a bare `str(FINAL(x))` and has neither, so without this
+            # fallback every RLM row scores 0.0 no matter how correct it is, while
+            # cued baseline prose scores normally. Running the fallback only on an
+            # empty result keeps replies that already parse bit-identical.
+            pred_answers_raw = extract_answers(
+                predicted_output,
+                answer_prefix=answer_prefix,
+                expect_list=is_multi_value,
+            )
 
         if not pred_answers_raw:
             all_em_scores.append(0.0)

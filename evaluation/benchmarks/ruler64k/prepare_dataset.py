@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 """Download RULER 64K into the Hugging Face cache for offline compute nodes.
 
 Run this script once on a login node with internet access.  It respects the

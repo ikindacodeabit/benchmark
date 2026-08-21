@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 from datasets import load_dataset
 
 huggingface_dataset_id = "MaxJeblick/InfiniteBench"
