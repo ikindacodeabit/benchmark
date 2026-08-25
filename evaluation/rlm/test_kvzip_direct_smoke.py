@@ -13,7 +13,6 @@ about whether KVzipSubClient itself works.
 Usage: run on a GPU node, e.g. via sbatch.
 """
 import random
-import string
 
 from evaluation.rlm.kvzip_backend import KVzipSubClient
 
