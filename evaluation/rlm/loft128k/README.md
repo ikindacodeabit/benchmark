@@ -1,5 +1,13 @@
 # LOFT-128k: vanilla vs RLM vs RLM+scratchpad vs RLM+scratchpad+KV-compression
 
+> **STALE from "The KV-compression arms" onward.** That section still describes the
+> standalone `snu-mllab/KVzip` backend (physical eviction, `KVZIP_DIR`, flash-attn,
+> `--compression-ratio`, `.venv-kvpress`), which was replaced by kvpress's own
+> `KVzipPress` in commit `0ec65c5`. Compression is now LOGICAL (masked, never freed),
+> the knob is `--memory-budget` / `--memory-budget-unit`, and there is a third arm `4c`
+> that derives the chunk size from the budget. See [RLM.md](../../../RLM.md) for the
+> current picture. Arms 1-3 and everything above that section are still accurate.
+
 Experiment arms on LOFT's five RAG subsets at 128k context, all on
 `Qwen/Qwen3-4B-Instruct-2507`:
 
