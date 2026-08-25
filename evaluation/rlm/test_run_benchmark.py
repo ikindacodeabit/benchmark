@@ -93,8 +93,11 @@ def _args(**overrides) -> argparse.Namespace:
         max_context_tokens=None,
         sub_backend="nim",
         press="kvzip",
-        compression_ratio=0.5,
+        memory_budget=1.0,
+        memory_budget_unit="GB",
         max_subcall_chars=32000,
+        subcall_sizing_mode="fixed",
+        target_compression_ratio=None,
     )
     base.update(overrides)
     return argparse.Namespace(**base)
@@ -110,19 +113,33 @@ class RunDirComponentsTest(unittest.TestCase):
             ["loft", "nq_128k", "Qwen_Qwen3-4B-Instruct-2507", "rlm", "scratchpad"],
         )
 
-    def test_kvzip_backend_stamps_press_ratio_and_nondefault_chunk(self):
-        args = _args(sub_backend="kvzip", compression_ratio=0.75, max_subcall_chars=131072)
+    def test_kvzip_backend_stamps_press_budget_and_nondefault_chunk(self):
+        args = _args(sub_backend="kvzip", memory_budget=2.0, max_subcall_chars=131072)
         self.assertEqual(
             build_run_dir_components(args, "rlm", Scratchpad()),
-            ["loft", "nq_128k", "Qwen_Qwen3-4B-Instruct-2507", "rlm", "scratchpad", "kvzip-kvzip0.75", "sub131072"],
+            ["loft", "nq_128k", "Qwen_Qwen3-4B-Instruct-2507", "rlm", "scratchpad", "kvzip-kvzip2GB", "sub131072"],
         )
 
     def test_default_chunk_size_adds_no_suffix(self):
         args = _args(sub_backend="kvzip")
         self.assertEqual(
             build_run_dir_components(args, "rlm", None)[-1],
-            "kvzip-kvzip0.5",
+            "kvzip-kvzip1GB",
         )
+
+    def test_auto_sizing_gets_its_own_directory(self):
+        """An auto run that happens to resolve to exactly the default size must NOT
+        resume into the hand-sized checkpoint: the marker is the only thing
+        distinguishing them, since neither carries a `sub<N>` component."""
+        fixed = build_run_dir_components(_args(sub_backend="kvzip"), "rlm", None)
+        auto = build_run_dir_components(
+            _args(sub_backend="kvzip", subcall_sizing_mode="auto", target_compression_ratio=0.9),
+            "rlm",
+            None,
+        )
+        self.assertEqual(auto[-1], "autosub0.9")
+        self.assertNotIn("sub32000", auto)
+        self.assertNotEqual(fixed, auto)
 
     def test_vanilla_mode_ignores_rlm_only_knobs(self):
         args = _args(sub_backend="kvzip", max_subcall_chars=131072, max_context_tokens=4096)

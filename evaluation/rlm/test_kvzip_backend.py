@@ -8,7 +8,10 @@ FAST and CLEARLY instead of OOMing twenty minutes into a run.
 """
 import os
 import unittest
+from types import SimpleNamespace
 from unittest import mock
+
+import torch
 
 from evaluation.rlm import kvzip_backend
 
@@ -67,10 +70,84 @@ class PreflightSelectGpuTest(unittest.TestCase):
                 kvzip_backend.preflight_select_gpu(min_free_gib=14.0, device="cuda:7")
 
 
-class ImportKvzipTest(unittest.TestCase):
-    def test_bad_checkout_path_is_rejected_before_sys_path_pollution(self):
-        with self.assertRaisesRegex(RuntimeError, "not a KVzip checkout"):
-            kvzip_backend.import_kvzip(kvzip_dir=os.path.dirname(__file__))
+def _fake_client(free_bytes=40 * 1024**3, max_position_embeddings=262144, max_context_tokens=34000):
+    """A KVzipSubClient with the model/GPU dependencies stubbed out.
+
+    Built via __new__ so no weights load and no CUDA context is created — the
+    same trick tests/test_pipeline.py uses. Config numbers are
+    Qwen3-4B-Instruct-2507's, so kv_bytes_per_token comes out at the real 147,456.
+    """
+    model = SimpleNamespace(
+        config=SimpleNamespace(
+            model_type="qwen3",
+            num_hidden_layers=36,
+            num_attention_heads=32,
+            num_key_value_heads=8,
+            hidden_size=4096,
+            head_dim=128,
+            max_position_embeddings=max_position_embeddings,
+        ),
+        model=SimpleNamespace(layers=[SimpleNamespace(self_attn=object()) for _ in range(36)]),
+        dtype=torch.bfloat16,
+    )
+    # 1 char == 1 token, so the calibrated ratio is a clean 1.0.
+    tokenizer = SimpleNamespace(encode=lambda s, add_special_tokens=False: list(range(len(s))))
+
+    client = kvzip_backend.KVzipSubClient.__new__(kvzip_backend.KVzipSubClient)
+    client.pipeline = SimpleNamespace(model=model, tokenizer=tokenizer)  # type: ignore[assignment]
+    client.memory_budget = 1.0
+    client.memory_budget_unit = "GB"
+    client.max_context_tokens = max_context_tokens
+    client._kv_bytes_per_token = 36 * 2 * 8 * 128 * 2
+    client._torch = SimpleNamespace(  # type: ignore[assignment]
+        cuda=SimpleNamespace(mem_get_info=lambda: (free_bytes, free_bytes))
+    )
+    client.subcall_sizing = None
+    return client
+
+
+class PlanSubcallChunkTest(unittest.TestCase):
+    """The planner's plumbing: budget in, size out, every cap considered."""
+
+    def test_it_derives_the_size_from_the_budget_and_records_the_reasoning(self):
+        client = _fake_client(max_context_tokens=131072)
+        sizing = client.plan_subcall_chunk(document="word " * 20000, target_compression_ratio=0.75)
+
+        # 1 GB / 147,456 B per token = 6,781 retained; /(1-0.75) = 27,124 admitted.
+        self.assertEqual(sizing.token_budget, 6781)
+        self.assertEqual(sizing.tokens, 27124)
+        self.assertEqual(sizing.binding, "budget")
+        self.assertAlmostEqual(sizing.realized_ratio_if_filled, 0.75, places=3)
+        self.assertEqual(sizing.kv_bytes_per_token, 147456)
+        self.assertIs(client.subcall_sizing, sizing)
+
+    def test_the_cli_context_cap_is_applied_when_none_is_passed(self):
+        """--sub-max-context-tokens must bind even though the caller didn't repeat it."""
+        client = _fake_client(max_context_tokens=34000)
+        sizing = client.plan_subcall_chunk(document="word " * 20000, target_compression_ratio=0.9)
+        self.assertEqual(sizing.binding, "cli_cap")
+        self.assertLess(sizing.realized_ratio_if_filled, 0.9)
+
+    def test_a_full_gpu_binds_the_size(self):
+        client = _fake_client(free_bytes=3 * 1024**3, max_context_tokens=131072)
+        sizing = client.plan_subcall_chunk(document="word " * 20000, target_compression_ratio=0.9)
+        self.assertEqual(sizing.binding, "gpu_fit")
+
+    def test_the_model_window_is_read_from_the_config(self):
+        client = _fake_client(max_position_embeddings=8192, max_context_tokens=131072)
+        sizing = client.plan_subcall_chunk(document="word " * 20000, target_compression_ratio=0.9)
+        self.assertEqual(sizing.binding, "sub_window")
+        self.assertEqual(sizing.caps["sub_window"], 8192 - 1024)
+
+    def test_the_reserve_reaches_the_planner(self):
+        """--subcall-reserve-tokens has to actually move the caps, or the question
+        and the decoded answer are unbudgeted."""
+        client = _fake_client(max_position_embeddings=8192, max_context_tokens=131072)
+        sizing = client.plan_subcall_chunk(
+            document="word " * 20000, target_compression_ratio=0.9, reserve_tokens=4096
+        )
+        self.assertEqual(sizing.caps["sub_window"], 8192 - 4096)
+        self.assertEqual(sizing.tokens, 8192 - 4096)
 
 
 if __name__ == "__main__":

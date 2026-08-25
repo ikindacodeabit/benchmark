@@ -99,12 +99,8 @@ if [ -n "${KVPRESS_ARMS:-}" ]; then
         echo "ERROR: no venv python at $KVPY; run run_infolab.sh setup first (or set KVZIP_PYTHON)" >&2
         exit 1
     fi
-    KVZIP_DIR="${KVZIP_DIR:-KVzip}"
-    if [ ! -f "$KVZIP_DIR/model/wrapper.py" ]; then
-        echo "ERROR: no KVzip checkout at $KVZIP_DIR (run run_infolab.sh setup, or set KVZIP_DIR)" >&2
-        exit 1
-    fi
-    export KVZIP_DIR
+    # No KVzip checkout needed any more: the sub-backend uses kvpress's own
+    # KVzipPress through KVPressTextGenerationPipeline, not snu-mllab/KVzip.
     KV_BASE=(
         --dataset loft
         --data-dir "${DATASET}_${LENGTH}"
@@ -124,7 +120,11 @@ if [ -n "${KVPRESS_ARMS:-}" ]; then
         --sub-max-tokens "${KV_SUB_MAX_TOKENS:-512}"
     )
     FAILED=0
-    for ratio in ${KV_RATIOS:-0.5 0.75}; do
+    # KV budgets, not compression ratios: the press takes a memory budget and
+    # derives each call's ratio from the slice it actually receives. These are
+    # matrix_constants.EXTENDED_KV_BUDGETS values so the arm-4 numbers sit on the
+    # same axis as the LOFT/RULER matrix runs.
+    for budget in ${KV_BUDGETS:-0.512 1}; do
         for arm in ${KV_ARMS:-4a 4b}; do
             case "$arm" in
             # 4a keeps the 32k-char chunking of arms 2/3 (isolates the press
@@ -132,18 +132,28 @@ if [ -n "${KVPRESS_ARMS:-}" ]; then
             # regime compression is supposed to enable). KVzip scores in 2-3
             # extra prefill passes, so 4b calls run ~a minute each: fewer calls,
             # longer per-example budget.
+            # 4c derives the chunk from the budget instead of hand-picking it, so
+            # the realized compression ratio is held constant across budgets
+            # rather than drifting with whatever size was chosen. Kept as a THIRD
+            # arm rather than retargeting 4a/4b, whose results are mid-campaign.
             4a) EXTRA=(--max-subcall-chars 32000 --max-sub-calls 40 --run-timeout "${KV_RUN_TIMEOUT_4A:-2400}") ;;
             4b) EXTRA=(--max-subcall-chars 131072 --max-sub-calls 16 --run-timeout "${KV_RUN_TIMEOUT_4B:-3600}") ;;
+            4c) EXTRA=(
+                --max-subcall-chars auto
+                --target-compression-ratio "${KV_TARGET_RATIO:-0.75}"
+                --max-sub-calls 16
+                --run-timeout "${KV_RUN_TIMEOUT_4C:-3600}"
+            ) ;;
             *)
-                echo "ERROR: unknown KV_ARMS entry '$arm' (use 4a and/or 4b)" >&2
+                echo "ERROR: unknown KV_ARMS entry '$arm' (use 4a, 4b and/or 4c)" >&2
                 exit 2
                 ;;
             esac
-            echo "--- arm $arm: rlm+scratchpad+${KV_PRESS:-kvzip} ratio $ratio ---"
+            echo "--- arm $arm: rlm+scratchpad+${KV_PRESS:-kvzip} budget ${budget}GB ---"
             CUDA_VISIBLE_DEVICES="${RLM_SUB_GPU:-0}" "$KVPY" -m evaluation.rlm.run_benchmark \
-                "${KV_BASE[@]}" --compression-ratio "$ratio" "${EXTRA[@]}" ||
+                "${KV_BASE[@]}" --memory-budget "$budget" --memory-budget-unit GB "${EXTRA[@]}" ||
                 {
-                    echo "WARN: ${DATASET} arm $arm ratio $ratio failed"
+                    echo "WARN: ${DATASET} arm $arm budget ${budget}GB failed"
                     FAILED=1
                 }
         done

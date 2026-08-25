@@ -36,10 +36,15 @@ import subprocess
 from typing import Any, Optional
 
 from .client import Usage
+from .sizing import (
+    DEFAULT_RESERVE_TOKENS,
+    SubcallSizing,
+    calibrate_chars_per_token,
+    gpu_fit_token_cap,
+    size_subcall_chunk,
+)
 
 SUB_PRESS_CHOICES = ("kvzip", "no_press")
-
-_GIB = 1024**3
 
 
 # ---- preflight checks -------------------------------------------------------
@@ -174,6 +179,72 @@ class KVzipSubClient:
         # backend's fit check agrees with LOFT/RULER's own budget math.
         self._kv_bytes_per_token = get_model_adapter(hf_model).kv_bytes_per_token(hf_model)
         self._torch = torch
+        self.subcall_sizing: Optional[SubcallSizing] = None
+
+    @property
+    def kv_bytes_per_token(self) -> int:
+        """Per-token KV cost of the sub model; the scale factor for every budget."""
+        return self._kv_bytes_per_token
+
+    def token_len(self, text: str) -> int:
+        """Public token count through the SUB tokenizer (not the root's counter)."""
+        return self._token_len(text)
+
+    # ---- chunk sizing -------------------------------------------------------
+    def plan_subcall_chunk(
+        self,
+        document: str,
+        target_compression_ratio: float,
+        cli_max_context_tokens: Optional[int] = None,
+        reserve_tokens: int = DEFAULT_RESERVE_TOKENS,
+    ) -> SubcallSizing:
+        """Size the chunk advertised to the root from this client's KV budget.
+
+        Resolved ONCE per run and frozen: the size is rendered into the root's
+        system prompt, so re-deriving it per example would vary the prompt across
+        examples of the same run and make the result non-reproducible.
+
+        `document` is a real context from the dataset under test -- the
+        chars-per-token ratio is measured from it rather than assumed, because a
+        wrong ratio overshoots the token cap and the context is then truncated.
+        """
+        # Deferred like every other kvpress/torch import in this module: the nim
+        # path must stay importable where they are absent.
+        from kvpress.model_adapter import get_model_adapter
+        from kvpress.pipeline import compute_token_budget_from_memory
+
+        token_budget, kv_bytes_per_token, _ = compute_token_budget_from_memory(
+            self.pipeline.model, self.memory_budget, self.memory_budget_unit
+        )
+        chars_per_token, source = calibrate_chars_per_token(
+            document, lambda s: self.pipeline.tokenizer.encode(s, add_special_tokens=False)
+        )
+
+        # The model's own window. No adapter method reports it, so read it off the
+        # text config the adapter already knows how to find (multimodal configs
+        # nest it under .text_config).
+        text_config = get_model_adapter(self.pipeline.model).get_text_config(self.pipeline.model)
+        sub_window_tokens = getattr(text_config, "max_position_embeddings", None)
+
+        free_bytes, _ = self._torch.cuda.mem_get_info()
+
+        sizing = size_subcall_chunk(
+            token_budget=token_budget,
+            target_compression_ratio=target_compression_ratio,
+            chars_per_token=chars_per_token,
+            chars_per_token_source=source,
+            kv_bytes_per_token=kv_bytes_per_token,
+            memory_budget=self.memory_budget,
+            memory_budget_unit=self.memory_budget_unit,
+            sub_window_tokens=sub_window_tokens,
+            cli_max_context_tokens=cli_max_context_tokens or self.max_context_tokens,
+            gpu_free_bytes=free_bytes,
+            reserve_tokens=reserve_tokens,
+        )
+        self.subcall_sizing = sizing
+        print(f"[kvzip] sub-chunk sizing: {sizing.describe()}")
+        print(f"[kvzip] caps considered: {sizing.caps}")
+        return sizing
 
     # ---- NIMClient-compatible surface ---------------------------------------
     def chat(self, messages: list[dict], **kw: Any) -> str:
@@ -198,12 +269,15 @@ class KVzipSubClient:
 
         Unlike a real-eviction backend, kvpress's KVzipPress never frees the
         masked-out KV -- the full context's cache is resident for the whole
-        call, not just before pruning. 1.2x + 1 GiB covers scoring
+        call, not just before pruning. The 1.2x + 1 GiB headroom covers scoring
         activations and allocator fragmentation; erring cautious here trades a
         retry notice for an OOM that would torch-poison the loaded weights.
+
+        Shares `gpu_fit_token_cap` with the chunk planner so the size we
+        advertise to the root and the size we accept at call time cannot drift.
         """
         free_bytes, _ = self._torch.cuda.mem_get_info()
-        return ctx_tokens * self._kv_bytes_per_token * 1.2 + 1 * _GIB <= free_bytes
+        return ctx_tokens <= gpu_fit_token_cap(free_bytes, self._kv_bytes_per_token)
 
     def _generate(self, context: str, question: str, split: bool, **kw: Any) -> str:
         ctx_tokens = self._token_len(context)
@@ -212,7 +286,17 @@ class KVzipSubClient:
             # a 131072-char slice of dense text can exceed the model window.
             ids = self.pipeline.tokenizer.encode(context, add_special_tokens=False)
             context = self.pipeline.tokenizer.decode(ids[: self.max_context_tokens])
+            dropped = ctx_tokens - self.max_context_tokens
             ctx_tokens = self.max_context_tokens
+            # Tell the root, the same way llm_query's char cap does. This used to
+            # be silent, so a slice sized in chars that overflowed the token cap
+            # lost its tail with nothing in the transcript to explain a miss.
+            # The notice rides the QUESTION side: the context side is what gets
+            # compressed, and a notice buried there can be evicted.
+            question += (
+                f"\n[NOTE: the text was truncated to {self.max_context_tokens} tokens "
+                f"({dropped} dropped from the end); pass a smaller snippet]"
+            )
         prune = self.press is not None and ctx_tokens >= self.press_min_tokens
         if not self._fits_in_memory(ctx_tokens):
             self._torch.cuda.empty_cache()

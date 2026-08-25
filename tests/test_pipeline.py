@@ -22,6 +22,9 @@ def make_memory_budget_pipeline():
     pipe = KVPressTextGenerationPipeline.__new__(KVPressTextGenerationPipeline)
     pipe.model = SimpleNamespace(
         config=SimpleNamespace(
+            # get_model_adapter dispatches on model_type; without it the adapter
+            # lookup raises before any budget arithmetic happens.
+            model_type="llama",
             num_hidden_layers=32,
             num_key_value_heads=8,
             num_attention_heads=32,
@@ -47,6 +50,16 @@ def test_compute_token_budget_from_memory(budget, unit, expected_tokens, expecte
     assert bytes_per_token == 131_072
     assert token_budget == expected_tokens
     assert budget_bytes == expected_bytes
+
+
+def test_the_method_delegates_to_the_module_level_helper():
+    """The RLM chunk planner calls the module-level function directly (it has no
+    pipeline of its own to hang the private method off). Pin that the two agree,
+    so sizing decisions cannot drift from what the press will actually do."""
+    from kvpress.pipeline import compute_token_budget_from_memory
+
+    pipe = make_memory_budget_pipeline()
+    assert compute_token_budget_from_memory(pipe.model, 1, "GB") == pipe._compute_token_budget_from_memory(1, "GB")
 
 
 @pytest.mark.parametrize(

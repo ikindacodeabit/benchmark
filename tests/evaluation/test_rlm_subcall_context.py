@@ -199,3 +199,23 @@ def test_split_prompt_teaches_the_two_arg_form_and_the_actual_cap():
     assert "llm_query(question: str, context_text: str)" in prompt
     assert "~32000 characters" in prompt  # default max_subcall_chars rendered in
     assert PINNED_DENSE_HELP not in prompt
+
+
+def test_split_prompt_renders_a_budget_derived_cap():
+    """Auto-sizing works by writing the derived size onto max_subcall_chars; the
+    prompt has to carry THAT number, or the root keeps asking for slices the
+    harness then truncates."""
+    root = FakeClient([FINISH_CODE])
+    rlm = RLM(
+        root_client=root,
+        sub_client=FakeSplitClient(),
+        max_steps=3,
+        exec_timeout=None,
+        run_timeout=None,
+        max_sub_calls=None,
+        max_subcall_chars=108496,
+    )
+    rlm.run("hello world", "task")
+    prompt = root.chat_calls[0][0]["content"]
+    assert "~108496 characters" in prompt
+    assert "~32000 characters" not in prompt

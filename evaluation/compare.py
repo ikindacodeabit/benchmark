@@ -88,7 +88,17 @@ def describe_configuration(backend: str, config: dict) -> str:
     if backend == "rlm":
         mode = config.get("mode", "rlm")
         budget = (config.get("memory_budget") or {}).get("max_context_tokens")
-        return f"{mode}" if budget is None else f"{mode}@ctx{budget}"
+        label = f"{mode}" if budget is None else f"{mode}@ctx{budget}"
+        # Without these, two arm-4 runs that differ only in their sub-call KV budget
+        # or chunk size -- the whole point of the arm -- render as the same row.
+        kv_budget = config.get("sub_kv_memory_budget")
+        if kv_budget is not None:
+            label += f"+kv{kv_budget:g}{config.get('sub_kv_memory_budget_unit', 'GB')}"
+            if config.get("subcall_sizing_mode") == "auto":
+                label += f"@auto{config.get('target_compression_ratio', 0.0):g}"
+            else:
+                label += f"@sub{config.get('max_subcall_chars')}"
+        return label
     press = config.get("press_name", "unknown")
     if config.get("memory_budget") is not None:
         return f"{press}@{config['memory_budget']:g}{config.get('memory_budget_unit', 'GB')}"

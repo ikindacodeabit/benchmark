@@ -28,6 +28,40 @@ MEMORY_UNIT_TO_BYTES = {
 }
 
 
+def compute_token_budget_from_memory(
+    model, memory_budget: float, memory_budget_unit: str = "GB", batch_size: int = 1
+) -> tuple[int, int, int]:
+    """
+    Compute how many tokens fit in the KV cache for an explicit memory budget.
+
+    Module-level so callers that need the budget WITHOUT running a generation can
+    reuse it rather than re-deriving the arithmetic -- notably the RLM harness,
+    which sizes its sub-call chunks from the same budget the presses are given
+    (see ``evaluation/rlm/sizing.py``). Depends only on the model, so it needs no
+    pipeline instance.
+
+    Returns the token budget, bytes per token, and budget in bytes.
+    """
+    if memory_budget <= 0:
+        raise ValueError(f"memory_budget must be positive, got {memory_budget}")
+
+    normalized_unit = memory_budget_unit.strip().upper()
+    if normalized_unit not in MEMORY_UNIT_TO_BYTES:
+        supported_units = ", ".join(MEMORY_UNIT_TO_BYTES)
+        raise ValueError(f"Unsupported memory_budget_unit={memory_budget_unit!r}. Supported units: {supported_units}")
+
+    bytes_per_token = get_model_adapter(model).kv_bytes_per_token(model, batch_size)
+    memory_budget_bytes = int(memory_budget * MEMORY_UNIT_TO_BYTES[normalized_unit])
+    token_budget = int(memory_budget_bytes // bytes_per_token)
+    if token_budget < 1:
+        raise ValueError(
+            f"A {memory_budget:g} {memory_budget_unit} KV budget is smaller than one KV token "
+            f"({bytes_per_token} bytes per token for this model)."
+        )
+
+    return token_budget, bytes_per_token, memory_budget_bytes
+
+
 class KVPressTextGenerationPipeline(Pipeline):
     """
     Pipeline for key-value cache compression in causal language models.
@@ -136,28 +170,12 @@ class KVPressTextGenerationPipeline(Pipeline):
         """
         Compute how many tokens can fit in the KV cache for an explicit memory unit.
 
+        Thin delegate to the module-level :func:`compute_token_budget_from_memory`,
+        kept so existing call sites and tests keep working unchanged.
+
         Returns the token budget, bytes per token, and budget in bytes.
         """
-        if memory_budget <= 0:
-            raise ValueError(f"memory_budget must be positive, got {memory_budget}")
-
-        normalized_unit = memory_budget_unit.strip().upper()
-        if normalized_unit not in MEMORY_UNIT_TO_BYTES:
-            supported_units = ", ".join(MEMORY_UNIT_TO_BYTES)
-            raise ValueError(
-                f"Unsupported memory_budget_unit={memory_budget_unit!r}. Supported units: {supported_units}"
-            )
-
-        bytes_per_token = self._compute_kv_bytes_per_token(batch_size)
-        memory_budget_bytes = int(memory_budget * MEMORY_UNIT_TO_BYTES[normalized_unit])
-        token_budget = int(memory_budget_bytes // bytes_per_token)
-        if token_budget < 1:
-            raise ValueError(
-                f"A {memory_budget:g} {memory_budget_unit} KV budget is smaller than one KV token "
-                f"({bytes_per_token} bytes per token for this model)."
-            )
-
-        return token_budget, bytes_per_token, memory_budget_bytes
+        return compute_token_budget_from_memory(self.model, memory_budget, memory_budget_unit, batch_size)
 
     @staticmethod
     def _compute_context_compression_ratio(context_length: int, token_budget: int) -> tuple[int, float]:
@@ -292,7 +310,7 @@ class KVPressTextGenerationPipeline(Pipeline):
         adapter = get_model_adapter(self.model)
         if cache is None:
             cache = DynamicCache()
-        
+
         bytes_per_token = self._compute_kv_bytes_per_token()
         compression_ratio = float(getattr(press, "compression_ratio", 0.0)) if press is not None else 0.0
 

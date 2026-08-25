@@ -289,7 +289,8 @@ print("chat template OK (tolerates enable_thinking)")
 PY
 
     echo "setup done. Next: DATASETS=\"nq\" LENGTH=32k LIMIT=3 SERVERS=1 $0 auto"
-    echo "arm 4:      KVPRESS_ARMS=1 KV_RATIOS=0.5 DATASETS=nq LENGTH=32k LIMIT=1 SERVERS=1 $0 auto"
+    echo "arm 4:      KVPRESS_ARMS=1 KV_BUDGETS=1 KV_ARMS=4a DATASETS=nq LENGTH=32k LIMIT=1 SERVERS=1 $0 auto"
+    echo "arm 4c:     KVPRESS_ARMS=1 KV_BUDGETS=1 KV_ARMS=4c KV_TARGET_RATIO=0.75 DATASETS=nq LENGTH=32k LIMIT=1 SERVERS=1 $0 auto"
     echo "cell 5:     DATASETS=nq KV_RATIOS=0.5 $0 kvzip-baseline"
     exit 0
 fi

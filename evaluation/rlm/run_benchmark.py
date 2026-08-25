@@ -25,6 +25,38 @@ from evaluation.benchmarks.results import score_prediction_frame
 from .client import NIMClient, RateLimiter
 from .datasets import available_datasets, canonical_dataset_name, load_examples
 from .rlm import RLM, MemoryBudget, Scratchpad, vanilla_answer
+from .sizing import DEFAULT_RESERVE_TOKENS
+
+# The historical hand-picked chunk size. Named because it is compared against in
+# build_run_dir_components as well as being the argparse default -- as two separate
+# literals, changing one would silently shift every run directory name.
+DEFAULT_MAX_SUBCALL_CHARS = 32000
+
+
+def _subcall_chars(value: str) -> Any:
+    """Parse --max-subcall-chars: a positive int, or the string 'auto'."""
+    if value.strip().lower() == "auto":
+        return "auto"
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected an integer or 'auto', got {value!r}")
+    if parsed < 1:
+        raise argparse.ArgumentTypeError(f"must be positive, got {parsed}")
+    return parsed
+
+
+def _prior_resolved_chars(run_dir: Path) -> int | None:
+    """The chunk size a previous run of this directory settled on, if recorded."""
+    config_path = run_dir / "config.yaml"
+    if not config_path.exists():
+        return None
+    try:
+        config = yaml.safe_load(config_path.read_text()) or {}
+    except yaml.YAMLError:
+        return None
+    prior = config.get("max_subcall_chars_resolved")
+    return int(prior) if prior else None
 
 
 def normalize(s: str) -> str:
@@ -155,6 +187,15 @@ def write_run_artifacts(
                 float(sum(s.get("pressed_calls", 0) for s in sub_kv) / total_calls) if total_calls else 0.0
             )
 
+    # The size we ASKED for, next to average_sub_compression_ratio which is what we
+    # GOT. They differ whenever the root under-fills the chunk -- the expected
+    # failure mode of auto sizing, and invisible without both numbers side by side.
+    if config.get("sub_backend") == "kvzip":
+        runtime["subcall_chars_advertised"] = config.get("max_subcall_chars")
+        runtime["subcall_sizing_mode"] = config.get("subcall_sizing_mode")
+        runtime["subcall_target_compression_ratio"] = config.get("target_compression_ratio")
+        runtime["subcall_sizing_binding"] = (config.get("subcall_sizing") or {}).get("binding")
+
     metrics["runtime"] = runtime
     (run_dir / "metrics.json").write_text(json.dumps(metrics, indent=2) + "\n")
     (run_dir / "config.yaml").write_text(yaml.safe_dump(config, sort_keys=False))
@@ -184,8 +225,14 @@ def build_run_dir_components(args: argparse.Namespace, mode: str, scratchpad: Sc
         # into an old checkpoint from that backend would silently merge two
         # experiments.
         components.append(f"{args.sub_backend}-{args.press}{args.memory_budget:g}{args.memory_budget_unit}")
-    if mode == "rlm" and args.max_subcall_chars != 32000:
+    if mode == "rlm" and args.max_subcall_chars != DEFAULT_MAX_SUBCALL_CHARS:
         components.append(f"sub{args.max_subcall_chars}")
+    # After the `sub` component, so every hand-sized slug stays byte-identical to
+    # what it was before auto-sizing existed. This marker is the ONLY thing
+    # separating an auto run that happens to resolve to exactly the default size
+    # from the hand-sized default -- neither carries a `sub<N>` component.
+    if mode == "rlm" and getattr(args, "subcall_sizing_mode", "fixed") == "auto":
+        components.append(f"autosub{args.target_compression_ratio:g}")
     return components
 
 
@@ -309,11 +356,29 @@ def main() -> None:
     )
     ap.add_argument(
         "--max-subcall-chars",
-        type=int,
-        default=32000,
+        type=_subcall_chars,
+        default=DEFAULT_MAX_SUBCALL_CHARS,
         help="char cap per llm_query prompt/context slice (was constructor-only); the split "
         "prompt advertises this cap to the root, so raising it is what makes the "
-        "'compression enables bigger reads' arm real",
+        "'compression enables bigger reads' arm real. Pass 'auto' to derive it from "
+        "--memory-budget and --target-compression-ratio instead of picking it by hand "
+        "(requires --sub-backend kvzip)",
+    )
+    ap.add_argument(
+        "--target-compression-ratio",
+        type=float,
+        default=None,
+        help="with --max-subcall-chars auto: the compression ratio the chunk is sized to HIT "
+        "when the root fills it (chunk = token_budget / (1 - ratio)). This only sets the size "
+        "advertised to the root -- the press still derives each call's actual ratio from the "
+        "slice the root really sent, reported as runtime.average_sub_compression_ratio",
+    )
+    ap.add_argument(
+        "--subcall-reserve-tokens",
+        type=int,
+        default=DEFAULT_RESERVE_TOKENS,
+        help="tokens held back from the sub model's window when auto-sizing, to cover the "
+        "question and the decoded answer (the context cap alone budgets for neither)",
     )
     ap.add_argument(
         "--sub-max-tokens",
@@ -369,6 +434,21 @@ def main() -> None:
     if dataset_name == "loft" and args.data_dir not in LOFT_TASKS:
         ap.error("--dataset loft requires --data-dir with one of: " + ", ".join(LOFT_TASKS))
 
+    # --- auto chunk sizing: validate the combination before anything expensive ---
+    auto_chunk = args.max_subcall_chars == "auto"
+    args.subcall_sizing_mode = "auto" if auto_chunk else "fixed"
+    if auto_chunk and args.sub_backend != "kvzip":
+        # The nim path has no KV budget, no press and no local tokenizer, so a
+        # derived size would be a fabricated number recorded in config.yaml.
+        ap.error("--max-subcall-chars auto requires --sub-backend kvzip (the nim path has no KV budget)")
+    if auto_chunk and args.target_compression_ratio is None:
+        ap.error("--max-subcall-chars auto requires --target-compression-ratio")
+    if args.target_compression_ratio is not None:
+        if not auto_chunk:
+            ap.error("--target-compression-ratio only applies with --max-subcall-chars auto")
+        if not 0.0 <= args.target_compression_ratio < 1.0:
+            ap.error("--target-compression-ratio must be in [0.0, 1.0)")
+
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
     modes = ["vanilla", "rlm"] if args.mode == "both" else [args.mode]
@@ -402,6 +482,23 @@ def main() -> None:
     if args.no_think:
         eb = {"chat_template_kwargs": {"enable_thinking": False}}
         root.extra_body = sub.extra_body = eb
+
+    # Resolve the advertised chunk size ONCE, before the RLM is built: it is
+    # rendered into the root's system prompt, so it must be identical for every
+    # example of the run. Needs a real document for the chars-per-token
+    # calibration, and examples only load inside the mode loop below -- so pull
+    # one here. After this block args.max_subcall_chars is always an int.
+    subcall_sizing = None
+    if auto_chunk:
+        sample = next(iter(load_examples(requested_dataset, args.data_dir, 1)))
+        subcall_sizing = sub.plan_subcall_chunk(
+            document=sample["context"],
+            target_compression_ratio=args.target_compression_ratio,
+            cli_max_context_tokens=args.sub_max_context_tokens,
+            reserve_tokens=args.subcall_reserve_tokens,
+        )
+        args.max_subcall_chars = subcall_sizing.chars
+
     budget = None
     if args.max_context_tokens is not None:
         budget = MemoryBudget(
@@ -434,6 +531,20 @@ def main() -> None:
         tdir = run_dir / "transcripts"
         tdir.mkdir(parents=True, exist_ok=True)
         done = load_done(res_path)
+        if auto_chunk and done:
+            # Auto sizing reads live GPU free memory, which a co-tenant process
+            # changes -- so a resumed auto run can resolve to a different size and
+            # merge two differently-sized experiments into one checkpoint. The
+            # run-dir name cannot catch this (it deliberately carries only the
+            # ratio, so auto runs remain resumable at all), so compare explicitly.
+            prior = _prior_resolved_chars(run_dir)
+            if prior and abs(args.max_subcall_chars - prior) > 0.02 * prior:
+                ap.error(
+                    f"{run_dir} holds {len(done)} examples sized at {prior} chars, but this run "
+                    f"resolved to {args.max_subcall_chars}. Resuming would merge two different "
+                    "configurations. Free the GPU and retry, or pass "
+                    f"--max-subcall-chars {prior} to reproduce the original size."
+                )
         print(f"== {dataset_name}/{args.data_dir or 'default'} / {mode} " f"-> {run_dir} ({len(done)} already done)")
 
         n, correct = 0, 0
@@ -560,6 +671,14 @@ def main() -> None:
             "sub_kv_memory_budget": args.memory_budget if args.sub_backend == "kvzip" else None,
             "sub_kv_memory_budget_unit": args.memory_budget_unit if args.sub_backend == "kvzip" else None,
             "max_subcall_chars": args.max_subcall_chars,
+            # How that number was arrived at. `subcall_sizing` carries every cap
+            # considered and which one bound, so a surprising size can be explained
+            # without re-running; `max_subcall_chars_resolved` is what the resume
+            # check compares against.
+            "subcall_sizing_mode": args.subcall_sizing_mode,
+            "target_compression_ratio": args.target_compression_ratio,
+            "max_subcall_chars_resolved": args.max_subcall_chars,
+            "subcall_sizing": asdict(subcall_sizing) if subcall_sizing else None,
             "sub_max_tokens": args.sub_max_tokens if args.sub_backend == "kvzip" else None,
             "sub_max_context_tokens": args.sub_max_context_tokens if args.sub_backend == "kvzip" else None,
             "press_min_tokens": args.press_min_tokens if args.sub_backend == "kvzip" else None,
