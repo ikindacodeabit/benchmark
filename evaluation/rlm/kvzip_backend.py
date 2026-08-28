@@ -143,7 +143,7 @@ class KVzipSubClient:
         device: Optional[str] = None,
         max_new_tokens: int = 512,
         max_context_tokens: int = 34000,
-        press_min_tokens: int = 1024,
+        press_min_tokens: Optional[int] = None,
         min_free_gib: float = 14.0,
     ):
         if press_name not in SUB_PRESS_CHOICES:
@@ -156,7 +156,7 @@ class KVzipSubClient:
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
         from kvpress.model_adapter import get_model_adapter
-        from kvpress.pipeline import KVPressTextGenerationPipeline
+        from kvpress.pipeline import KVPressTextGenerationPipeline, compute_token_budget_from_memory
         from kvpress.presses.kvzip_press import KVzipPress
 
         self.model = model
@@ -172,6 +172,19 @@ class KVzipSubClient:
         self.memory_budget_unit = memory_budget_unit
         self.max_new_tokens = max_new_tokens
         self.max_context_tokens = max_context_tokens
+        # Below this many tokens, pressing is skipped outright. Derived from the
+        # memory budget itself rather than a fixed constant: kvpress's own
+        # compression math already yields ratio=0 for ctx_tokens <= token_budget
+        # (nothing to evict), so skipping the press call below that point is a
+        # free no-op, not a missed opportunity. A fixed floor (the previous
+        # default was 1024) is wrong at small budgets -- e.g. 100MB for
+        # Qwen3-4B is a ~678-token budget, so a 1024-token floor would skip
+        # pressing on calls that are already over budget and have something to
+        # evict. Still overridable via --press-min-tokens for anyone who wants
+        # the old fixed-floor behavior.
+        if press_min_tokens is None:
+            token_budget, _, _ = compute_token_budget_from_memory(hf_model, memory_budget, memory_budget_unit)
+            press_min_tokens = token_budget
         self.press_min_tokens = press_min_tokens
         self._example_stats: list[dict] = []
         # Same helper the rest of kvpress uses to convert a GB budget into a

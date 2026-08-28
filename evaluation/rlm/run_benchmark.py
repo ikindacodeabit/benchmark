@@ -411,8 +411,10 @@ def main() -> None:
     ap.add_argument(
         "--press-min-tokens",
         type=int,
-        default=1024,
-        help="one-arg llm_query prompts below this many tokens skip the press",
+        default=None,
+        help="one-arg llm_query prompts below this many tokens skip the press; "
+        "defaults to the memory budget's own token capacity (kvzip_backend.py "
+        "derives it) rather than a fixed constant",
     )
     ap.add_argument("--out", default="evaluation/results/rlm")
     ap.add_argument("--debug", action="store_true", help="print every RLM step (model reply, code, REPL output) live")
@@ -681,7 +683,10 @@ def main() -> None:
             "subcall_sizing": asdict(subcall_sizing) if subcall_sizing else None,
             "sub_max_tokens": args.sub_max_tokens if args.sub_backend == "kvzip" else None,
             "sub_max_context_tokens": args.sub_max_context_tokens if args.sub_backend == "kvzip" else None,
-            "press_min_tokens": args.press_min_tokens if args.sub_backend == "kvzip" else None,
+            # sub.press_min_tokens (not args.press_min_tokens): when left at the
+            # default None, kvzip_backend.py derives it from the memory budget,
+            # so the resolved value only exists on the constructed client.
+            "press_min_tokens": sub.press_min_tokens if args.sub_backend == "kvzip" else None,
         }
         metrics = write_run_artifacts(
             res_path,
