@@ -99,10 +99,11 @@ class ClampTest(unittest.TestCase):
         self.assertEqual(set(sizing.caps), {"budget", "sub_window", "cli_cap", "gpu_fit"})
         self.assertEqual(min(v for v in sizing.caps.values() if v is not None), sizing.tokens)
 
-    def test_a_pathologically_tight_cap_falls_back_to_the_floor(self):
-        sizing = _size(gpu_free_bytes=KV_FIT_HEADROOM_BYTES, min_tokens=1024)
-        self.assertEqual(sizing.binding, "floor")
-        self.assertEqual(sizing.tokens, 1024)
+    def test_a_pathologically_tight_cap_refuses_to_size_the_run(self):
+        """A GPU that provably cannot hold even min_tokens must stop the run up
+        front, not advertise a floor-sized chunk that every sub-call then fails."""
+        with self.assertRaises(RuntimeError):
+            _size(gpu_free_bytes=KV_FIT_HEADROOM_BYTES, min_tokens=1024)
 
     def test_uncompressed_tokens_records_the_pre_clamp_ask(self):
         sizing = _size(target_compression_ratio=0.9, cli_max_context_tokens=34_000)

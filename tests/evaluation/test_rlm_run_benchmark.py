@@ -208,6 +208,16 @@ class RunDirComponentsTest(unittest.TestCase):
         self.assertNotIn("sub32000", auto)
         self.assertNotEqual(fixed, auto)
 
+    def test_auto_sizing_directory_ignores_the_resolved_size(self):
+        """main() overwrites max_subcall_chars with the resolved int BEFORE the
+        run dir is named. If the name carried it, two auto runs resolving to
+        different sizes (GPU free memory changed) would land in different
+        directories and silently fork instead of hitting the resume guard."""
+        auto = dict(sub_backend="kvzip", subcall_sizing_mode="auto", target_compression_ratio=0.9)
+        first = build_run_dir_components(_args(**auto, max_subcall_chars=101000), "rlm", None)
+        second = build_run_dir_components(_args(**auto, max_subcall_chars=99000), "rlm", None)
+        self.assertEqual(first, second)
+
     def test_a_split_filter_gets_its_own_directory(self):
         """A dev-split smoke run must not resume into the real run's checkpoint --
         but `all` adds nothing, so existing directories keep their names."""

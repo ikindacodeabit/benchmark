@@ -238,10 +238,14 @@ class EvaluationConfig:
             components.append(f"fraction{self.fraction:.3f}")
         if self.max_context_length is not None:
             components.append(f"max_context{self.max_context_length}")
+        if self.fp8:
+            components.append("fp8")
         if self.int8:
             components.append("int8")
         if self.int4:
             components.append("int4_nf4")
+        if self.seed != 42:
+            components.append(f"seed{self.seed}")
         if self.query_aware:
             components.append("query_aware")
         if self.key_channel_compression_ratio is not None:
@@ -250,11 +254,10 @@ class EvaluationConfig:
             components.append(f"needle_depth{self.needle_depth}")
         dir_name = "__".join(filter(None, components))  # Filter None/empty strings
         dir_name = f"new_{dir_name}"
-        config_dir = output_dir / dir_name
-
-        # Use a deterministic directory so interrupted matrix runs can resume.
-        config_dir.mkdir(parents=True, exist_ok=True)
-        return config_dir
+        # Deterministic name so interrupted matrix runs can resume. Creating the
+        # directory is the caller's job: this is also called from the matrix
+        # pre-scan, which must not litter the tree with empty directories.
+        return output_dir / dir_name
 
     def save_config(self, config_filename: Path):
         """
@@ -283,8 +286,9 @@ def _load_yaml_config(path: str | Path, _seen: Optional[set[Path]] = None) -> di
         with open(config_path, "r") as f:
             config = yaml.safe_load(f) or {}
     except FileNotFoundError:
-        logger.warning(f"Config file not found at {config_path}. " "Using only command-line arguments and defaults.")
-        return {}
+        # Silently proceeding on dataclass defaults would run the wrong model,
+        # press, and dataset on a cluster allocation. Fail loudly instead.
+        raise FileNotFoundError(f"Config file not found at {config_path}")
 
     if not isinstance(config, dict):
         raise ValueError(f"Expected a YAML mapping in {config_path}")
@@ -814,9 +818,10 @@ class EvaluationRunner:
         if save_filename.exists():
             logger.warning(f"Results CSV already exists at {save_filename}. Overwriting.")
 
-        self.df[list(set(self.df.columns) - set(["context"]))].to_csv(
-            str(save_filename), index=False
-        )  # type: ignore[index]
+        # drop() keeps the remaining columns in their original, stable order; a
+        # set difference reordered them per process (hash randomization).
+        frame = self.df.drop(columns=["context"], errors="ignore")  # type: ignore[union-attr]
+        frame.to_csv(str(save_filename), index=False)
         logger.info(f"Results saved to {save_filename}")
 
     def _calculate_and_save_metrics(self, save_filename: Path):
@@ -856,8 +861,13 @@ class EvaluationRunner:
                 f"average compression ratio: {metrics['average_compression_ratio']:.6f}"
             )
 
-        with open(str(save_filename), "w") as f:
+        # metrics.json existing is what marks a configuration "done" to the
+        # matrix skip check, so it must appear atomically: a kill mid-write must
+        # not leave a partial file that counts as complete.
+        tmp_filename = save_filename.with_suffix(".json.tmp")
+        with open(str(tmp_filename), "w") as f:
             json.dump(metrics, f, indent=4)  # Pretty print JSON
+        os.replace(tmp_filename, save_filename)
 
         logger.info(f"Metrics saved to {save_filename}")
         logger.info(f"Metrics:\n{json.dumps(metrics, indent=2)}")
@@ -1013,6 +1023,7 @@ Files in this directory:
                         f"{memory_budget:g}{self.config.memory_budget_unit}"
                     )
 
+                results_dir.mkdir(parents=True, exist_ok=True)
                 predictions_filename = results_dir / "predictions.csv"
                 metrics_filename = results_dir / "metrics.json"
                 config_filename = results_dir / "config.yaml"
@@ -1069,7 +1080,13 @@ Files in this directory:
         ]
         # Determine which tasks to run
         if self.config.data_dir is None or (isinstance(self.config.data_dir, list) and len(self.config.data_dir) == 0):
-            # Run all LongBench tasks
+            # The all-tasks default is a LongBench task list; silently iterating
+            # it against another dataset ran 21 nonexistent subsets.
+            if self.config.dataset != "longbench":
+                raise ValueError(
+                    f"No data_dir given and dataset is {self.config.dataset!r}: the run-everything "
+                    "default only exists for longbench. Pass data_dir with the subset(s) to run."
+                )
             tasks_to_run = longbench_tasks
             logger.info(f"No specific tasks provided. Running all {len(tasks_to_run)} LongBench tasks.")
         else:
@@ -1095,6 +1112,7 @@ Files in this directory:
                     f"Evaluation files already exist at \n {predictions_filename} \n {metrics_filename}.\nSkipping..."
                 )
                 continue
+            results_dir.mkdir(parents=True, exist_ok=True)
 
             self._load_and_prepare_dataset(task_data_dir=task)
 

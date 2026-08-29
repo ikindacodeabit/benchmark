@@ -70,7 +70,7 @@ class SubcallSizing:
 
     chars: int
     tokens: int
-    binding: str  # "budget" | "sub_window" | "cli_cap" | "gpu_fit" | "floor"
+    binding: str  # "budget" | "sub_window" | "cli_cap" | "gpu_fit"
     target_compression_ratio: float
     token_budget: int
     kv_bytes_per_token: int
@@ -200,8 +200,11 @@ def size_subcall_chunk(
 
     caps: dict = {
         "budget": uncompressed_tokens,
-        "sub_window": None if sub_window_tokens is None else sub_window_tokens - reserve_tokens,
-        "cli_cap": None if cli_max_context_tokens is None else cli_max_context_tokens - reserve_tokens,
+        # max(0, ...): a reserve larger than the window used to go NEGATIVE here,
+        # win the min() below, and get relabeled "floor" -- advertising a chunk
+        # the GPU provably cannot serve.
+        "sub_window": None if sub_window_tokens is None else max(0, sub_window_tokens - reserve_tokens),
+        "cli_cap": None if cli_max_context_tokens is None else max(0, cli_max_context_tokens - reserve_tokens),
         "gpu_fit": (
             None if gpu_free_bytes is None else gpu_fit_token_cap(gpu_free_bytes, kv_bytes_per_token)
         ),
@@ -211,10 +214,16 @@ def size_subcall_chunk(
     tokens = live[binding]
 
     if tokens < min_tokens:
-        # Every cap is implausibly tight (a nearly-full GPU, a tiny window). Return
-        # a floor and label it, so the caller reports an unusable configuration
-        # rather than advertising a zero-length chunk to the model.
-        tokens, binding = min_tokens, "floor"
+        # Every cap is implausibly tight (a nearly-full GPU, a tiny window).
+        # Proceeding used to relabel this "floor" and advertise min_tokens
+        # anyway -- and every sub-call then came back [SUB-MODEL ERROR]. An
+        # unusable configuration should stop the run before it burns hours.
+        table = ", ".join(f"{name}={value}" for name, value in caps.items())
+        raise RuntimeError(
+            f"auto chunk sizing came out at {tokens} tokens (binding {binding!r}), below the "
+            f"usable minimum of {min_tokens}. Caps considered: {table}. Free GPU memory, raise "
+            "--sub-max-context-tokens, or lower --subcall-reserve-tokens."
+        )
 
     return SubcallSizing(
         chars=int(tokens * chars_per_token),

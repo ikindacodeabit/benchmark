@@ -93,12 +93,29 @@ def preflight_select_gpu(min_free_gib: float, device: Optional[str] = None) -> i
         )
     table = "; ".join(f"GPU{g['index']}: {g['free_gib']:.1f}/{g['total_gib']:.1f} GiB free" for g in gpus)
 
+    # nvidia-smi reports PHYSICAL indices, but under a pre-set
+    # CUDA_VISIBLE_DEVICES (SLURM sets one routinely) torch device ordinals --
+    # and therefore --sub-device cuda:N -- are LOGICAL indices into that mask.
+    # Resolve through the mask so cuda:1 means "my second allocated GPU", and
+    # never pin outside the allocation.
+    mask = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    visible = [int(p) for p in mask.split(",") if p.strip()] if mask else None
+
     pinned: Optional[int] = None
     if device and device.startswith("cuda:"):
-        pinned = int(device.split(":", 1)[1])
-    elif os.environ.get("CUDA_VISIBLE_DEVICES", "").strip():
+        ordinal = int(device.split(":", 1)[1])
+        if visible is not None:
+            if ordinal >= len(visible):
+                raise RuntimeError(
+                    f"--sub-device {device} is out of range: CUDA_VISIBLE_DEVICES={mask!r} "
+                    f"exposes only {len(visible)} GPU(s)."
+                )
+            pinned = visible[ordinal]
+        else:
+            pinned = ordinal
+    elif visible is not None:
         # Already pinned externally; check the first visible physical GPU.
-        pinned = int(os.environ["CUDA_VISIBLE_DEVICES"].split(",")[0])
+        pinned = visible[0]
 
     if pinned is not None:
         match = next((g for g in gpus if g["index"] == pinned), None)
@@ -311,6 +328,11 @@ class KVzipSubClient:
                 f"({dropped} dropped from the end); pass a smaller snippet]"
             )
         prune = self.press is not None and ctx_tokens >= self.press_min_tokens
+        if prune:
+            # Presses carry per-call state; evaluate.py resets between matrix
+            # configurations for the same reason. One shared instance serving
+            # every sub-call of a run must not leak scores across calls.
+            self.press._reset_internal_parameters()
         if not self._fits_in_memory(ctx_tokens):
             self._torch.cuda.empty_cache()
             if not self._fits_in_memory(ctx_tokens):

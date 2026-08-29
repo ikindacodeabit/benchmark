@@ -70,6 +70,14 @@ RESUME_CRITICAL_KEYS = (
     "sub_max_context_tokens",
     "press_min_tokens",
     "sub_max_tokens",
+    "data_dir",
+    # Dicts: comparing them whole covers their nested knobs too
+    # (keep_recent_turns inside memory_budget, max_notes_tokens inside
+    # scratchpad), which have no top-level key of their own.
+    "memory_budget",
+    "scratchpad",
+    "target_compression_ratio",
+    "no_think",
 )
 
 
@@ -80,8 +88,13 @@ def resume_conflicts(run_dir: Path, config: dict) -> list[str]:
         return []
     try:
         prior = yaml.safe_load(config_path.read_text()) or {}
-    except yaml.YAMLError:
-        return []
+    except yaml.YAMLError as exc:
+        # An unreadable config must not silently DISABLE the guard -- that is
+        # the exact failure mode (merging two experiments) it exists to prevent.
+        raise SystemExit(
+            f"{config_path} is corrupt ({exc}); cannot verify this run matches the "
+            "checkpoint beside it. Fix or remove the run directory."
+        )
     return [
         f"{key}: checkpoint was written with {prior.get(key)!r}, this run has {config.get(key)!r}"
         for key in RESUME_CRITICAL_KEYS
@@ -96,8 +109,11 @@ def _prior_resolved_chars(run_dir: Path) -> int | None:
         return None
     try:
         config = yaml.safe_load(config_path.read_text()) or {}
-    except yaml.YAMLError:
-        return None
+    except yaml.YAMLError as exc:
+        raise SystemExit(
+            f"{config_path} is corrupt ({exc}); cannot verify this run's auto-sized "
+            "chunk matches the checkpoint beside it. Fix or remove the run directory."
+        )
     prior = config.get("max_subcall_chars_resolved")
     return int(prior) if prior else None
 
@@ -122,7 +138,13 @@ def load_done(path: Path) -> set:
     for line in open(path):
         if not line.strip():
             continue
-        record = json.loads(line)
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            # A hard kill can tear the last append mid-line. The rest of the
+            # file is intact; treat the torn record as not-done so it reruns.
+            print(f"!! skipping a torn checkpoint line in {path} (interrupted write); its example will rerun")
+            continue
         if not record.get("error"):
             done.add(record["id"])
     return done
@@ -140,7 +162,16 @@ def write_run_artifacts(
     number a KVPress run of this dataset reports and the two are directly
     comparable. Everything RLM-specific lands under ``runtime``.
     """
-    records = [json.loads(line) for line in checkpoint_path.read_text().splitlines() if line.strip()]
+    records = []
+    for line in checkpoint_path.read_text().splitlines():
+        if not line.strip():
+            continue
+        try:
+            records.append(json.loads(line))
+        except json.JSONDecodeError:
+            # Same torn-trailing-line tolerance as load_done: the interrupted
+            # example was rerun and re-appended, so nothing is lost by skipping.
+            continue
     frame = pd.DataFrame(records).rename(columns={"pred": "predicted_answer"})
     # An errored example is RETRIED on resume (load_done ignores it) and the retry
     # APPENDS a record -- the failed one stays in the checkpoint, because a JSONL
@@ -300,13 +331,18 @@ def build_run_dir_components(args: argparse.Namespace, mode: str, scratchpad: Sc
         # into an old checkpoint from that backend would silently merge two
         # experiments.
         components.append(f"{args.sub_backend}-{args.press}{args.memory_budget:g}{args.memory_budget_unit}")
-    if mode == "rlm" and args.max_subcall_chars != DEFAULT_MAX_SUBCALL_CHARS:
+    # Auto-sized runs must NOT stamp the resolved char count into the name: the
+    # resolution reads live GPU free memory, so a resume could resolve slightly
+    # differently, land in a fresh directory, and silently start over instead of
+    # hitting the _prior_resolved_chars guard. Only hand-picked sizes are named.
+    sizing_mode = getattr(args, "subcall_sizing_mode", "fixed")
+    if mode == "rlm" and sizing_mode == "fixed" and args.max_subcall_chars != DEFAULT_MAX_SUBCALL_CHARS:
         components.append(f"sub{args.max_subcall_chars}")
     # After the `sub` component, so every hand-sized slug stays byte-identical to
     # what it was before auto-sizing existed. This marker is the ONLY thing
     # separating an auto run that happens to resolve to exactly the default size
     # from the hand-sized default -- neither carries a `sub<N>` component.
-    if mode == "rlm" and getattr(args, "subcall_sizing_mode", "fixed") == "auto":
+    if mode == "rlm" and sizing_mode == "auto":
         components.append(f"autosub{args.target_compression_ratio:g}")
     return components
 
@@ -818,6 +854,7 @@ def build_run_config(
         "exec_timeout": args.exec_timeout or None,
         "run_timeout": args.run_timeout or None,
         "max_sub_calls": args.max_sub_calls or None,
+        "no_think": bool(args.no_think),
         "sub_backend": args.sub_backend,
         "press": args.press if args.sub_backend == "kvzip" else None,
         # sub_kv_-prefixed: "memory_budget" above is the ROOT's own eviction
