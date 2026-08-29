@@ -6,6 +6,10 @@
 # cached here fails at load time inside the job. LOFT_LENGTHS selects which LOFT
 # splits to pull; the default is the 128k grid. `1m` is large and opt-in.
 #   LOFT_LENGTHS="32k 128k" bash evaluation/rlm/slurm/download_data.sh
+#
+# STAGE selects which benchmark groups to cache (default: all three), so a run
+# that only needs one is not blocked by another's upstream layout changing:
+#   STAGE=loft LOFT_LENGTHS="1m" bash evaluation/rlm/slurm/download_data.sh
 set -euo pipefail
 
 LOFT_LENGTHS="${LOFT_LENGTHS:-128k}"
@@ -41,32 +45,41 @@ import os
 from datasets import load_dataset
 from evaluation.benchmarks.registry import DATASET_REGISTRY, LOFT_RAG_DATASETS, RULER_32K_TASKS
 
-# These are the same IDs/configs consumed by KVPress's shared loader.
-print("Caching shared LongBench-v2 test split ...")
-longbench = load_dataset(DATASET_REGISTRY["longbench-v2"], split="test")
-print(f"LongBench-v2: {len(longbench)} examples")
+# Which groups to cache. Staging everything unconditionally means one unrelated
+# benchmark's upstream layout change blocks the group you actually wanted --
+# e.g. a LOFT-only run dying inside the RULER loop.
+stage = set(os.environ.get("STAGE", "longbench ruler loft").split())
 
-print("Caching shared RULER-32K subsets ...")
-for task in RULER_32K_TASKS:
-    dataset = load_dataset(
-        DATASET_REGISTRY["ruler32k"],
-        data_dir=task,
-        split="test",
-    )
-    print(f"RULER-32K/{task}: {len(dataset)} examples")
+# These are the same IDs/configs consumed by KVPress's shared loader.
+if "longbench" in stage:
+    print("Caching shared LongBench-v2 test split ...")
+    longbench = load_dataset(DATASET_REGISTRY["longbench-v2"], split="test")
+    print(f"LongBench-v2: {len(longbench)} examples")
+
+if "ruler" in stage:
+    print("Caching shared RULER-32K subsets ...")
+    for task in RULER_32K_TASKS:
+        # Must match _load_ruler32k: each task is its own CONFIG and its own
+        # SPLIT, both named after the task. Passing data_dir= instead makes
+        # datasets treat the repo as a directory of raw files and synthesise a
+        # single "train" split, so split="test" then fails with
+        # 'Unknown split "test". Should be one of [train]'.
+        dataset = load_dataset(DATASET_REGISTRY["ruler32k"], task, split=task)
+        print(f"RULER-32K/{task}: {len(dataset)} examples")
 
 # --- LOFT ---
 # LOFT is mirrored per (dataset, length) as its own repo rather than as configs of
 # one repo, so each combination is a separate load_dataset call. `_load_loft`
 # concatenates dev+test, so both splits must be cached.
-lengths = os.environ.get("LOFT_LENGTHS", "128k").split()
-print(f"Caching LOFT RAG subsets for lengths: {', '.join(lengths)} ...")
-for length in lengths:
-    for name in LOFT_RAG_DATASETS:
-        repo = f"f20180301/loft-rag-{name}-{length}"
-        splits = load_dataset(repo)
-        counts = ", ".join(f"{s}={len(d)}" for s, d in splits.items())
-        print(f"LOFT/{name}_{length}: {counts}")
+if "loft" in stage:
+    lengths = os.environ.get("LOFT_LENGTHS", "128k").split()
+    print(f"Caching LOFT RAG subsets for lengths: {', '.join(lengths)} ...")
+    for length in lengths:
+        for name in LOFT_RAG_DATASETS:
+            repo = f"f20180301/loft-rag-{name}-{length}"
+            splits = load_dataset(repo)
+            counts = ", ".join(f"{s}={len(d)}" for s, d in splits.items())
+            print(f"LOFT/{name}_{length}: {counts}")
 
 # --- OOLONG ---
 # The OOLONG benchmark splits live on the Hugging Face Hub; the repo/config
