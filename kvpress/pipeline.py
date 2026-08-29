@@ -309,7 +309,12 @@ class KVPressTextGenerationPipeline(Pipeline):
         # Prefilling using the press on the context
         adapter = get_model_adapter(self.model)
         if cache is None:
-            cache = DynamicCache()
+            # Must go through the adapter: a Qwen3.5 model needs a cache that
+            # carries recurrent_states/conv_states. With a plain DynamicCache
+            # those fields never exist, so snapshot/restore_cache_state below
+            # silently preserved nothing and the recurrent state leaked across
+            # questions sharing a context.
+            cache = adapter.create_cache(self.model)
 
         bytes_per_token = self._compute_kv_bytes_per_token()
         compression_ratio = float(getattr(press, "compression_ratio", 0.0)) if press is not None else 0.0

@@ -74,6 +74,7 @@ def attention_patch(func):
     """
 
     def wrapper(module, query, key, value, attention_mask, dropout, **kwargs):
+        masked_entries = None
         if query.shape[2] == key.shape[2]:
             # Prefilling
             module.masked_key_indices = None
@@ -89,15 +90,25 @@ def attention_patch(func):
             k = search_hyperplane(q)
             k = k.view(bsz, num_key_value_heads, head_dim)
 
-            # At indices, update the keys to the fake keys
+            # At indices, update the keys to the fake keys. `key` is the live
+            # cache tensor, so the originals are kept and put back below: left
+            # in place, these huge synthetic keys persist in the cache, and the
+            # moment a later pass clears masked_key_indices they stop being
+            # masked and start participating in attention as if they were real.
             batch_indices, head_indices, seq_indices = module.masked_key_indices
+            masked_entries = (batch_indices, head_indices, seq_indices, key[batch_indices, head_indices, seq_indices])
             key[batch_indices, head_indices, seq_indices] = k[batch_indices, head_indices]
 
         # see https://github.com/NVIDIA/kvpress/pull/115#issuecomment-3183785597
         # cu_seq_lens_k are only in kwargs if model.generate is used.
         if "cu_seq_lens_k" in kwargs:
             kwargs["cu_seq_lens_k"][-1] = key.shape[-2]
-        return func(module, query, key, value, attention_mask, dropout, **kwargs)
+        try:
+            return func(module, query, key, value, attention_mask, dropout, **kwargs)
+        finally:
+            if masked_entries is not None:
+                batch_indices, head_indices, seq_indices, original = masked_entries
+                key[batch_indices, head_indices, seq_indices] = original
 
     return wrapper
 

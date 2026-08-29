@@ -33,6 +33,57 @@ SUPPORTED_MODELS = (
 )
 
 
+def _bind_model_adapter(press, adapter, model, _seen=None) -> None:
+    """Give ``press`` and every press it delegates to the model adapter.
+
+    Wrapper presses (ComposedPress, PerLayerCompressionPress,
+    PrefillDecodingPress, AdaKVPress, ...) call the INNER press's
+    forward_hook directly, so the inner press needs the adapter even though
+    its own ``__call__`` never runs. Without this the inner press raised
+    ``AttributeError: no attribute '_model_for_adapter'`` on the first
+    compressed layer. Inner presses are found by walking attributes rather
+    than a fixed name list, because wrappers disagree on the field name
+    (press / presses / prefilling_press / decoding_press).
+    """
+    if _seen is None:
+        _seen = set()
+    if id(press) in _seen:
+        return
+    _seen.add(id(press))
+
+    press._model_adapter = adapter
+    press._model_for_adapter = model
+    for value in list(vars(press).values()):
+        for candidate in value if isinstance(value, (list, tuple)) else (value,):
+            if isinstance(candidate, BasePress):
+                _bind_model_adapter(candidate, adapter, model, _seen)
+
+
+def _supported_on_qwen35(press) -> bool:
+    """Whether a press is safe on Qwen3.5's packed query projection.
+
+    Only presses that score from keys alone are: Qwen3.5 packs the attention
+    gate into q_proj, so anything reading query states needs the unpacking in
+    utils.get_prerope_query_states.
+
+    Checked by class rather than by class NAME, and through wrappers. The name
+    check this replaces was wrong in both directions: a ComposedPress or
+    AdaKVPress around KnormPress was rejected despite reading no queries, and
+    any subclass that happened to be named KnormPress was accepted.
+    """
+    # Imported here, not at module scope: these presses import base_press.
+    from kvpress.presses.knorm_press import KnormPress
+    from kvpress.presses.random_press import RandomPress
+
+    inner = getattr(press, "press", None)
+    if inner is not None:
+        return _supported_on_qwen35(inner)
+    nested = getattr(press, "presses", None)
+    if nested is not None:
+        return all(_supported_on_qwen35(p) for p in nested)
+    return isinstance(press, (RandomPress, KnormPress))
+
+
 @dataclass
 class BasePress:
     """
@@ -133,8 +184,13 @@ class BasePress:
         cache = kwargs["past_key_values"]
         adapter = getattr(self, "_model_adapter", None)
         if adapter is None:
-            # Direct hook callers predate model adapters and use the standard cache.
-            adapter = get_model_adapter(self._model_for_adapter)
+            # Only __call__ sets this, and it sets both fields together -- so a
+            # missing adapter meant the old fallback dereferenced an equally
+            # missing _model_for_adapter and raised an opaque AttributeError.
+            raise RuntimeError(
+                f"{type(self).__name__}.forward_hook was called outside the press context manager. "
+                "Register hooks via `with press(model):` so the model adapter is set up."
+            )
         q_len = hidden_states.shape[1]
 
         # Don't compress after pre-filling
@@ -174,13 +230,11 @@ class BasePress:
         ...     outputs = model(input_ids, past_key_values=cache)
         """
         adapter = get_model_adapter(model)
-        if adapter.is_qwen35:
-            supported_press_names = {"RandomPress", "KnormPress"}
-            if type(self).__name__ not in supported_press_names:
-                raise NotImplementedError(
-                    "Qwen3.5 currently supports only no_press, random, and knorm; "
-                    "query-aware presses need Qwen3.5 query-projection handling."
-                )
+        if adapter.is_qwen35 and not _supported_on_qwen35(self):
+            raise NotImplementedError(
+                "Qwen3.5 currently supports only no_press, random, and knorm; "
+                "query-aware presses need Qwen3.5 query-projection handling."
+            )
         if not isinstance(model, SUPPORTED_MODELS) and not adapter.is_qwen35:
             logger.warning(f"Model {type(model)} not tested, supported models: {SUPPORTED_MODELS}")
 
@@ -189,8 +243,7 @@ class BasePress:
 
         self.post_init_from_model(model)
         hooks = []
-        self._model_adapter = adapter
-        self._model_for_adapter = model
+        _bind_model_adapter(self, adapter, model)
         try:
             language_model = adapter.get_language_model(model)
             for layer_idx, attention in adapter.iter_kv_attention_layers(model):
@@ -204,3 +257,7 @@ class BasePress:
         finally:
             for forward_hook in hooks:
                 forward_hook.remove()
+            # Presses in evaluation's registry are module-level singletons, so
+            # holding the model here kept it alive for the process lifetime and
+            # left a stale adapter for the next model to pick up.
+            _bind_model_adapter(self, None, None)

@@ -389,7 +389,9 @@ class EvaluationRunner:
         compression_ratio = self.config.compression_ratio
         key_channel_compression_ratio = self.config.key_channel_compression_ratio
 
-        press = PRESS_REGISTRY[press_name]
+        # A factory: every configuration gets a press of its own, because the
+        # branches below configure it by mutation.
+        press = PRESS_REGISTRY[press_name]()
 
         # Apply compression ratios based on press type
         if isinstance(press, DuoAttentionPress):
