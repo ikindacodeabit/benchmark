@@ -19,10 +19,27 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_rows(path: Path) -> dict[tuple[str, str, str], dict[str, str]]:
+def load_rows(path: Path) -> list[dict[str, str]]:
     with path.open(newline="", errors="replace") as source:
-        rows = list(csv.DictReader(source))
-    return {(row.get("task", ""), row.get("split", ""), row.get("question", "")): row for row in rows}
+        return list(csv.DictReader(source))
+
+
+def key_rows(rows: list[dict[str, str]], key_columns: list[str]) -> dict[tuple[str, ...], dict[str, str]]:
+    return {tuple(row.get(column, "") for column in key_columns): row for row in rows}
+
+
+def shared_key_columns(direct: list[dict[str, str]], reference: list[dict[str, str]]) -> list[str]:
+    """Join on whichever identity columns both CSVs actually carry.
+
+    KVPress CSVs have task/split columns; direct-baseline CSVs only have
+    question. Keying on absent columns silently joins everything on ("",...).
+    """
+    columns = [set(row) for rows in (direct, reference) for row in rows[:1]]
+    present = set.intersection(*columns) if columns else set()
+    keys = [column for column in ("task", "split", "question") if column in present]
+    if "question" not in keys:
+        raise SystemExit("Both CSVs must have a 'question' column to be joinable")
+    return keys
 
 
 def canonical_prediction(value: str) -> str:
@@ -41,8 +58,11 @@ def has_think(value: str) -> bool:
 
 def main() -> None:
     args = parse_args()
-    direct = load_rows(args.direct_csv)
-    reference = load_rows(args.reference_csv)
+    direct_rows = load_rows(args.direct_csv)
+    reference_rows = load_rows(args.reference_csv)
+    key_columns = shared_key_columns(direct_rows, reference_rows)
+    direct = key_rows(direct_rows, key_columns)
+    reference = key_rows(reference_rows, key_columns)
     shared = sorted(set(direct).intersection(reference))
     exact = canonical = direct_think = reference_think = 0
     for key in shared:

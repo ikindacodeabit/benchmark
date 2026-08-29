@@ -174,6 +174,7 @@ def main() -> None:
     ap.add_argument("--results-dir", default=RESULTS_ROOT, help="tree holding both KVPress and RLM run dirs")
     ap.add_argument("--dataset", default=None, help="restrict to one dataset")
     ap.add_argument("--model", default=None, help="restrict to one model id")
+    ap.add_argument("--backend", default=None, choices=["rlm", "kvpress"], help="restrict to one backend")
     ap.add_argument("--csv", default=None, help="also write the joined table here")
     args = ap.parse_args()
 
@@ -190,6 +191,8 @@ def main() -> None:
         frame = frame[frame["dataset"] == args.dataset]
     if args.model:
         frame = frame[frame["model"] == args.model]
+    if args.backend:
+        frame = frame[frame["backend"] == args.backend]
     if frame.empty:
         raise SystemExit("No runs matched the given filters")
 
@@ -220,15 +223,18 @@ def main() -> None:
 
     # A KVPress row and an RLM row are only comparable if they ran the same
     # scorer, which means the same dataset. Say so explicitly rather than letting
-    # a reader assume every printed row belongs in one plot.
-    for (dataset, task), group in frame.groupby(["dataset", "task"]):
-        backends = set(group["backend"])
-        if len(backends) < 2:
-            print(f"\nnote: {dataset}/{task} has only {backends.pop()} runs -- nothing to compare against yet")
-        elif group["metric"].nunique() > 1:
-            print(
-                f"\nwarning: {dataset}/{task} rows use different metrics {sorted(set(group['metric']))}; not comparable"
-            )
+    # a reader assume every printed row belongs in one plot. A --backend view is
+    # deliberately single-backend, so the cross-backend notes don't apply there.
+    if not args.backend:
+        for (dataset, task), group in frame.groupby(["dataset", "task"]):
+            backends = set(group["backend"])
+            if len(backends) < 2:
+                print(f"\nnote: {dataset}/{task} has only {backends.pop()} runs -- nothing to compare against yet")
+            elif group["metric"].nunique() > 1:
+                print(
+                    f"\nwarning: {dataset}/{task} rows use different metrics "
+                    f"{sorted(set(group['metric']))}; not comparable"
+                )
 
     if args.csv:
         frame.to_csv(args.csv, index=False)

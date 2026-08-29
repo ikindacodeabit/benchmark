@@ -154,7 +154,3 @@ def load_examples(
         dataset_registry=DATASET_REGISTRY,
     )
     yield from iter_benchmark_examples(frame, canonical_name, task, limit, split)
-
-
-# Kept for callers that only need a list of accepted names.
-TASKS = {name: name for name in available_datasets()}
