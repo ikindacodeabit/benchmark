@@ -693,6 +693,10 @@ class RLM:
             "sub_calls": 0,
             "sub_call_tokens": 0,
             "sub_cache_hits": 0,
+            # Pre-initialized like every other counter: incremented only via
+            # .get(..., 0) + 1, it was absent from a healthy run's metrics and
+            # downstream aggregation had to special-case its absence.
+            "sub_fit_failures": 0,
             "evictions": 0,
             "overflow_evictions": 0,
             "budget": (self.budget.max_context_tokens if self.budget else None),
@@ -1198,16 +1202,19 @@ def vanilla_answer(
                 shrink_retries=retries,
             )
 
-    for attempt in range(12):
+    # The final attempt is inside the loop, not after it: a 13th call outside
+    # the try raised uncaught on overflow, and record(12) then reported 12
+    # retries for what was really a 13th attempt.
+    last_attempt = 12
+    for attempt in range(last_attempt + 1):
         try:
             out = client.chat([{"role": "user", "content": prompt}])
             record(attempt)
             return out
         except Exception as e:  # noqa: BLE001 - narrowed by the guard below
-            if not _is_context_overflow(e) or len(truncated) <= 2000:
+            if attempt == last_attempt or not _is_context_overflow(e) or len(truncated) <= 2000:
                 record(attempt)
                 raise
             truncated = truncated[: int(len(truncated) * 0.8)]
             prompt = build(truncated)
-    record(12)
-    return client.chat([{"role": "user", "content": prompt}])
+    raise AssertionError("unreachable: the loop either returns or raises")

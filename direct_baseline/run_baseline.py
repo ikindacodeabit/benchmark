@@ -293,8 +293,37 @@ def json_safe(value: Any) -> Any:
     return str(value)
 
 
+# What the predictions actually depend on. Deliberately NOT the whole config:
+# hashing every field meant bumping log_level, moving output_dir, or resuming on
+# cuda:1 instead of cuda:0 invalidated the checkpoint and threw away a run that
+# could take days. Sampling knobs are included only when do_sample is on, since
+# greedy decoding ignores them.
+RESULT_AFFECTING_FIELDS = (
+    "dataset",
+    "data_dir",
+    "model",
+    "dtype",
+    "attn_implementation",
+    "trust_remote_code",
+    "model_kwargs",
+    "max_context_length",
+    "max_new_tokens",
+    "fraction",
+    "limit",
+    "seed",
+    "needle_depth",
+    "enable_thinking",
+    "do_sample",
+)
+SAMPLING_FIELDS = ("temperature", "top_p", "top_k")
+
+
 def fingerprint(config: BaselineConfig, task: str | None) -> str:
-    payload = {**asdict(config), "task": task, "inference_backend": "transformers.generate"}
+    fields = asdict(config)
+    payload: dict[str, Any] = {name: fields[name] for name in RESULT_AFFECTING_FIELDS}
+    if config.do_sample:
+        payload.update({name: fields[name] for name in SAMPLING_FIELDS})
+    payload.update(task=task, inference_backend="transformers.generate")
     return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
 
 

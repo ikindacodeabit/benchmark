@@ -41,6 +41,12 @@
 
 set -euo pipefail
 
+if [ "$#" -lt 3 ]; then
+    echo "usage: $0 <config-file|default> <profile> <worker-count> [extra run_matrix.py args...]" >&2
+    echo "  config-file is resolved relative to evaluation/, e.g. yml/loft128k.yaml" >&2
+    exit 2
+fi
+
 CONFIG_FILE="$1"; shift
 PROFILE="$1"; shift
 WORKER_COUNT="$1"; shift
@@ -51,13 +57,15 @@ if [ -z "${CONFIG_FILE}" ] || [ "${CONFIG_FILE}" == "default" ]; then
     CONFIG_FILE="${DEFAULT_CONFIG_FILE}"
 fi
 
-BASE_DIR=/home/rethinkingai-self/25m0820
-EVAL_DIR="${BASE_DIR}/kvpress/evaluation"
+# Overridable for other hosts/accounts. The #SBATCH --output lines above cannot
+# expand variables, so they repeat this default path literally -- change both.
+BASE_DIR="${BASE_DIR:-/home/rethinkingai-self/25m0820}"
+EVAL_DIR="${EVAL_DIR:-${BASE_DIR}/kvpress/evaluation}"
 # kvpress-tf515: transformers==5.15.0 (required for the Qwen3.5 dynamic-GPTQ
 # path) + kernels>=0.12.2. evaluate.py also sets checkpoint_format=gptq_v2
 # for GPTQ checkpoints missing it, to skip GPTQModel's v1->v2 zero-point
 # "fix" that was corrupting every quantized weight.
-PYTHON="${BASE_DIR}/miniconda3/envs/kvpress-tf515/bin/python"
+PYTHON="${PYTHON:-${BASE_DIR}/miniconda3/envs/kvpress-tf515/bin/python}"
 
 mkdir -p "${BASE_DIR}/logs"
 cd "${EVAL_DIR}"
@@ -76,4 +84,4 @@ WORKER_ID="${SLURM_ARRAY_TASK_ID:-0}"
     --profile="${PROFILE}" \
     --worker-id="${WORKER_ID}" \
     --worker-count="${WORKER_COUNT}" \
-    "${EXTRA_ARGS[@]}"
+    ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}

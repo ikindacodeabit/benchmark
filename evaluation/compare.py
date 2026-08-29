@@ -48,31 +48,54 @@ RUNTIME_KEY = "runtime"
 
 
 def _flatten(metrics: dict, prefix: str = "") -> dict[str, Any]:
-    """Flatten one level of per-task nesting, e.g. {'niah_single_1': {...}}."""
+    """Flatten per-task nesting, e.g. {'niah_single_1': {'f1': ...}}.
+
+    Nested keys keep their path. Dropping the prefix on recursion collapsed
+    every task's metrics onto the same bare names, so a per-task dict like
+    {'niah_single_1': {'f1': ...}, 'cwe': {'f1': ...}} left one 'f1' -- the
+    last task silently winning -- and headline_score reported it as the run's
+    score. _lookup below resolves a bare metric name against these paths.
+    """
     flat: dict[str, Any] = {}
     for key, value in metrics.items():
         if key == RUNTIME_KEY:
             continue
         name = f"{prefix}{key}"
         if isinstance(value, dict):
-            flat.update(_flatten(value, prefix=""))
+            flat.update(_flatten(value, prefix=f"{name}."))
         else:
             flat[name] = value
     return flat
+
+
+def _lookup(flat: dict[str, Any], key: str) -> Optional[float]:
+    """The value for ``key``, at the top level or nested under a single task.
+
+    Returns None when several tasks report it. Silently picking one is how a
+    multi-task metrics.json used to publish an arbitrary task's number as the
+    whole run's headline score.
+    """
+    value = flat.get(key)
+    if isinstance(value, (int, float)):
+        return float(value)
+    nested = [v for k, v in flat.items() if k.rsplit(".", 1)[-1] == key and isinstance(v, (int, float))]
+    return float(nested[0]) if len(nested) == 1 else None
 
 
 def headline_score(metrics: dict, dataset: Optional[str] = None) -> tuple[Optional[str], Optional[float]]:
     """Pick the comparable number out of a scorer's metrics dict."""
     flat = _flatten(metrics)
     preferred = DATASET_SCORE_KEY.get(dataset or "")
-    if preferred is not None and isinstance(flat.get(preferred), (int, float)):
-        return preferred, float(flat[preferred])
+    if preferred is not None:
+        value = _lookup(flat, preferred)
+        if value is not None:
+            return preferred, value
     for key in SCORE_KEYS:
-        value = flat.get(key)
-        if isinstance(value, (int, float)):
-            return key, float(value)
+        value = _lookup(flat, key)
+        if value is not None:
+            return key, value
     # Fall back to the only numeric entry, if the scorer reports exactly one.
-    numeric = {k: v for k, v in flat.items() if isinstance(v, (int, float)) and k != "num_samples"}
+    numeric = {k: v for k, v in flat.items() if isinstance(v, (int, float)) and k.rsplit(".", 1)[-1] != "num_samples"}
     if len(numeric) == 1:
         key, value = next(iter(numeric.items()))
         return key, float(value)
