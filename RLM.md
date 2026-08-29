@@ -41,14 +41,14 @@ The harnesses share everything except inference:
 | Scoring | `benchmarks/results.score_prediction_frame` |
 | Result contract | `predictions.csv`, `metrics.json`, `config.yaml` |
 | Cross-backend comparison | `evaluation/compare.py` |
-| Inference | **independent** — vLLM/NIM over HTTP for RLM, local HF pipeline for KVPress |
+| Inference | **independent** — vLLM over HTTP for RLM, local HF pipeline for KVPress |
 
 The seam is two methods. `rlm.py` consumes a client that offers `.chat(messages)`; a
 KV-compressing client additionally offers `.chat_split(question, context)`. When the sub
 client has the second method, the REPL tool the root is taught changes shape:
 
 ```python
-# dense (nim backend): one argument, the slice pasted into the prompt
+# dense (http backend): one argument, the slice pasted into the prompt
 llm_query("Answer X based on this text:\n" + context[i:j])
 
 # split (kvzip backend): two arguments, the slice compressed separately
@@ -228,7 +228,7 @@ derives each call's ratio itself. (`KV_RATIOS` still drives the *cell-5* `evalua
 baseline, which genuinely does take `--compression_ratio`.) 4c is a third arm rather than a
 retargeting of 4a/4b, whose results are mid-campaign.
 
-`auto` requires `--sub-backend kvzip` and a target ratio; the `nim` path has no KV budget and
+`auto` requires `--sub-backend kvzip` and a target ratio; the `http` path has no KV budget and
 no local tokenizer, so a derived number there would be fabricated. The ratio must be in
 `[0.0, 1.0)` — 1.0 asks for an infinite chunk.
 

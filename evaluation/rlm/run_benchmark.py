@@ -23,7 +23,7 @@ from evaluation.benchmarks.registry import LOFT_TASKS, RULER_32K_TASKS, SCORER_R
 from evaluation.benchmarks.results import score_prediction_frame
 from evaluation.results_layout import RLM_RESULTS_DIR
 
-from .client import NIMClient, RateLimiter
+from .client import LLMClient
 from .datasets import available_datasets, canonical_dataset_name, load_examples
 from .rlm import RLM, MemoryBudget, Scratchpad, vanilla_answer
 from .sizing import DEFAULT_RESERVE_TOKENS
@@ -115,7 +115,7 @@ def is_correct(pred: str | None, answers: list[str]) -> bool:
 
 def load_done(path: Path) -> set:
     """IDs already completed. Records that died with a harness/API exception
-    (e.g. a transient NIM outage) don't count -- re-running retries them."""
+    (e.g. a transient server outage) don't count -- re-running retries them."""
     if not path.exists():
         return set()
     done = set()
@@ -154,7 +154,7 @@ def write_run_artifacts(
 
     # An example that died with an API/harness exception is a MISSING measurement,
     # not a wrong answer. score_prediction_frame fills a null prediction with "",
-    # which every scorer then marks 0 -- so a NIM outage would show up as the RLM
+    # which every scorer then marks 0 -- so a server outage would show up as the RLM
     # arm being less accurate than KVPress, which never makes network calls and so
     # can never take this hit. Score only the examples that actually produced an
     # answer, and report the shortfall separately.
@@ -339,13 +339,16 @@ def main() -> None:
         "like a real run that scored 0.000",
     )
     ap.add_argument(
-        "--root-model", default="meta/llama-3.3-70b-instruct", help="NIM model id for vanilla baseline AND the RLM root"
+        "--root-model",
+        default="Qwen/Qwen3-4B-Instruct-2507",
+        help="served model id for vanilla baseline AND the RLM root",
     )
     ap.add_argument(
-        "--sub-model", default="meta/llama-3.1-8b-instruct", help="NIM model id for recursive sub-calls (cheap is fine)"
+        "--sub-model",
+        default="Qwen/Qwen3-4B-Instruct-2507",
+        help="served model id for recursive sub-calls (cheap is fine)",
     )
-    ap.add_argument("--base-url", default="https://integrate.api.nvidia.com/v1")
-    ap.add_argument("--rpm", type=int, default=35)
+    ap.add_argument("--base-url", default="http://localhost:8000/v1", help="OpenAI-compatible server, e.g. vLLM")
     ap.add_argument("--max-steps", type=int, default=12)
     ap.add_argument("--vanilla-char-limit", type=int, default=400_000)
     ap.add_argument(
@@ -409,7 +412,7 @@ def main() -> None:
         "hitting the API. 0 disables",
     )
     # --- Sub-call backend (arm 4: KV-compressed sub-calls; see kvzip_backend.py) ---
-    # `nim` keeps today's behavior: sub-calls go to the same OpenAI-compatible
+    # `http` keeps today's behavior: sub-calls go to the same OpenAI-compatible
     # server as the root. `kvzip` loads the sub model IN-PROCESS through
     # kvpress's own KVzipPress + KVPressTextGenerationPipeline -- the same
     # press and memory-budget mechanics used by every LOFT/RULER/synthetic-kv
@@ -417,7 +420,9 @@ def main() -> None:
     # rather than freeing it, so this does NOT reduce actual GPU memory usage
     # the way a real-eviction backend would -- it buys methodological
     # consistency with the rest of the benchmarking, not compute savings.
-    ap.add_argument("--sub-backend", default="nim", choices=["nim", "kvzip"])
+    # "nim" is a deprecated alias for "http": existing run-dir slugs and
+    # config.yaml resume guards were written with it, so it must keep parsing.
+    ap.add_argument("--sub-backend", default="http", choices=["http", "kvzip", "nim"])
     ap.add_argument(
         "--press",
         default="kvzip",
@@ -470,7 +475,7 @@ def main() -> None:
         type=int,
         default=512,
         help="max_new_tokens per kvzip sub-call; HF greedy decode is ~30-40 tok/s, so the "
-        "NIM default of 4096 is a wall-clock hazard in-process",
+        "HTTP-path default of 4096 is a wall-clock hazard in-process",
     )
     ap.add_argument(
         "--sub-device",
@@ -507,6 +512,8 @@ def main() -> None:
         help="disable Qwen3 thinking mode (chat_template_kwargs.enable_thinking=False)",
     )
     args = ap.parse_args()
+    if args.sub_backend == "nim":  # deprecated alias; the slug never carried it
+        args.sub_backend = "http"
 
     requested_dataset = args.dataset or args.legacy_dataset
     dataset_name = canonical_dataset_name(requested_dataset)
@@ -523,9 +530,9 @@ def main() -> None:
     auto_chunk = args.max_subcall_chars == "auto"
     args.subcall_sizing_mode = "auto" if auto_chunk else "fixed"
     if auto_chunk and args.sub_backend != "kvzip":
-        # The nim path has no KV budget, no press and no local tokenizer, so a
+        # The http path has no KV budget, no press and no local tokenizer, so a
         # derived size would be a fabricated number recorded in config.yaml.
-        ap.error("--max-subcall-chars auto requires --sub-backend kvzip (the nim path has no KV budget)")
+        ap.error("--max-subcall-chars auto requires --sub-backend kvzip (the http path has no KV budget)")
     if auto_chunk and args.target_compression_ratio is None:
         ap.error("--max-subcall-chars auto requires --target-compression-ratio")
     if args.target_compression_ratio is not None:
@@ -538,16 +545,12 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     modes = ["vanilla", "rlm"] if args.mode == "both" else [args.mode]
 
-    # One limiter shared by root + sub so the rpm cap is per-account (two separate
-    # limiters would let the process issue up to ~2x rpm and trip 429s).
-    limiter = RateLimiter(args.rpm)
-    client_kw = dict(base_url=args.base_url, rpm=args.rpm, limiter=limiter)
-    root = NIMClient(model=args.root_model, **client_kw)
+    root = LLMClient(model=args.root_model, base_url=args.base_url)
     sub: Any
     if args.sub_backend == "kvzip":
         if modes == ["vanilla"]:
             ap.error("--sub-backend kvzip only affects RLM sub-calls; use --mode rlm (or both)")
-        # Imported lazily: the nim path must stay importable in a venv without
+        # Imported lazily: the http path must stay importable in a venv without
         # torch or kvpress's deps.
         from .kvzip_backend import KVzipSubClient
 
@@ -563,7 +566,7 @@ def main() -> None:
             min_free_gib=args.sub_min_free_gib,
         )
     else:
-        sub = NIMClient(model=args.sub_model, **client_kw)
+        sub = LLMClient(model=args.sub_model, base_url=args.base_url)
     if args.no_think:
         eb = {"chat_template_kwargs": {"enable_thinking": False}}
         root.extra_body = sub.extra_body = eb

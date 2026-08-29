@@ -26,7 +26,7 @@ TWO THINGS THIS DOES NOT DO, both easy to misread:
    whatever ``metrics.json``'s ``average_sub_compression_ratio`` reports.
 
 Deliberately free of torch/transformers imports: ``run_benchmark.py`` must stay
-importable in a venv without them (the ``nim`` path has no torch), and the run
+importable in a venv without them (the ``http`` path has no torch), and the run
 directory name depends on these types on every path.
 """
 

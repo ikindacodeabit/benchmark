@@ -15,7 +15,7 @@ from evaluation.rlm.rlm import RLM
 
 
 class FakeClient:
-    """Minimal stand-in for NIMClient: records calls, replays scripted replies."""
+    """Minimal stand-in for LLMClient: records calls, replays scripted replies."""
 
     def __init__(self, replies):
         self._replies = list(replies)

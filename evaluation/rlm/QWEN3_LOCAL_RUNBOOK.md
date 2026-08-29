@@ -79,7 +79,7 @@ Outputs:
 ## Step 6 — Score
 ```bash
 source .venv/bin/activate
-python -m evaluation.rlm.score evaluation/results/rlm
+python -m evaluation.compare --backend rlm
 ```
 
 ---
@@ -104,7 +104,7 @@ python -m evaluation.rlm.score evaluation/results/rlm
 ## What was already changed in the repo (for reference)
 You do **not** need to redo these — they're committed in the working tree:
 
-1. **`evaluation/rlm/client.py`** — added an `extra_body: dict | None = None` field to `NIMClient`;
+1. **`evaluation/rlm/client.py`** — added an `extra_body: dict | None = None` field to `LLMClient`;
    `chat()` now falls back to it when no per-call `extra_body` is given.
 2. **`evaluation/rlm/run_benchmark.py`** — added a `--no-think` flag that sets
    `extra_body={"chat_template_kwargs": {"enable_thinking": False}}` on the root and sub clients.

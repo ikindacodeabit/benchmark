@@ -16,7 +16,7 @@ from evaluation.rlm.rlm import EXAMPLE_LLM_QUERY_DENSE, LLM_QUERY_HELP_DENSE, RL
 
 
 class FakeClient:
-    """Plain NIMClient stand-in: chat only, records calls."""
+    """Plain LLMClient stand-in: chat only, records calls."""
 
     def __init__(self, replies=("sub answer",)):
         self._replies = list(replies)
@@ -154,7 +154,7 @@ def test_deadline_check_is_opt_in_and_blocks_the_call_when_expired():
     assert sub.split_calls == []
 
     # Default (off): an expired deadline does not gate the sub-call — that is the
-    # long-standing behavior of the NIM/vLLM arms and must not change under them.
+    # long-standing behavior of the HTTP/vLLM arms and must not change under them.
     sub2 = FakeSplitClient()
     rlm2 = _rlm(sub2)
     rlm2._deadline = time.monotonic() - 1
@@ -184,7 +184,7 @@ def test_repetition_breaker_routes_through_chat_split():
 
 FINISH_CODE = "```python\nFINAL(context[:5])\n```"
 
-# The exact llm_query bullet the dense (NIM/vLLM) arms run with. Changing it
+# The exact llm_query bullet the dense (HTTP/vLLM) arms run with. Changing it
 # re-baselines every arm that reads it, so bump this pin only on purpose.
 #
 # Generation 2: the cap is rendered from max_subcall_chars instead of the fixed

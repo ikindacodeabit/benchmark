@@ -115,7 +115,7 @@ With `--sub-backend kvzip` the REPL tool becomes
 `llm_query(question, context_text)`: the slice is prefilled through
 `KVPressTextGenerationPipeline` under `KVzipPress`, and the question (plus
 `SUB_SYSTEM_PROMPT`) decodes against the compressed cache uncompressed.
-Documented deviations from the NIM path:
+Documented deviations from the original hosted-API path:
 
 1. the pipeline has no system role, so the sub system prompt is prepended to
    the question side (identical across every arm-4 lane, so internal
@@ -226,7 +226,7 @@ comparison is invalid.
 Then aggregate:
 
 ```bash
-python -m evaluation.rlm.score evaluation/results/loft128k
+python -m evaluation.compare --backend rlm --results-dir evaluation/results/loft128k
 python -m evaluation.compare --dataset loft --csv loft128k.csv
 ```
 

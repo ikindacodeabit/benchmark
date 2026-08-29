@@ -45,7 +45,7 @@ class ErroredRecordTest(unittest.TestCase):
     """An API failure is a missing measurement, not a wrong answer.
 
     KVPress runs locally and never makes network calls, so it cannot take this
-    hit. Counting a NIM outage as a zero would show up as the RLM arm being less
+    hit. Counting a server outage as a zero would show up as the RLM arm being less
     accurate, which is the one thing this comparison must not get wrong.
     """
 
@@ -158,7 +158,7 @@ def _args(**overrides) -> argparse.Namespace:
         root_model="Qwen/Qwen3-4B-Instruct-2507",
         split="all",
         max_context_tokens=None,
-        sub_backend="nim",
+        sub_backend="http",
         press="kvzip",
         memory_budget=1.0,
         memory_budget_unit="GB",
@@ -174,7 +174,7 @@ class RunDirComponentsTest(unittest.TestCase):
     """Anything that changes results must land in the directory name, or two
     configurations share a checkpoint.jsonl and silently merge."""
 
-    def test_nim_backend_keeps_the_legacy_layout(self):
+    def test_http_backend_keeps_the_legacy_layout(self):
         self.assertEqual(
             build_run_dir_components(_args(), "rlm", Scratchpad()),
             ["loft", "nq_128k", "Qwen_Qwen3-4B-Instruct-2507", "rlm", "scratchpad"],

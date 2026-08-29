@@ -3,7 +3,7 @@
 """In-process KV-compression backend for RLM sub-calls, via kvpress's own KVzipPress.
 
 `KVzipSubClient` is duck-typed to the surface `rlm.py` consumes from
-`NIMClient` (`.chat()`, `.usage`, `.extra_body`, `.model`) and adds
+`LLMClient` (`.chat()`, `.usage`, `.extra_body`, `.model`) and adds
 `.chat_split(question, context)`, which routes through
 `kvpress.presses.kvzip_press.KVzipPress` and
 `kvpress.pipeline.KVPressTextGenerationPipeline` -- the exact same press and
@@ -89,7 +89,7 @@ def preflight_select_gpu(min_free_gib: float, device: Optional[str] = None) -> i
     if not gpus:
         raise RuntimeError(
             "No NVIDIA GPU visible (nvidia-smi failed). --sub-backend kvzip loads the sub model "
-            "in-process and needs a local GPU; use --sub-backend nim on CPU-only hosts."
+            "in-process and needs a local GPU; use --sub-backend http on CPU-only hosts."
         )
     table = "; ".join(f"GPU{g['index']}: {g['free_gib']:.1f}/{g['total_gib']:.1f} GiB free" for g in gpus)
 
@@ -208,7 +208,7 @@ class KVzipSubClient:
         chars-per-token ratio is measured from it rather than assumed, because a
         wrong ratio overshoots the token cap and the context is then truncated.
         """
-        # Deferred like every other kvpress/torch import in this module: the nim
+        # Deferred like every other kvpress/torch import in this module: the http
         # path must stay importable where they are absent.
         from kvpress.model_adapter import get_model_adapter
         from kvpress.pipeline import compute_token_budget_from_memory
@@ -246,7 +246,7 @@ class KVzipSubClient:
         print(f"[kvzip] caps considered: {sizing.caps}")
         return sizing
 
-    # ---- NIMClient-compatible surface ---------------------------------------
+    # ---- LLMClient-compatible surface ---------------------------------------
     def chat(self, messages: list[dict], **kw: Any) -> str:
         """Legacy one-string path (root emitted a plain llm_query(prompt) call).
 

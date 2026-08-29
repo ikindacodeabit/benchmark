@@ -20,8 +20,6 @@ MODEL="${MODEL:-Qwen/Qwen3-4B-Instruct-2507}"
 MAX_NOTES_TOKENS="${MAX_NOTES_TOKENS:-1024}"
 LOGS="${LOGS:-$RESULTS/logs}"
 
-# client.py no longer needs NVIDIA_API_KEY for a local base_url; only the
-# hosted catalog requires one.
 export TOKENIZERS_PARALLELISM=false
 export PYTHONUNBUFFERED=1
 
@@ -108,7 +106,6 @@ if [ -n "${KVPRESS_ARMS:-}" ]; then
         --base-url "http://localhost:$PORT/v1"
         --root-model "$MODEL"
         --sub-model "$MODEL"
-        --rpm 600
         --max-steps 50
         --exec-timeout 60
         --out "$RESULTS"
@@ -177,7 +174,6 @@ COMMON=(
     --base-url "http://localhost:$PORT/v1"
     --root-model "$MODEL"
     --sub-model "$MODEL"
-    --rpm 600
     --max-steps 50
     --vanilla-char-limit 700000
     --vanilla-max-prompt-tokens 134000

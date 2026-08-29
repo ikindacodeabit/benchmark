@@ -45,7 +45,7 @@ import traceback
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
-from .client import NIMClient
+from .client import LLMClient
 
 ROOT_SYSTEM_PROMPT = """You are solving a task over a LONG document that does NOT fit in your context window.
 The document is stored in a Python REPL as a string variable named `context`
@@ -316,8 +316,8 @@ class RLMResult:
 class RLM:
     def __init__(
         self,
-        root_client: NIMClient,
-        sub_client: NIMClient | None = None,
+        root_client: LLMClient,
+        sub_client: LLMClient | None = None,
         max_steps: int = 12,
         obs_limit: int = 6000,
         max_subcall_chars: int = 32000,
@@ -345,13 +345,13 @@ class RLM:
         # off without affecting the others.
         self.exec_timeout = exec_timeout
         # Wall-clock ceiling for ONE example. exec_timeout deliberately excludes
-        # llm_query time (a slow sub-call is legitimate), and NIMClient retries with
+        # llm_query time (a slow sub-call is legitimate), and LLMClient retries with
         # backoff -- so without a separate deadline a single pathological example can
         # stall a job for hours. None disables.
         self.run_timeout = run_timeout
         self.max_sub_calls = max_sub_calls
         # Check the run_timeout deadline INSIDE llm_query too. Off by default:
-        # the NIM/vLLM arms take their per-step deadline check between turns, and
+        # the HTTP/vLLM arms take their per-step deadline check between turns, and
         # changing that mid-campaign would confound them. The kvzip arm turns it
         # on because one code cell can loop over many multi-minute in-process
         # sub-calls without ever reaching the per-step check.
@@ -449,7 +449,7 @@ class RLM:
             try:
                 if chunk is not None:
                     # The client seam is duck-typed (hasattr-guarded above), so the
-                    # NIMClient annotation legitimately lacks this method.
+                    # LLMClient annotation legitimately lacks this method.
                     ans = self.sub.chat_split(  # type: ignore[attr-defined]
                         question=question, context=chunk, system=SUB_SYSTEM_PROMPT
                     )
@@ -832,7 +832,7 @@ class RLM:
             """Ask the root, letting the SERVER decide whether the view fits.
 
             Without a --max-context-tokens budget the view grows monotonically, and
-            NIMClient does not retry 4xx: one overflow ended the example as
+            LLMClient does not retry 4xx: one overflow ended the example as
             end_reason="exception" -- the mechanism that zeroed the whole RULER-32k
             RLM run. vanilla_answer already treats the server as the authority on
             what fits; do the same here rather than requiring the operator to have
@@ -1133,7 +1133,7 @@ def _is_context_overflow(exc: Exception) -> bool:
 
 
 def vanilla_answer(
-    client: NIMClient,
+    client: LLMClient,
     context: str,
     task: str,
     char_limit: int = 400_000,
