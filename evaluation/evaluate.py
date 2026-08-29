@@ -31,10 +31,10 @@ from benchmarks.needle_in_haystack.utils import insert_needle_in_haystack
 from benchmarks.results import score_prediction_frame
 from evaluate_registry import DATASET_REGISTRY, PRESS_REGISTRY, SCORER_REGISTRY
 from fire import Fire
+from results_layout import is_complete, run_artifacts
 from tqdm import tqdm
 from transformers import AutoConfig, AutoTokenizer, BitsAndBytesConfig, FineGrainedFP8Config, Pipeline, pipeline
-from verify_int8_model import verify_int8_model
-from verify_int4_model import verify_int4_model
+from verify_bnb_model import verify_int4_model, verify_int8_model
 from kvpress.model_adapter import get_model_adapter
 from kvpress.pipeline import KVPressTextGenerationPipeline
 
@@ -930,6 +930,30 @@ Files in this directory:
         self._setup_deterministic_seeds()
         torch.cuda.empty_cache()
 
+    def _apply_matrix_configuration(
+        self,
+        task: str,
+        memory_budget: Optional[float],
+        memory_budget_unit: str,
+        budget_press_name: str,
+        baseline_press_name: Optional[str],
+        baseline_compression_ratio: float,
+    ) -> bool:
+        """Point the config at one matrix cell. Returns whether it is the no-press baseline.
+
+        The matrix walks its configurations twice -- once to find the pending
+        ones, once to run them -- and both loops set exactly these six fields.
+        Keeping the two copies in step by hand is how a pre-scan and a run can
+        silently disagree about which directory a cell belongs in.
+        """
+        is_no_press_baseline = memory_budget is None and baseline_press_name == "no_press"
+        self.config.data_dir = task
+        self.config.press_name = "no_press" if is_no_press_baseline else budget_press_name
+        self.config.compression_ratio = 0.0 if is_no_press_baseline else baseline_compression_ratio
+        self.config.memory_budget = memory_budget
+        self.config.memory_budget_unit = memory_budget_unit.upper()
+        return is_no_press_baseline
+
     def run_memory_budget_matrix(
         self,
         tasks: list[str],
@@ -962,17 +986,17 @@ Files in this directory:
             pending_configurations: list[tuple[Optional[float], str, Path]] = []
 
             for memory_budget, memory_budget_unit in configurations:
-                self.config.data_dir = task
-                is_no_press_baseline = memory_budget is None and baseline_press_name == "no_press"
-                self.config.press_name = "no_press" if is_no_press_baseline else budget_press_name
-                self.config.compression_ratio = 0.0 if is_no_press_baseline else baseline_compression_ratio
-                self.config.memory_budget = memory_budget
-                self.config.memory_budget_unit = memory_budget_unit.upper()
+                self._apply_matrix_configuration(
+                    task,
+                    memory_budget,
+                    memory_budget_unit,
+                    budget_press_name,
+                    baseline_press_name,
+                    baseline_compression_ratio,
+                )
                 results_dir = self.config.get_results_dir(output_dir, data_dir=task)
-                predictions_filename = results_dir / "predictions.csv"
-                metrics_filename = results_dir / "metrics.json"
 
-                if predictions_filename.exists() and metrics_filename.exists():
+                if is_complete(results_dir):
                     logger.info(
                         f"Completed results already exist for task={task}, "
                         f"memory_budget={memory_budget}{memory_budget_unit}; skipping."
@@ -994,12 +1018,14 @@ Files in this directory:
             source_df = self.df.copy(deep=True)  # type: ignore[union-attr]
 
             for memory_budget, memory_budget_unit, results_dir in pending_configurations:
-                self.config.data_dir = task
-                is_no_press_baseline = memory_budget is None and baseline_press_name == "no_press"
-                self.config.press_name = "no_press" if is_no_press_baseline else budget_press_name
-                self.config.compression_ratio = 0.0 if is_no_press_baseline else baseline_compression_ratio
-                self.config.memory_budget = memory_budget
-                self.config.memory_budget_unit = memory_budget_unit.upper()
+                is_no_press_baseline = self._apply_matrix_configuration(
+                    task,
+                    memory_budget,
+                    memory_budget_unit,
+                    budget_press_name,
+                    baseline_press_name,
+                    baseline_compression_ratio,
+                )
                 if is_no_press_baseline:
                     # True full-attention reference: do not construct, configure,
                     # enter, or otherwise invoke a press for this inference.
@@ -1026,10 +1052,11 @@ Files in this directory:
                     )
 
                 results_dir.mkdir(parents=True, exist_ok=True)
-                predictions_filename = results_dir / "predictions.csv"
-                metrics_filename = results_dir / "metrics.json"
-                config_filename = results_dir / "config.yaml"
-                readme_filename = results_dir / "README.md"
+                artifacts = run_artifacts(results_dir)
+                predictions_filename = artifacts["predictions"]
+                metrics_filename = artifacts["metrics"]
+                config_filename = artifacts["config"]
+                readme_filename = artifacts["readme"]
 
                 self._run_inference()
                 self._save_results(predictions_filename)
@@ -1104,10 +1131,11 @@ Files in this directory:
         for task in tasks_to_run:
             logger.info(f"Starting evaluation for task: {task}")
             results_dir = self.config.get_results_dir(output_dir, data_dir=task)
-            predictions_filename = results_dir / "predictions.csv"
-            metrics_filename = results_dir / "metrics.json"
-            config_filename = results_dir / "config.yaml"
-            readme_filename = results_dir / "README.md"
+            artifacts = run_artifacts(results_dir)
+            predictions_filename = artifacts["predictions"]
+            metrics_filename = artifacts["metrics"]
+            config_filename = artifacts["config"]
+            readme_filename = artifacts["readme"]
 
             if predictions_filename.exists() and metrics_filename.exists():
                 logger.info(
@@ -1128,6 +1156,24 @@ Files in this directory:
 
 
 # --- Command-Line Interface ---
+def build_config(config_file: Optional[str], **overrides) -> "EvaluationConfig":
+    """Layer dataclass defaults, then the YAML file, then explicit overrides.
+
+    Shared with run_matrix.py, which used to reach into the private
+    _load_yaml_config and re-implement the layering with only --fraction
+    honoured -- so the two entry points could disagree about a run's settings.
+    ``None`` overrides are dropped: that is how the CLI signals "not given".
+    """
+    values = asdict(EvaluationConfig())
+    values.update(_load_yaml_config(config_file))
+    values.update({key: value for key, value in overrides.items() if value is not None})
+    try:
+        return EvaluationConfig(**values)
+    except TypeError as error:
+        print(f"Error: Invalid configuration argument provided. {error}", file=sys.stderr)
+        sys.exit(1)
+
+
 class CliEntryPoint:
     """
     CLI entry point for building configuration and running the evaluation.
@@ -1147,26 +1193,7 @@ class CliEntryPoint:
         2. Values from YAML config file
         3. Command-line arguments (highest priority)
         """
-        # 1. Start with dataclass defaults.
-        final_args = asdict(EvaluationConfig())
-
-        # 2. Layer YAML values on top.
-        yaml_config = _load_yaml_config(config_file)
-        final_args.update(yaml_config)
-
-        # 3. Layer CLI arguments on top (highest priority).
-        # Filter out None values from CLI overrides
-        cli_args = {k: v for k, v in cli_overrides.items() if v is not None}
-        final_args.update(cli_args)
-
-        # 4. Create and validate the final config object.
-        try:
-            config = EvaluationConfig(**final_args)
-        except TypeError as e:
-            # Provide a user-friendly error for bad arguments.
-            print(f"Error: Invalid configuration argument provided. {e}", file=sys.stderr)
-            sys.exit(1)
-
+        config = build_config(config_file, **cli_overrides)
         runner = EvaluationRunner(config)
         runner.run_evaluation()
 

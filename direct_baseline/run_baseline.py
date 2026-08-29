@@ -30,6 +30,7 @@ from evaluation.benchmarks.loaders import load_benchmark_dataset  # noqa: E402
 from evaluation.benchmarks.needle_in_haystack.utils import insert_needle_in_haystack  # noqa: E402
 from evaluation.benchmarks.registry import DATASET_REGISTRY  # noqa: E402
 from evaluation.benchmarks.results import score_prediction_frame  # noqa: E402
+from evaluation.textstats import think_tag_stats  # noqa: E402
 
 
 LOGGER = logging.getLogger("direct_baseline")
@@ -450,8 +451,6 @@ def run(config: BaselineConfig) -> None:
                 )
                 generated_ids = generated[0, input_ids.shape[-1] :]
                 prediction = tokenizer.decode(generated_ids, skip_special_tokens=True)
-                open_tags = len(re.findall(r"<think>", prediction, flags=re.IGNORECASE))
-                close_tags = len(re.findall(r"</think>", prediction, flags=re.IGNORECASE))
                 record = {
                     "fingerprint": run_fingerprint,
                     "row_index": int(row_index),
@@ -460,10 +459,7 @@ def run(config: BaselineConfig) -> None:
                     "retained_context_tokens": retained_tokens,
                     "prompt_tokens": int(input_ids.shape[-1]),
                     "generated_tokens": int(generated_ids.shape[-1]),
-                    "think_open_tags": open_tags,
-                    "think_close_tags": close_tags,
-                    "has_think_tag": bool(open_tags or close_tags),
-                    "unclosed_think": open_tags > close_tags,
+                    **think_tag_stats(prediction),
                 }
                 sink.write(json.dumps(record, ensure_ascii=False) + "\n")
                 sink.flush()

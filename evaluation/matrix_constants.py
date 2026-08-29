@@ -25,6 +25,12 @@ SYNTHETIC_INDEPENDENT_BUDGETS: tuple[Budget, ...] = (
     (256.0, "MB"),
 )
 
+# Deliberately NOT the same as SYNTHETIC_ALL_BUDGETS below, despite looking
+# like it: kvpress's MEMORY_UNIT_TO_BYTES is decimal (MB=1000**2, GB=1000**3),
+# so 1024 MB is 1.024e9 bytes and 1 GB is 1.0e9 -- a 2.4% larger budget, under a
+# different results-directory name (`memory_budget1024MB` vs `memory_budget1GB`).
+# Collapsing the two would silently reprice every run in this profile and orphan
+# the directories already on disk.
 SYNTHETIC_EXTENDED_BUDGETS: tuple[Budget, ...] = (
     (512.0, "MB"),
     (1024.0, "MB"),

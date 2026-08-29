@@ -7,8 +7,14 @@ import argparse
 import ast
 import csv
 import json
-import re
+import sys
 from pathlib import Path
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
+
+from evaluation.textstats import has_think_tag  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -52,10 +58,6 @@ def canonical_prediction(value: str) -> str:
     return " ".join(value.split())
 
 
-def has_think(value: str) -> bool:
-    return bool(re.search(r"</?think>", value, flags=re.IGNORECASE))
-
-
 def main() -> None:
     args = parse_args()
     direct_rows = load_rows(args.direct_csv)
@@ -70,8 +72,8 @@ def main() -> None:
         reference_prediction = reference[key].get("predicted_answer", "")
         exact += direct_prediction == reference_prediction
         canonical += canonical_prediction(direct_prediction) == canonical_prediction(reference_prediction)
-        direct_think += has_think(direct_prediction)
-        reference_think += has_think(reference_prediction)
+        direct_think += has_think_tag(direct_prediction)
+        reference_think += has_think_tag(reference_prediction)
     result = {
         "direct_rows": len(direct),
         "reference_rows": len(reference),
