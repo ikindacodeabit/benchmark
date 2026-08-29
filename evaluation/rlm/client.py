@@ -8,11 +8,11 @@ self-hosted NIM/vLLM endpoint — just change base_url in the config.
 from __future__ import annotations
 
 import os
-import time
 import threading
+import time
 from dataclasses import dataclass, field
 
-from openai import OpenAI, APIError, RateLimitError, APITimeoutError
+from openai import APIError, APITimeoutError, OpenAI, RateLimitError
 
 
 @dataclass
@@ -20,12 +20,18 @@ class Usage:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     calls: int = 0
+    # The last call's prompt size, as the SERVER counted it. The running totals
+    # above cannot answer "how big was the context at its peak", and the RLM's
+    # cost axis is exactly that question -- previously answered with a local
+    # estimate from a different tokenizer.
+    last_prompt_tokens: int | None = None
 
     def add(self, resp) -> None:
         u = getattr(resp, "usage", None)
         if u:
             self.prompt_tokens += u.prompt_tokens or 0
             self.completion_tokens += u.completion_tokens or 0
+            self.last_prompt_tokens = u.prompt_tokens or None
         self.calls += 1
 
     @property

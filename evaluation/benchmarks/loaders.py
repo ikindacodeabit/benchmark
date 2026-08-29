@@ -214,6 +214,7 @@ def iter_benchmark_examples(
     dataset_name: str,
     task: Optional[str],
     limit: Optional[int] = None,
+    split: Optional[str] = None,
 ) -> Iterator[dict[str, Any]]:
     """Adapt shared benchmark rows to the backend-neutral example contract."""
     required = {"context", "question"}
@@ -223,7 +224,32 @@ def iter_benchmark_examples(
     if limit is not None and limit < 1:
         raise ValueError("limit must be positive")
 
+    if split and split != "all" and "split" in df.columns:
+        df = df[df["split"] == split]
+        if df.empty:
+            raise ValueError(f"{dataset_name}/{task or 'default'} has no rows in split {split!r}")
+
     rows = df.head(limit) if limit is not None else df
+    # LOFT concatenates dev (10 rows) then test (100), so `--limit 10` with no split
+    # filter silently evaluates the dev split alone -- a smoke run that lands in the
+    # results tree indistinguishable from a real one. Say so rather than let a 0.000
+    # be read as a result.
+    if limit is not None and "split" in rows.columns:
+        covered = set(rows["split"].dropna().unique())
+        available = set(df["split"].dropna().unique())
+        if len(available) > 1 and len(covered) == 1:
+            only = covered.pop()
+            logger.warning(
+                "--limit %d selects only the %r split of %s/%s (%d of %d rows). "
+                "Pass --split test for a real run, or --split %s to make this explicit.",
+                limit,
+                only,
+                dataset_name,
+                task or "default",
+                len(rows),
+                len(df),
+                only,
+            )
     for position, (_, series) in enumerate(rows.iterrows()):
         row = series.to_dict()
         source_id = row.get("_id") or row.get("id") or row.get("context_id")
@@ -237,5 +263,6 @@ def iter_benchmark_examples(
             "task": str(row.get("task") or task or dataset_name),
             "answer_prefix": str(row.get("answer_prefix") or ""),
             "max_new_tokens": row.get("max_new_tokens"),
+            "split": row.get("split"),
             "scoring": _scoring_fields_from_row(row, answers),
         }

@@ -131,9 +131,12 @@ def load_examples(
     dataset_name: str,
     task: str | None = None,
     limit: int | None = None,
+    split: str | None = None,
 ):
     """Yield backend-neutral examples from a synthetic or shared benchmark."""
     if dataset_name in SYNTHETIC_TASKS:
+        if split and split != "all":
+            raise ValueError(f"{dataset_name} is generated, not split into dev/test; drop --split")
         yield from SYNTHETIC_TASKS[dataset_name](limit)
         return
 
@@ -150,7 +153,7 @@ def load_examples(
         task=task,
         dataset_registry=DATASET_REGISTRY,
     )
-    yield from iter_benchmark_examples(frame, canonical_name, task, limit)
+    yield from iter_benchmark_examples(frame, canonical_name, task, limit, split)
 
 
 # Kept for callers that only need a list of accepted names.

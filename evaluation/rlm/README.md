@@ -51,7 +51,7 @@ download datasets (HF) ──> /scratch ──> SLURM array job: run_benchmark.p
    For a shared RULER-32K subset, use:
    `python -m evaluation.rlm.run_benchmark --dataset ruler32k --data-dir niah_single_1 --limit 5 --mode both`.
 6. **Full runs**: `sbatch benchmark_artifacts/slurm_jobs/rlm/all_tasks/run_eval.slurm`.
-7. **Score & compare**: `python -m evaluation.rlm.score benchmark_artifacts/results/rlm`
+7. **Score & compare**: `python -m evaluation.rlm.score evaluation/results/rlm`
 
 Each RLM run gets its own directory containing a resumable `checkpoint.jsonl`,
 the three common result artifacts, and (for RLM mode) per-example transcripts.
@@ -76,8 +76,14 @@ python -m evaluation.compare --dataset ruler32k --csv comparison.csv
   proportional to. Plot score against this column to put a compression sweep and
   a `--max-context-tokens` sweep on one chart.
 
-Two asymmetries the harness records rather than hides, because ignoring either
-one silently flatters RLM:
+For an arm with KV-compressed sub-calls, `context_tokens_held` is
+`max(root_peak, sub_peak)`, with the root-only figure kept beside it as
+`context_tokens_root`. Counting only the root would flatter that arm badly: while
+the root holds ~2k tokens, the sub model holds a whole slice of KV on the GPU,
+and `KVzipPress` masks it rather than freeing it.
+
+Three asymmetries the harness records rather than hides, because ignoring any of
+them silently flatters RLM:
 
 - **Errors.** An RLM example that dies on an API error is dropped from the score
   and counted in `runtime.errors`. KVPress runs locally and cannot fail this
@@ -90,6 +96,11 @@ one silently flatters RLM:
   Set `--vanilla-max-prompt-tokens` to `(max-model-len - max-tokens - margin)`;
   without it, densely-tokenising subsets (RULER `cwe`, `niah_multikey_3`)
   overflow the served window and score 0.0 from a harness error.
+- **Abstentions.** An RLM example can end with `FINAL_NONE` — the model searched
+  and reports finding nothing. That scores 0 exactly like a wrong answer, so
+  `runtime.abstained` is reported separately: an arm that abstains honestly and
+  one that hallucinates confidently are not the same result, and the score column
+  alone cannot tell them apart. Vanilla has no equivalent ending.
 
 ## Runaway guards and the scratchpad
 All four are toggleable and independent; pass `0` to disable one without
@@ -112,6 +123,18 @@ Because `--scratchpad` and `--max-context-tokens` both change results, both
 appear in the run directory name — otherwise two configurations would share a
 `checkpoint.jsonl` and silently merge. Nothing parses that name; `compare.py`
 reads `config.yaml`.
+
+The name cannot carry *every* result-affecting knob without becoming unreadable,
+so the rest (`--limit`, `--split`, `--max-steps`, the timeouts, the sub model,
+…) are enforced on **resume** instead: `config.yaml` is written before the first
+example runs, and a later run whose settings disagree with it aborts rather than
+appending into someone else's checkpoint.
+
+`--split dev|test|all` picks a split where the dataset has them. It matters most
+for LOFT, which ships 10 dev rows followed by 100 test rows: with `--split all`
+(the default) a `--limit 10` smoke run silently evaluates *only* dev, and lands
+in the results tree looking like a real run that scored 0.000. Use `--split dev`
+for smoke runs — it also gets its own directory — and `--split test` for real ones.
 
 The root and sub clients now share one `RateLimiter`, so `--rpm` is a per-account
 cap. Previously each client had its own and the process could issue ~2x `--rpm`

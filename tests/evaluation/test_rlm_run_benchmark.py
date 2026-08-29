@@ -3,17 +3,21 @@
 """Tests for the properties that make an RLM run comparable to a KVPress run.
 
 Run from the repository root (the module uses absolute `evaluation.*` imports):
-    python -m pytest evaluation/rlm/test_run_benchmark.py
+    python -m pytest tests/evaluation/test_rlm_run_benchmark.py
 """
 
 import argparse
+import inspect
 import json
 import tempfile
 import unittest
 from pathlib import Path
 
+import yaml
+
+from evaluation.rlm import run_benchmark as rb
 from evaluation.rlm.rlm import Scratchpad, vanilla_answer
-from evaluation.rlm.run_benchmark import build_run_dir_components, load_done, write_run_artifacts
+from evaluation.rlm.run_benchmark import build_run_dir_components, load_done, resume_conflicts, write_run_artifacts
 
 
 def _checkpoint(records: list[dict]) -> tuple[Path, Path]:
@@ -83,6 +87,68 @@ class ErroredRecordTest(unittest.TestCase):
         metrics = write_run_artifacts(path, run_dir, "synthetic_kv_32k", {"backend": "rlm"})
         self.assertAlmostEqual(metrics["runtime"]["average_peak_context_tokens"], 4100.0)
 
+    def test_a_retried_error_does_not_count_twice(self):
+        """The failed record stays in the append-only checkpoint when the example
+        is retried, so without de-duplication the run reports an error it already
+        recovered from -- and `errors` is the column that vets the score."""
+        retried = self.records + [_answered("d", "delta", "delta")]
+        path, run_dir = _checkpoint(retried)
+        metrics = write_run_artifacts(path, run_dir, "synthetic_kv_32k", {"backend": "rlm"})
+
+        self.assertEqual(metrics["runtime"]["errors"], 0)
+        self.assertEqual(metrics["runtime"]["examples"], 4)
+        self.assertEqual(metrics["runtime"]["scored"], 4)
+        predictions = (run_dir / "predictions.csv").read_text().splitlines()
+        self.assertEqual(sum(line.startswith("d,") for line in predictions), 1)
+
+    def test_abstentions_are_counted_apart_from_failures(self):
+        records = [_answered("a", "x", "x"), _answered("b", "y", "y")]
+        records[1].update(pred=None, end_reason="abstained", correct=False)
+        records[0]["end_reason"] = "final_called"
+        path, run_dir = _checkpoint(records)
+        metrics = write_run_artifacts(path, run_dir, "synthetic_kv_32k", {"backend": "rlm"})
+        self.assertEqual(metrics["runtime"]["abstained"], 1)
+
+
+class ResumeGuardTest(unittest.TestCase):
+    """The run-dir name cannot carry every result-affecting knob, so resuming is
+    checked against the config the first run wrote. Two experiments must never
+    merge into one checkpoint.jsonl."""
+
+    @staticmethod
+    def _run_dir(**config) -> Path:
+        run_dir = Path(tempfile.mkdtemp())
+        (run_dir / "config.yaml").write_text(yaml.safe_dump(config))
+        return run_dir
+
+    def test_a_changed_limit_is_a_conflict(self):
+        run_dir = self._run_dir(limit=110, max_steps=50)
+        conflicts = resume_conflicts(run_dir, {"limit": 10, "max_steps": 50})
+        self.assertEqual(len(conflicts), 1)
+        self.assertIn("limit", conflicts[0])
+
+    def test_matching_configuration_resumes_cleanly(self):
+        run_dir = self._run_dir(limit=110, max_steps=50, sub_model="a/b")
+        self.assertEqual(resume_conflicts(run_dir, {"limit": 110, "max_steps": 50, "sub_model": "a/b"}), [])
+
+    def test_a_missing_config_does_not_block_a_resume(self):
+        """Checkpoints written before config.yaml was saved up front are still
+        resumable -- the guard reports what it can prove, not what it assumes."""
+        self.assertEqual(resume_conflicts(Path(tempfile.mkdtemp()), {"limit": 10}), [])
+
+    def test_knobs_outside_the_declared_set_are_not_conflicts(self):
+        run_dir = self._run_dir(limit=110, base_url="http://a")
+        self.assertEqual(resume_conflicts(run_dir, {"limit": 110, "base_url": "http://b"}), [])
+
+    def test_the_guard_reads_the_previous_run_not_this_one(self):
+        """config.yaml is written up front so an interrupted run is still checkable
+        -- which means the write must come AFTER the checks read it. Writing it any
+        earlier makes every guard compare this run against itself and always pass."""
+        source = inspect.getsource(rb.main)
+        write = source.index('(run_dir / "config.yaml").write_text')
+        self.assertLess(source.index("conflicts = resume_conflicts("), write)
+        self.assertLess(source.index("prior = _prior_resolved_chars("), write)
+
 
 def _args(**overrides) -> argparse.Namespace:
     base = dict(
@@ -90,6 +156,7 @@ def _args(**overrides) -> argparse.Namespace:
         legacy_dataset=None,
         data_dir="nq_128k",
         root_model="Qwen/Qwen3-4B-Instruct-2507",
+        split="all",
         max_context_tokens=None,
         sub_backend="nim",
         press="kvzip",
@@ -140,6 +207,16 @@ class RunDirComponentsTest(unittest.TestCase):
         self.assertEqual(auto[-1], "autosub0.9")
         self.assertNotIn("sub32000", auto)
         self.assertNotEqual(fixed, auto)
+
+    def test_a_split_filter_gets_its_own_directory(self):
+        """A dev-split smoke run must not resume into the real run's checkpoint --
+        but `all` adds nothing, so existing directories keep their names."""
+        self.assertEqual(
+            build_run_dir_components(_args(), "rlm", None)[:4],
+            ["loft", "nq_128k", "Qwen_Qwen3-4B-Instruct-2507", "rlm"],
+        )
+        self.assertIn("split-dev", build_run_dir_components(_args(split="dev"), "rlm", None))
+        self.assertNotIn("split-all", build_run_dir_components(_args(), "rlm", None))
 
     def test_vanilla_mode_ignores_rlm_only_knobs(self):
         args = _args(sub_backend="kvzip", max_subcall_chars=131072, max_context_tokens=4096)

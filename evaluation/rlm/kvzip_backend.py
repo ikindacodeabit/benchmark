@@ -250,13 +250,24 @@ class KVzipSubClient:
     def chat(self, messages: list[dict], **kw: Any) -> str:
         """Legacy one-string path (root emitted a plain llm_query(prompt) call).
 
-        The flattened text is treated as KVzip `context` with an empty
-        question, so a big single-arg paste is still compressed instead of the
-        arm silently degenerating to dense. Tiny prompts (< press_min_tokens)
-        skip the press: compressing a two-line question is pure noise.
+        User content is treated as KVzip `context`, so a big single-arg paste is
+        still compressed instead of the arm silently degenerating to dense. Tiny
+        prompts (< press_min_tokens) skip the press: compressing a two-line
+        question is pure noise.
+
+        The SYSTEM message rides the uncompressed question side, as it does in
+        chat_split. Flattening every role into `context` put the sub model's own
+        instructions under KV masking -- the one span whose tokens are all load
+        bearing, and the reason an evicted instruction shows up as the sub model
+        ignoring its format rules rather than as a memory saving.
         """
-        text = "\n\n".join(str(m.get("content", "")) for m in messages if m.get("content"))
-        return self._generate(context=text, question="", split=False, **kw)
+        system = "\n\n".join(
+            str(m.get("content", "")) for m in messages if m.get("role") == "system" and m.get("content")
+        )
+        text = "\n\n".join(
+            str(m.get("content", "")) for m in messages if m.get("role") != "system" and m.get("content")
+        )
+        return self._generate(context=text, question=system, split=False, **kw)
 
     def chat_split(self, question: str, context: str, system: Optional[str] = None, **kw: Any) -> str:
         """Context-aware path: `context` is compressed, question side is not."""
@@ -285,7 +296,9 @@ class KVzipSubClient:
             # Token-level analogue of kvpress's max_context_length truncation:
             # a 131072-char slice of dense text can exceed the model window.
             ids = self.pipeline.tokenizer.encode(context, add_special_tokens=False)
-            context = self.pipeline.tokenizer.decode(ids[: self.max_context_tokens])
+            # `decode` is annotated `str | list[str]` (it batches), but a single
+            # sequence in means a single string out.
+            context = str(self.pipeline.tokenizer.decode(ids[: self.max_context_tokens]))
             dropped = ctx_tokens - self.max_context_tokens
             ctx_tokens = self.max_context_tokens
             # Tell the root, the same way llm_query's char cap does. This used to

@@ -21,6 +21,7 @@ import yaml
 
 from evaluation.benchmarks.registry import LOFT_TASKS, RULER_32K_TASKS, SCORER_REGISTRY
 from evaluation.benchmarks.results import score_prediction_frame
+from evaluation.results_layout import RLM_RESULTS_DIR
 
 from .client import NIMClient, RateLimiter
 from .datasets import available_datasets, canonical_dataset_name, load_examples
@@ -44,6 +45,48 @@ def _subcall_chars(value: str) -> Any:
     if parsed < 1:
         raise argparse.ArgumentTypeError(f"must be positive, got {parsed}")
     return parsed
+
+
+# Knobs that change what the numbers MEAN, but that the run-dir name deliberately
+# does not carry: a slug with all of them in it would be unreadable, and adding
+# them would rename every existing run directory. They are enforced on RESUME
+# instead, against the config.yaml the first run wrote -- so two different
+# experiments can still never merge into one checkpoint.jsonl, which is the
+# property build_run_dir_components exists to protect.
+RESUME_CRITICAL_KEYS = (
+    "limit",
+    "split",
+    "root_model",
+    # Not in the slug: adding it there would rename every run directory that has
+    # ever been written, orphaning their checkpoints silently. Erroring on resume
+    # is both safer and louder.
+    "sub_model",
+    "max_steps",
+    "exec_timeout",
+    "run_timeout",
+    "max_sub_calls",
+    "vanilla_char_limit",
+    "vanilla_max_prompt_tokens",
+    "sub_max_context_tokens",
+    "press_min_tokens",
+    "sub_max_tokens",
+)
+
+
+def resume_conflicts(run_dir: Path, config: dict) -> list[str]:
+    """How this run's config differs from the one that wrote the checkpoint."""
+    config_path = run_dir / "config.yaml"
+    if not config_path.exists():
+        return []
+    try:
+        prior = yaml.safe_load(config_path.read_text()) or {}
+    except yaml.YAMLError:
+        return []
+    return [
+        f"{key}: checkpoint was written with {prior.get(key)!r}, this run has {config.get(key)!r}"
+        for key in RESUME_CRITICAL_KEYS
+        if key in prior and prior.get(key) != config.get(key)
+    ]
 
 
 def _prior_resolved_chars(run_dir: Path) -> int | None:
@@ -99,6 +142,14 @@ def write_run_artifacts(
     """
     records = [json.loads(line) for line in checkpoint_path.read_text().splitlines() if line.strip()]
     frame = pd.DataFrame(records).rename(columns={"pred": "predicted_answer"})
+    # An errored example is RETRIED on resume (load_done ignores it) and the retry
+    # APPENDS a record -- the failed one stays in the checkpoint, because a JSONL
+    # written for crash-safety is never rewritten in place. Without this de-dup the
+    # stale failure is counted a second time: `errors` and `examples` both inflate
+    # and predictions.csv carries the id twice. `errors` is the column a reader
+    # checks before believing a score, so it has to mean what it says.
+    if "id" in frame:
+        frame = frame.drop_duplicates("id", keep="last").reset_index(drop=True)
     frame.to_csv(run_dir / "predictions.csv", index=False)
 
     # An example that died with an API/harness exception is a MISSING measurement,
@@ -123,11 +174,21 @@ def write_run_artifacts(
         "examples": count,
         "scored": scored,
         "errors": int(errored.sum()),
-        "progress_match": float(scored_frame["correct"].sum() / scored) if scored else 0.0,
+        # `_loose` in the name: this is a substring containment check, systematically
+        # more generous than the canonical scorer that produced the headline metric
+        # sitting beside it in this same file. It is a progress indicator for a
+        # running sweep, never a result.
+        "progress_match_loose": float(scored_frame["correct"].sum() / scored) if scored else 0.0,
         "average_tokens": float(scored_frame["tokens"].mean()) if scored else 0.0,
         "average_latency_s": float(scored_frame["latency_s"].mean()) if scored else 0.0,
         "unfinished": int((~scored_frame["finished"].astype(bool)).sum()) if scored else 0,
     }
+
+    # Abstentions are a deliberate ending (FINAL_NONE), not a failure: the model
+    # searched and reported finding nothing. They score 0 like any wrong answer, so
+    # without this column an abstaining arm and a hallucinating one look identical.
+    if scored and "end_reason" in scored_frame:
+        runtime["abstained"] = int((scored_frame["end_reason"] == "abstained").sum())
 
     # Peak simultaneous root context is RLM's analogue of KVPress's
     # `average_retained_context_tokens` -- both say "how much context did the model
@@ -186,6 +247,16 @@ def write_run_artifacts(
             runtime["sub_pressed_call_fraction"] = (
                 float(sum(s.get("pressed_calls", 0) for s in sub_kv) / total_calls) if total_calls else 0.0
             )
+            # The cost axis compared against KVPress is peak context held at once.
+            # Counting only the ROOT flatters this arm: while the root holds ~2k
+            # tokens, the sub model is holding a whole slice of KV on the GPU, and
+            # KVzip masks rather than frees it. Report the larger of the two as the
+            # honest peak, keeping both components visible above.
+            root_peak = runtime.get("average_peak_context_tokens")
+            sub_peak = runtime.get("average_sub_context_tokens")
+            if root_peak is not None and sub_peak is not None:
+                runtime["average_peak_context_tokens_root"] = root_peak
+                runtime["average_peak_context_tokens"] = float(max(root_peak, sub_peak))
 
     # The size we ASKED for, next to average_sub_compression_ratio which is what we
     # GOT. They differ whenever the root under-fills the chunk -- the expected
@@ -214,6 +285,10 @@ def build_run_dir_components(args: argparse.Namespace, mode: str, scratchpad: Sc
     model_slug = args.root_model.replace("/", "_")
     task_slug = (args.data_dir or "default").replace("/", "_")
     components = [dataset_name, task_slug, model_slug, mode]
+    # Only when it is not the whole subset: `all` is what every existing run used,
+    # so naming it would rename every existing directory for no new information.
+    if getattr(args, "split", "all") != "all":
+        components.append(f"split-{args.split}")
     if mode == "rlm" and args.max_context_tokens is not None:
         components.append(f"ctx{args.max_context_tokens}")
     if mode == "rlm" and scratchpad is not None:
@@ -253,6 +328,16 @@ def main() -> None:
     )
     ap.add_argument("--mode", default="both", choices=["vanilla", "rlm", "both"])
     ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument(
+        "--split",
+        default="all",
+        choices=["all", "dev", "test"],
+        help="restrict to one split where the dataset has them (LOFT ships dev then "
+        "test). Datasets with a single split ignore this. Use --split dev for smoke "
+        "runs and --split test for real ones: with 'all', a small --limit silently "
+        "evaluates the 10 dev rows only, which lands in the results tree looking "
+        "like a real run that scored 0.000",
+    )
     ap.add_argument(
         "--root-model", default="meta/llama-3.3-70b-instruct", help="NIM model id for vanilla baseline AND the RLM root"
     )
@@ -414,7 +499,7 @@ def main() -> None:
         default=1024,
         help="one-arg llm_query prompts below this many tokens skip the press",
     )
-    ap.add_argument("--out", default="evaluation/results/rlm")
+    ap.add_argument("--out", default=RLM_RESULTS_DIR)
     ap.add_argument("--debug", action="store_true", help="print every RLM step (model reply, code, REPL output) live")
     ap.add_argument(
         "--no-think",
@@ -490,7 +575,7 @@ def main() -> None:
     # one here. After this block args.max_subcall_chars is always an int.
     subcall_sizing = None
     if auto_chunk:
-        sample = next(iter(load_examples(requested_dataset, args.data_dir, 1)))
+        sample = next(iter(load_examples(requested_dataset, args.data_dir, 1, args.split)))
         subcall_sizing = sub.plan_subcall_chunk(
             document=sample["context"],
             target_compression_ratio=args.target_compression_ratio,
@@ -498,6 +583,18 @@ def main() -> None:
             reserve_tokens=args.subcall_reserve_tokens,
         )
         args.max_subcall_chars = subcall_sizing.chars
+        # A target ratio is only actually delivered when the KV BUDGET is what
+        # limits the chunk. If the sub model's window or --sub-max-context-tokens
+        # binds first, the run silently measures a different ratio than the one
+        # asked for, and only runtime.subcall_sizing_binding records it.
+        if subcall_sizing.binding != "budget":
+            print(
+                f"!! --target-compression-ratio {args.target_compression_ratio:g} is NOT what this run "
+                f"will deliver: the chunk size is limited by {subcall_sizing.binding!r} "
+                f"({subcall_sizing.tokens} tokens), not by the KV budget. Raise "
+                "--sub-max-context-tokens (and check the sub model's window) to hit the "
+                "requested ratio."
+            )
 
     budget = None
     if args.max_context_tokens is not None:
@@ -531,6 +628,21 @@ def main() -> None:
         tdir = run_dir / "transcripts"
         tdir.mkdir(parents=True, exist_ok=True)
         done = load_done(res_path)
+        run_config = build_run_config(args, mode, dataset_name, budget, scratchpad, subcall_sizing)
+        if done:
+            # The run-dir name cannot carry every result-affecting knob, so a resume
+            # is checked against the config the first run wrote. Without this, a
+            # second run with a different --limit (or --max-steps, or sub model)
+            # appends to the same checkpoint and the two silently merge into one set
+            # of numbers -- exactly what the directory naming exists to prevent.
+            conflicts = resume_conflicts(run_dir, run_config)
+            if conflicts:
+                ap.error(
+                    f"{run_dir} holds {len(done)} examples from a different configuration:\n  "
+                    + "\n  ".join(conflicts)
+                    + "\nResuming would merge two experiments. Re-run with the original "
+                    "settings, or point --out somewhere else."
+                )
         if auto_chunk and done:
             # Auto sizing reads live GPU free memory, which a co-tenant process
             # changes -- so a resumed auto run can resolve to a different size and
@@ -545,11 +657,17 @@ def main() -> None:
                     "configurations. Free the GPU and retry, or pass "
                     f"--max-subcall-chars {prior} to reproduce the original size."
                 )
+        # Written BEFORE the examples run, not only at the end: a run interrupted
+        # part-way through would otherwise leave a checkpoint with no config beside
+        # it, and the resume checks would have nothing to compare against. It must
+        # come AFTER both of those checks, which read the PREVIOUS run's config --
+        # writing it any earlier makes each check compare this run against itself.
+        (run_dir / "config.yaml").write_text(yaml.safe_dump(run_config, sort_keys=False))
         print(f"== {dataset_name}/{args.data_dir or 'default'} / {mode} " f"-> {run_dir} ({len(done)} already done)")
 
         n, correct = 0, 0
         with open(res_path, "a") as fout:
-            for ex in load_examples(requested_dataset, args.data_dir, args.limit):
+            for ex in load_examples(requested_dataset, args.data_dir, args.limit, args.split):
                 if ex["id"] in done:
                     continue
                 t0 = time.time()
@@ -570,27 +688,27 @@ def main() -> None:
                 }
                 record.update(ex.get("scoring", {}))
                 question = ex["question"]
-                if ex.get("answer_prefix"):
-                    question = f"{question}\n{ex['answer_prefix']}"
+                # The benchmark's output contract goes to BOTH arms, as a format
+                # instruction rather than stacked onto the question a second time:
+                # the RLM renders it into its system prompt and vanilla appends it
+                # to the document prompt. Scoring is string-matching, so an arm
+                # asked for a different answer SHAPE is measured as less accurate.
+                answer_format = ex.get("answer_prefix") or None
+                vstats: dict = {}
                 try:
                     if mode == "vanilla":
-                        vstats: dict = {}
                         pred = vanilla_answer(
                             root,
                             ex["context"],
                             question,
                             char_limit=args.vanilla_char_limit,
+                            answer_format=answer_format,
                             max_prompt_tokens=args.vanilla_max_prompt_tokens,
                             stats=vstats,
                         )
                         record.update(pred=pred, steps=1, finished=True, end_reason="")
-                        # Was the gold even inside the prompt we sent? Without this a
-                        # truncated vanilla arm's score is indistinguishable from a
-                        # model failure -- and unlike KVPress, which compresses the
-                        # full context, this arm can simply not have seen the answer.
-                        record.update(vstats)
                     else:
-                        r = rlm.run(ex["context"], question)
+                        r = rlm.run(ex["context"], question, answer_format=answer_format)
                         if hasattr(sub, "pop_example_stats"):
                             r.metrics["sub_kv"] = sub.pop_example_stats() or None
                         record.update(
@@ -625,6 +743,13 @@ def main() -> None:
                     record.update(
                         pred=None, error=f"{type(e).__name__}: {e}", steps=0, finished=False, end_reason="exception"
                     )
+                # Was the gold even inside the prompt we sent? Without this a
+                # truncated vanilla arm's score is indistinguishable from a model
+                # failure -- and unlike KVPress, which compresses the full context,
+                # this arm can simply not have seen the answer. Merged outside the
+                # try: vanilla_answer fills the dict before re-raising, and the
+                # errored record is exactly the one a triage pass needs it on.
+                record.update(vstats)
                 record["correct"] = is_correct(record.get("pred"), ex["answers"])
                 record["latency_s"] = round(time.time() - t0, 2)
                 record["tokens"] = root.usage.total_tokens + sub.usage.total_tokens - tok0
@@ -642,47 +767,6 @@ def main() -> None:
                 )
         if n:
             print(f"== {mode}: {correct}/{n} correct ({100*correct/n:.1f}%)")
-        run_config = {
-            "backend": "rlm",
-            "dataset": dataset_name,
-            "data_dir": args.data_dir,
-            # `model` duplicates root_model under the key KVPress's config.yaml
-            # uses, so a comparison joins the two backends on (dataset, data_dir,
-            # model) without special-casing either one.
-            "model": args.root_model,
-            "mode": mode,
-            "root_model": args.root_model,
-            "sub_model": args.sub_model,
-            "base_url": args.base_url,
-            "limit": args.limit,
-            "max_steps": args.max_steps,
-            "vanilla_char_limit": args.vanilla_char_limit,
-            "vanilla_max_prompt_tokens": args.vanilla_max_prompt_tokens,
-            "memory_budget": asdict(budget) if budget else None,
-            "scratchpad": asdict(scratchpad) if scratchpad else None,
-            "exec_timeout": args.exec_timeout or None,
-            "run_timeout": args.run_timeout or None,
-            "max_sub_calls": args.max_sub_calls or None,
-            "sub_backend": args.sub_backend,
-            "press": args.press if args.sub_backend == "kvzip" else None,
-            # sub_kv_-prefixed: "memory_budget" above is the ROOT's own eviction
-            # budget (MemoryBudget), an unrelated concept -- this is the KV
-            # compression budget applied per llm_query sub-call.
-            "sub_kv_memory_budget": args.memory_budget if args.sub_backend == "kvzip" else None,
-            "sub_kv_memory_budget_unit": args.memory_budget_unit if args.sub_backend == "kvzip" else None,
-            "max_subcall_chars": args.max_subcall_chars,
-            # How that number was arrived at. `subcall_sizing` carries every cap
-            # considered and which one bound, so a surprising size can be explained
-            # without re-running; `max_subcall_chars_resolved` is what the resume
-            # check compares against.
-            "subcall_sizing_mode": args.subcall_sizing_mode,
-            "target_compression_ratio": args.target_compression_ratio,
-            "max_subcall_chars_resolved": args.max_subcall_chars,
-            "subcall_sizing": asdict(subcall_sizing) if subcall_sizing else None,
-            "sub_max_tokens": args.sub_max_tokens if args.sub_backend == "kvzip" else None,
-            "sub_max_context_tokens": args.sub_max_context_tokens if args.sub_backend == "kvzip" else None,
-            "press_min_tokens": args.press_min_tokens if args.sub_backend == "kvzip" else None,
-        }
         metrics = write_run_artifacts(
             res_path,
             run_dir,
@@ -694,6 +778,63 @@ def main() -> None:
         f"Total API calls: root={root.usage.calls}, sub={sub.usage.calls}; "
         f"tokens: {root.usage.total_tokens + sub.usage.total_tokens}"
     )
+
+
+def build_run_config(
+    args: argparse.Namespace,
+    mode: str,
+    dataset_name: str,
+    budget: MemoryBudget | None,
+    scratchpad: Scratchpad | None,
+    subcall_sizing: Any,
+) -> dict:
+    """The run's full settings, as written to config.yaml.
+
+    Built before the examples run rather than after, because it is what a resume
+    is checked against (see resume_conflicts).
+    """
+    return {
+        "backend": "rlm",
+        "dataset": dataset_name,
+        "data_dir": args.data_dir,
+        # `model` duplicates root_model under the key KVPress's config.yaml
+        # uses, so a comparison joins the two backends on (dataset, data_dir,
+        # model) without special-casing either one.
+        "model": args.root_model,
+        "mode": mode,
+        "root_model": args.root_model,
+        "sub_model": args.sub_model,
+        "base_url": args.base_url,
+        "limit": args.limit,
+        "split": args.split,
+        "max_steps": args.max_steps,
+        "vanilla_char_limit": args.vanilla_char_limit,
+        "vanilla_max_prompt_tokens": args.vanilla_max_prompt_tokens,
+        "memory_budget": asdict(budget) if budget else None,
+        "scratchpad": asdict(scratchpad) if scratchpad else None,
+        "exec_timeout": args.exec_timeout or None,
+        "run_timeout": args.run_timeout or None,
+        "max_sub_calls": args.max_sub_calls or None,
+        "sub_backend": args.sub_backend,
+        "press": args.press if args.sub_backend == "kvzip" else None,
+        # sub_kv_-prefixed: "memory_budget" above is the ROOT's own eviction
+        # budget (MemoryBudget), an unrelated concept -- this is the KV
+        # compression budget applied per llm_query sub-call.
+        "sub_kv_memory_budget": args.memory_budget if args.sub_backend == "kvzip" else None,
+        "sub_kv_memory_budget_unit": args.memory_budget_unit if args.sub_backend == "kvzip" else None,
+        "max_subcall_chars": args.max_subcall_chars,
+        # How that number was arrived at. `subcall_sizing` carries every cap
+        # considered and which one bound, so a surprising size can be explained
+        # without re-running; `max_subcall_chars_resolved` is what the resume
+        # check compares against.
+        "subcall_sizing_mode": args.subcall_sizing_mode,
+        "target_compression_ratio": args.target_compression_ratio,
+        "max_subcall_chars_resolved": args.max_subcall_chars,
+        "subcall_sizing": asdict(subcall_sizing) if subcall_sizing else None,
+        "sub_max_tokens": args.sub_max_tokens if args.sub_backend == "kvzip" else None,
+        "sub_max_context_tokens": args.sub_max_context_tokens if args.sub_backend == "kvzip" else None,
+        "press_min_tokens": args.press_min_tokens if args.sub_backend == "kvzip" else None,
+    }
 
 
 if __name__ == "__main__":

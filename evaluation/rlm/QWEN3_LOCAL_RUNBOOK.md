@@ -72,14 +72,14 @@ Runs {niah, multikey, longbench_v2} × {vanilla, rlm}, 50 examples each. Resumab
 re-submitting skips examples already in the JSONL.
 
 Outputs:
-- `benchmark_artifacts/results/rlm/<condition>/<run>/checkpoint.jsonl` — resumable per-example records
-- `benchmark_artifacts/results/rlm/<condition>/<run>/{predictions.csv,metrics.json,config.yaml}` — common artifacts
-- `benchmark_artifacts/results/rlm/<condition>/transcripts/<task>.rlm.Qwen_Qwen3-8B/<id>.json` — full RLM transcripts
+- `evaluation/results/rlm/<condition>/<run>/checkpoint.jsonl` — resumable per-example records
+- `evaluation/results/rlm/<condition>/<run>/{predictions.csv,metrics.json,config.yaml}` — common artifacts
+- `evaluation/results/rlm/<condition>/transcripts/<task>.rlm.Qwen_Qwen3-8B/<id>.json` — full RLM transcripts
 
 ## Step 6 — Score
 ```bash
 source .venv/bin/activate
-python -m evaluation.rlm.score benchmark_artifacts/results/rlm
+python -m evaluation.rlm.score evaluation/results/rlm
 ```
 
 ---

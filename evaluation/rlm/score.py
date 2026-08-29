@@ -11,8 +11,10 @@ from pathlib import Path
 
 import yaml
 
+from evaluation.results_layout import RLM_RESULTS_DIR
 
-def main(results_dir: str = "benchmark_artifacts/results/rlm") -> None:
+
+def main(results_dir: str = RLM_RESULTS_DIR) -> None:
     result_root = Path(results_dir)
     common_runs = []
     for metrics_path in sorted(result_root.rglob("metrics.json")):
@@ -36,7 +38,7 @@ def main(results_dir: str = "benchmark_artifacts/results/rlm") -> None:
             print(
                 f"{label:<34}{config.get('mode', ''):<9}"
                 f"{config.get('root_model', ''):<36}{runtime.get('examples', 0):>5}"
-                f"{100 * runtime.get('progress_match', runtime.get('accuracy', 0)):>8.1f}"
+                f"{100 * runtime.get('progress_match_loose', runtime.get('accuracy', 0)):>8.1f}"
                 f"{runtime.get('average_tokens', 0):>10.0f}"
                 f"{runtime.get('average_latency_s', 0):>8.1f}"
                 f"{runtime.get('unfinished', 0):>7}{runtime.get('errors', 0):>5}"
@@ -77,4 +79,4 @@ def main(results_dir: str = "benchmark_artifacts/results/rlm") -> None:
 
 
 if __name__ == "__main__":
-    main(sys.argv[1] if len(sys.argv) > 1 else "benchmark_artifacts/results/rlm")
+    main(sys.argv[1] if len(sys.argv) > 1 else RLM_RESULTS_DIR)

@@ -3,7 +3,7 @@
 """Tests for the runaway guards and the scratchpad -- each on AND off.
 
 Run from the repository root (the module uses absolute `evaluation.*` imports):
-    python -m pytest evaluation/rlm/test_guards.py
+    python -m pytest tests/evaluation/test_rlm_guards.py
 """
 
 import time
@@ -209,6 +209,174 @@ class ScratchpadTest(unittest.TestCase):
         block = rlm._notes_block(["padding " * 200])
         self.assertIn("oldest notes truncated", block)
         self.assertLess(rlm.tok.count(block), 200)
+
+    def test_the_cap_is_honored_and_the_marker_appears_once(self):
+        """The old loop prepended a marker on every shrink pass -- stacking one
+        copy per iteration -- and refused to shrink below 200 chars, so a small
+        cap was silently ignored."""
+        rlm = RLM(root_client=_ScriptedClient([""]), scratchpad=Scratchpad(max_notes_tokens=10))
+        block = rlm._notes_block(["padding " * 500])
+        self.assertEqual(block.count("oldest notes truncated"), 1)
+        self.assertLessEqual(rlm.tok.count(block), 10)
+
+
+class _ContextOverflow(Exception):
+    status_code = 400
+
+    def __str__(self):
+        return "This model's maximum context length is 40960 tokens"
+
+
+class _OverflowingClient(_ScriptedClient):
+    """Rejects any prompt over `limit` characters, as a served model would."""
+
+    def __init__(self, replies, limit: int):
+        super().__init__(replies)
+        self.limit = limit
+        self.rejections = 0
+
+    def chat(self, messages, **kw):
+        if sum(len(m["content"]) for m in messages) > self.limit:
+            self.rejections += 1
+            raise _ContextOverflow()
+        return super().chat(messages, **kw)
+
+
+class RootContextOverflowTest(unittest.TestCase):
+    """Without a --max-context-tokens budget the root's view grows every turn and
+    nothing bounds it. One overflow used to end the example as an exception --
+    the mechanism that zeroed an entire RULER-32k RLM run."""
+
+    def test_the_server_rejecting_the_view_evicts_and_retries(self):
+        # Distinct cells: three identical ones would trip the repetition breaker
+        # instead, which is a different guard with its own test.
+        chatty = [_code(f"print({c!r} * 3000)") for c in "abc"]
+        root = _OverflowingClient(chatty + _finish("survived"), limit=9000)
+        rlm = RLM(root_client=root, max_steps=8, exec_timeout=None)
+
+        result = rlm.run("ctx", "task")
+
+        self.assertGreater(root.rejections, 0, "the fixture should have overflowed at least once")
+        self.assertEqual(result.answer, "survived")
+        self.assertGreater(result.metrics["overflow_evictions"], 0)
+
+    def test_an_unfixable_overflow_still_raises(self):
+        """When there are no turns left to drop, the system prompt alone exceeds
+        the window; dropping more cannot help and pretending otherwise would loop."""
+        root = _OverflowingClient(_finish("never reached"), limit=10)
+        rlm = RLM(root_client=root, max_steps=3, exec_timeout=None)
+
+        with self.assertRaises(_ContextOverflow):
+            rlm.run("ctx", "task")
+
+    def test_a_non_overflow_error_is_not_retried(self):
+        class _Boom(Exception):
+            status_code = 500
+
+        class _Client(_ScriptedClient):
+            def chat(self, messages, **kw):
+                raise _Boom()
+
+        with self.assertRaises(_Boom):
+            RLM(root_client=_Client([]), max_steps=3, exec_timeout=None).run("ctx", "task")
+
+
+class GroundingTest(unittest.TestCase):
+    """The guard has to reject guesses without rejecting honest answers."""
+
+    def test_a_literal_merely_embedded_in_a_task_word_is_rejected(self):
+        """Plain containment licensed any literal appearing ANYWHERE in the task
+        string, including inside a longer number or word: a question mentioning
+        2012 whitelisted the invented answer 12."""
+        root = _ScriptedClient([_code("FINAL('12')")] * 4)
+        rlm = RLM(root_client=root, max_steps=6, exec_timeout=None)
+
+        result = rlm.run("nothing relevant", "How many were sold in 2012?")
+        self.assertEqual(result.end_reason, "ungrounded_final")
+
+    def test_a_word_genuinely_present_in_the_task_is_accepted(self):
+        root = _ScriptedClient([_code("FINAL('beta')")])
+        rlm = RLM(root_client=root, max_steps=3, exec_timeout=None)
+
+        result = rlm.run("ctx", "Which of alpha or beta is it?")
+        self.assertEqual(result.answer, "beta")
+
+    def test_an_answer_in_the_elided_middle_of_a_long_output_is_grounded(self):
+        """The observation shown to the model is truncated head+tail for display;
+        grounding must read what actually printed, or a real answer buried in the
+        middle reads as a fabrication."""
+        root = _ScriptedClient(
+            [
+                _code("print('x' * 4000 + ' SECRET42 ' + 'y' * 4000)"),
+                _code("FINAL('SECRET42')"),
+            ]
+        )
+        rlm = RLM(root_client=root, max_steps=4, obs_limit=500, exec_timeout=None)
+
+        result = rlm.run("ctx", "find the secret")
+        self.assertEqual(result.answer, "SECRET42")
+        self.assertIn("...[truncated", result.transcript[0]["observation"])
+
+    def test_a_guess_dressed_as_an_fstring_is_still_a_guess(self):
+        root = _ScriptedClient([_code('FINAL(f"42")')] * 4)
+        rlm = RLM(root_client=root, max_steps=6, exec_timeout=None)
+
+        self.assertEqual(rlm.run("ctx", "how many?").end_reason, "ungrounded_final")
+
+
+class AbstentionTest(unittest.TestCase):
+    """A model that searched and found nothing has something true to report, and
+    no way to say it: FINAL("unknown") is by construction absent from the output
+    it describes, so the grounding guard read the honest ending as a guess."""
+
+    def test_final_none_ends_the_run_without_a_grounding_check(self):
+        root = _ScriptedClient([_code("FINAL_NONE('the document never mentions it')")])
+        rlm = RLM(root_client=root, max_steps=3, exec_timeout=None)
+
+        result = rlm.run("ctx", "task")
+        self.assertEqual(result.end_reason, "abstained")
+        self.assertIsNone(result.answer)
+        self.assertTrue(result.finished, "abstaining is a completed run, not a failure")
+        self.assertEqual(result.metrics["abstain_reason"], "the document never mentions it")
+
+    def test_final_none_is_honored_in_prose_too(self):
+        root = _ScriptedClient(["I searched thoroughly. FINAL_NONE('not present')"])
+        rlm = RLM(root_client=root, max_steps=3, exec_timeout=None)
+
+        result = rlm.run("ctx", "task")
+        self.assertEqual(result.end_reason, "abstained")
+        self.assertIsNone(result.answer)
+
+
+class ReplyParsingTest(unittest.TestCase):
+    def test_a_code_block_cut_off_at_max_tokens_still_runs(self):
+        """A reply truncated mid-block has an opening fence and no closing one.
+        Read as 'no code block' it burned a nudge, and three of them returned the
+        raw truncated text as the answer."""
+        root = _ScriptedClient(["Here goes:\n```python\nans = 'found it'\nprint(ans)"] + [_code("FINAL(ans)")])
+        rlm = RLM(root_client=root, max_steps=4, exec_timeout=None)
+
+        result = rlm.run("ctx", "task")
+        self.assertEqual(result.answer, "found it")
+        self.assertEqual(result.metrics["truncated_code_blocks"], 1)
+
+    def test_final_var_on_a_missing_variable_is_not_an_answer(self):
+        """It used to answer the literal string '<missing var x>' and record it as
+        a finished, successful prediction."""
+        root = _ScriptedClient([_code("FINAL_VAR('nope')")] + _finish("real answer"))
+        rlm = RLM(root_client=root, max_steps=5, exec_timeout=None)
+
+        result = rlm.run("ctx", "task")
+        self.assertIn("NameError", result.transcript[0]["observation"])
+        self.assertEqual(result.answer, "real answer")
+
+    def test_prose_final_var_naming_an_unset_variable_falls_through_to_a_nudge(self):
+        root = _ScriptedClient(["I am done: FINAL_VAR('never_set')"] + _finish("real answer"))
+        rlm = RLM(root_client=root, max_steps=5, exec_timeout=None)
+
+        result = rlm.run("ctx", "task")
+        self.assertNotIn("missing var", str(result.answer))
+        self.assertEqual(result.answer, "real answer")
 
 
 if __name__ == "__main__":

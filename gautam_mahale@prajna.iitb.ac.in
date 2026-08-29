@@ -1,0 +1,1501 @@
+From af318022c17a81d0419164553a019f60fa1d4394 Mon Sep 17 00:00:00 2001
+From: Gautam Mahale <gautam_mahale@iitb.ac.in>
+Date: Fri, 7 Aug 2026 01:09:52 +0530
+Subject: [PATCH] Make RLM results comparable with KVPress, and guard long runs
+
+The RLM harness already shared KVPress's dataset loaders, canonical scorers
+and predictions.csv/metrics.json/config.yaml contract, but three things made
+the two backends' numbers not actually comparable, and nothing bounded a
+runaway example.
+
+Comparability:
+
+* An example that died with an API error was scored as a wrong answer.
+  score_prediction_frame fills a null prediction with "", which every scorer
+  marks 0 -- so a NIM outage read as the RLM arm being less accurate, a hit
+  KVPress cannot take because it makes no network calls. Errored rows are now
+  excluded from scoring and reported in runtime.errors.
+* Errored examples were recorded as done, so a transient outage permanently
+  poisoned those cells. They are now retried on resume.
+* The vanilla arm's character limit is not a token limit. On densely-tokenising
+  subsets (RULER cwe, niah_multikey_3) the server rejected every prompt with a
+  400 and the cell scored 0.0 from a harness error rather than from the model.
+  vanilla_answer now takes a token ceiling and, because no local tokenizer
+  matches the server's, shrinks and retries whenever the server rejects for
+  length. Truncation stats are recorded so a low vanilla score is readable as a
+  property of the limit rather than of the model.
+
+metrics.json now also reports average_peak_context_tokens, the RLM analogue of
+KVPress's average_retained_context_tokens -- both are "context held at once",
+which is what KV memory is proportional to and what a memory sweep varies.
+
+evaluation/compare.py joins both result trees on (dataset, data_dir, model) and
+prints score against that shared cost axis.
+
+Runaway guards, each independently switchable off with 0:
+
+* --exec-timeout (60s): bounds pure-Python time in one code block. Paused
+  around llm_query so a slow-but-legitimate sub-call is not mistaken for a
+  runaway loop.
+* --run-timeout (900s): bounds wall-clock for one example, since exec-timeout
+  deliberately does not bound llm_query time.
+* --max-sub-calls (40): past the cap llm_query returns a notice instead of
+  hitting the API, so the model degrades rather than erroring.
+* --scratchpad (off): opt-in note() tool whose notes are re-shown every turn
+  and survive budget eviction.
+
+Also fixed along the way: model code calling sys.exit() raised SystemExit that
+escaped run_benchmark's except Exception and killed the whole sweep; the
+sub-call cache keyed on the truncated prompt so two slices sharing a prefix
+returned each other's answers; connection errors and NIM's transient 400
+DEGRADED were treated as fatal instead of retryable; and root and sub each held
+their own RateLimiter, letting the process issue ~2x --rpm.
+
+No KVPress code is touched -- the dependency stays one-way.
+
+Signed-off-by: Gautam Mahale <gautam_mahale@iitb.ac.in>
+---
+ evaluation/compare.py                | 199 ++++++++++++++++++
+ evaluation/rlm/README.md             |  59 ++++++
+ evaluation/rlm/client.py             |  17 +-
+ evaluation/rlm/rlm.py                | 304 +++++++++++++++++++++++++--
+ evaluation/rlm/run_benchmark.py      | 179 ++++++++++++++--
+ evaluation/rlm/test_guards.py        | 215 +++++++++++++++++++
+ evaluation/rlm/test_run_benchmark.py | 153 ++++++++++++++
+ 7 files changed, 1084 insertions(+), 42 deletions(-)
+ create mode 100644 evaluation/compare.py
+ create mode 100644 evaluation/rlm/test_guards.py
+ create mode 100644 evaluation/rlm/test_run_benchmark.py
+
+diff --git a/evaluation/compare.py b/evaluation/compare.py
+new file mode 100644
+index 0000000..c6debbd
+--- /dev/null
++++ b/evaluation/compare.py
+@@ -0,0 +1,199 @@
++# SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-License-Identifier: Apache-2.0
++"""Join KVPress and RLM runs into one comparison table.
++
++Both backends write the same `predictions.csv` / `metrics.json` / `config.yaml`
++contract and score through the same canonical scorer in `benchmarks/registry.py`,
++so for a given (dataset, data_dir, model) their headline numbers are the same
++measurement and can be placed side by side. This script does the placing.
++
++Usage:
++  python -m evaluation.compare                                  # all results
++  python -m evaluation.compare --results-dir evaluation/results
++  python -m evaluation.compare --dataset ruler32k --csv out.csv
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++from pathlib import Path
++from typing import Any, Iterator, Optional
++
++import pandas as pd
++import yaml
++
++# Scorers disagree on what to call the headline number, and some nest it per task.
++# Checked in order; the first hit wins. Both backends run the SAME scorer for a
++# given dataset, so whichever key is picked is picked identically for both -- that
++# symmetry, not the specific key, is what makes the columns comparable.
++SCORE_KEYS = ("average", "string_match", "exact_match", "score", "accuracy", "f1")
++
++# Reported by the RLM harness about itself; never a benchmark score.
++RUNTIME_KEY = "runtime"
++
++
++def _flatten(metrics: dict, prefix: str = "") -> dict[str, Any]:
++    """Flatten one level of per-task nesting, e.g. {'niah_single_1': {...}}."""
++    flat: dict[str, Any] = {}
++    for key, value in metrics.items():
++        if key == RUNTIME_KEY:
++            continue
++        name = f"{prefix}{key}"
++        if isinstance(value, dict):
++            flat.update(_flatten(value, prefix=""))
++        else:
++            flat[name] = value
++    return flat
++
++
++def headline_score(metrics: dict) -> tuple[Optional[str], Optional[float]]:
++    """Pick the comparable number out of a scorer's metrics dict."""
++    flat = _flatten(metrics)
++    for key in SCORE_KEYS:
++        value = flat.get(key)
++        if isinstance(value, (int, float)):
++            return key, float(value)
++    # Fall back to the only numeric entry, if the scorer reports exactly one.
++    numeric = {k: v for k, v in flat.items() if isinstance(v, (int, float)) and k != "num_samples"}
++    if len(numeric) == 1:
++        key, value = next(iter(numeric.items()))
++        return key, float(value)
++    return None, None
++
++
++def iter_runs(results_dir: Path) -> Iterator[tuple[Path, dict, dict]]:
++    """Yield (run_dir, config, metrics) for every completed run under a tree."""
++    for metrics_path in sorted(results_dir.rglob("metrics.json")):
++        run_dir = metrics_path.parent
++        config_path = run_dir / "config.yaml"
++        if not config_path.exists():
++            continue
++        try:
++            metrics = json.loads(metrics_path.read_text())
++            config = yaml.safe_load(config_path.read_text()) or {}
++        except (json.JSONDecodeError, yaml.YAMLError):
++            continue
++        yield run_dir, config, metrics
++
++
++def describe_configuration(backend: str, config: dict) -> str:
++    """A short label for the knob this run varies -- the sweep's x-axis."""
++    if backend == "rlm":
++        mode = config.get("mode", "rlm")
++        budget = (config.get("memory_budget") or {}).get("max_context_tokens")
++        return f"{mode}" if budget is None else f"{mode}@ctx{budget}"
++    press = config.get("press_name", "unknown")
++    if config.get("memory_budget") is not None:
++        return f"{press}@{config['memory_budget']:g}{config.get('memory_budget_unit', 'GB')}"
++    return f"{press}@cr{config.get('compression_ratio', 0.0):.2f}"
++
++
++def build_row(run_dir: Path, config: dict, metrics: dict) -> dict[str, Any]:
++    backend = config.get("backend", "kvpress")
++    metric_name, score = headline_score(metrics)
++    runtime = metrics.get(RUNTIME_KEY, {}) if isinstance(metrics.get(RUNTIME_KEY), dict) else {}
++
++    data_dir = config.get("data_dir")
++    if isinstance(data_dir, list):
++        data_dir = "__".join(data_dir)
++
++    row: dict[str, Any] = {
++        "backend": backend,
++        "dataset": config.get("dataset"),
++        "task": data_dir or "default",
++        "model": config.get("model"),
++        "configuration": describe_configuration(backend, config),
++        "metric": metric_name,
++        "score": score,
++    }
++
++    # The shared cost axis. KVPress varies how much of the KV cache it keeps; RLM
++    # varies how much context the root holds at once. Both answer "how many context
++    # tokens were live at peak", which is what KV memory is proportional to -- so
++    # this is the column to plot score against for either backend.
++    if backend == "rlm":
++        row["context_tokens_held"] = runtime.get("average_peak_context_tokens")
++        row["total_tokens"] = runtime.get("average_tokens")
++        row["examples"] = runtime.get("scored")
++        row["errors"] = runtime.get("errors")
++        # Only meaningful for the vanilla arm, and the reason its score may be a
++        # property of the truncation limit rather than of the model.
++        row["context_retained"] = runtime.get("average_context_chars_retained")
++    else:
++        row["context_tokens_held"] = metrics.get("average_retained_context_tokens")
++        row["total_tokens"] = metrics.get("average_original_context_tokens")
++        row["kv_memory_gb"] = metrics.get("average_retained_kv_memory_gb")
++        row["compression_ratio"] = metrics.get("average_compression_ratio")
++        row["context_retained"] = 1.0  # KVPress compresses the full context, never truncates it.
++
++    row["run_dir"] = str(run_dir)
++    return row
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    ap.add_argument("--results-dir", default="evaluation/results", help="tree holding both KVPress and RLM run dirs")
++    ap.add_argument("--dataset", default=None, help="restrict to one dataset")
++    ap.add_argument("--model", default=None, help="restrict to one model id")
++    ap.add_argument("--csv", default=None, help="also write the joined table here")
++    args = ap.parse_args()
++
++    results_dir = Path(args.results_dir)
++    if not results_dir.exists():
++        raise SystemExit(f"No results directory at {results_dir}")
++
++    rows = [build_row(*run) for run in iter_runs(results_dir)]
++    if not rows:
++        raise SystemExit(f"No runs with both metrics.json and config.yaml under {results_dir}")
++
++    frame = pd.DataFrame(rows)
++    if args.dataset:
++        frame = frame[frame["dataset"] == args.dataset]
++    if args.model:
++        frame = frame[frame["model"] == args.model]
++    if frame.empty:
++        raise SystemExit("No runs matched the given filters")
++
++    frame = frame.sort_values(["dataset", "task", "model", "backend", "configuration"], na_position="last")
++
++    display_columns = [
++        c
++        for c in (
++            "dataset",
++            "task",
++            "model",
++            "backend",
++            "configuration",
++            "metric",
++            "score",
++            "context_tokens_held",
++            "total_tokens",
++            "context_retained",
++            "kv_memory_gb",
++            "errors",
++        )
++        if c in frame.columns
++    ]
++    with pd.option_context("display.max_columns", None, "display.width", 200):
++        print(frame[display_columns].to_string(index=False))
++
++    # A KVPress row and an RLM row are only comparable if they ran the same
++    # scorer, which means the same dataset. Say so explicitly rather than letting
++    # a reader assume every printed row belongs in one plot.
++    for (dataset, task), group in frame.groupby(["dataset", "task"]):
++        backends = set(group["backend"])
++        if len(backends) < 2:
++            print(f"\nnote: {dataset}/{task} has only {backends.pop()} runs -- nothing to compare against yet")
++        elif group["metric"].nunique() > 1:
++            print(
++                f"\nwarning: {dataset}/{task} rows use different metrics {sorted(set(group['metric']))}; not comparable"
++            )
++
++    if args.csv:
++        frame.to_csv(args.csv, index=False)
++        print(f"\nwrote {args.csv}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/evaluation/rlm/README.md b/evaluation/rlm/README.md
+index be7269a..fdd58d8 100644
+--- a/evaluation/rlm/README.md
++++ b/evaluation/rlm/README.md
+@@ -58,6 +58,65 @@ the three common result artifacts, and (for RLM mode) per-example transcripts.
+ The canonical benchmark scorer—not the harness's quick progress-match flag—is
+ the authoritative score in `metrics.json`.
+ 
++## Comparing against KVPress
++Run both backends on the same `dataset` / `data_dir` / `model`, then join them:
++
++```bash
++python -m evaluation.compare --dataset ruler32k --csv comparison.csv
++```
++
++`compare.py` walks `evaluation/results/`, reads each run's `config.yaml` and
++`metrics.json`, and prints one row per run. What makes the rows commensurable:
++
++- **Same scorer.** Both backends call `benchmarks/results.score_prediction_frame`,
++  so `score` is literally the same function applied to the same gold answers.
++- **Same cost axis.** `context_tokens_held` is KVPress's
++  `average_retained_context_tokens` and RLM's `average_peak_context_tokens` —
++  both answer "how much context was live at once", which is what KV memory is
++  proportional to. Plot score against this column to put a compression sweep and
++  a `--max-context-tokens` sweep on one chart.
++
++Two asymmetries the harness records rather than hides, because ignoring either
++one silently flatters RLM:
++
++- **Errors.** An RLM example that dies on an API error is dropped from the score
++  and counted in `runtime.errors`. KVPress runs locally and cannot fail this
++  way, so scoring an outage as a zero would understate RLM for a reason that has
++  nothing to do with the method. Treat a run with many errors as incomplete, not
++  as a result — check the `errors` column before believing a score.
++- **Truncation.** KVPress compresses the full context; vanilla truncates it. The
++  `context_retained` column is the fraction that survived, so a low vanilla score
++  can be read as a property of the char/token limit rather than of the model.
++  Set `--vanilla-max-prompt-tokens` to `(max-model-len - max-tokens - margin)`;
++  without it, densely-tokenising subsets (RULER `cwe`, `niah_multikey_3`)
++  overflow the served window and score 0.0 from a harness error.
++
++## Runaway guards and the scratchpad
++All four are toggleable and independent; pass `0` to disable one without
++affecting the others. Defaults are on because an unguarded run can burn a whole
++SLURM allocation on one pathological example, but a debugging session that wants
++to watch a single example run to completion can switch any of them off.
++
++| Flag | Default | Off | What it bounds |
++|---|---|---|---|
++| `--exec-timeout` | `60` s | `0` | Pure-Python time for ONE code block, so a model-generated infinite loop can't hang the sweep. Time inside `llm_query` is excluded — the watchdog is paused around sub-calls, so a slow-but-legitimate API call is never mistaken for a runaway loop. |
++| `--run-timeout` | `900` s | `0` | Wall-clock for ONE example, ending it with `end_reason=run_timeout`. Needed because `--exec-timeout` deliberately does not bound `llm_query` time. |
++| `--max-sub-calls` | `40` | `0` | `llm_query` calls per example. Past the cap, calls return a notice instead of hitting the API, so the model degrades gracefully rather than erroring. |
++| `--scratchpad` | off | (omit) | Opt-in `note(text)` REPL tool. Notes are re-shown every turn and survive budget eviction, giving the model a durable place to keep findings. Size it with `--max-notes-tokens`. |
++
++`--exec-timeout` relies on `SIGALRM`, so it is a no-op off the main thread or on
++platforms without it; it also cannot interrupt a C-level regex. `--run-timeout`
++has neither limitation and is the backstop.
++
++Because `--scratchpad` and `--max-context-tokens` both change results, both
++appear in the run directory name — otherwise two configurations would share a
++`checkpoint.jsonl` and silently merge. Nothing parses that name; `compare.py`
++reads `config.yaml`.
++
++The root and sub clients now share one `RateLimiter`, so `--rpm` is a per-account
++cap. Previously each client had its own and the process could issue ~2x `--rpm`
++and trip 429s.
++
+ ## Benchmarks (in order of effort)
+ | Benchmark | Why | Source |
+ |---|---|---|
+diff --git a/evaluation/rlm/client.py b/evaluation/rlm/client.py
+index 76163fd..3a927e8 100644
+--- a/evaluation/rlm/client.py
++++ b/evaluation/rlm/client.py
+@@ -61,6 +61,10 @@ class NIMClient:
+     temperature: float = 0.0
+     max_tokens: int = 4096
+     extra_body: dict | None = None
++    # Optional shared limiter: pass ONE RateLimiter to several clients (e.g. the
++    # RLM root + sub) so the rpm cap applies per ACCOUNT, not per client — two
++    # independent limiters would otherwise let the process issue ~2x rpm.
++    limiter: RateLimiter | None = None
+     usage: Usage = field(default_factory=Usage)
+ 
+     def __post_init__(self) -> None:
+@@ -68,7 +72,7 @@ class NIMClient:
+         if not key:
+             raise RuntimeError("Set NVIDIA_API_KEY (get one at build.nvidia.com).")
+         self._client = OpenAI(base_url=self.base_url, api_key=key, timeout=self.timeout)
+-        self._limiter = RateLimiter(self.rpm)
++        self._limiter = self.limiter or RateLimiter(self.rpm)
+ 
+     def chat(self, messages: list[dict], **kw) -> str:
+         """One chat completion with backoff. Returns assistant text."""
+@@ -90,14 +94,19 @@ class NIMClient:
+                 resp = self._client.chat.completions.create(**params)
+                 self.usage.add(resp)
+                 return resp.choices[0].message.content or ""
+-            except (RateLimitError, APITimeoutError) as e:
++            except (RateLimitError, APITimeoutError):
+                 if attempt == self.max_retries - 1:
+                     raise
+                 time.sleep(delay)
+                 delay = min(delay * 2, 120)
+             except APIError as e:
+-                # 5xx are retryable; 4xx (bad request, context too long) are not
+-                if getattr(e, "status_code", 500) and e.status_code < 500:
++                # 5xx are retryable; 4xx (bad request, context too long) are not.
++                # Connection errors (e.g. APIConnectionError) have no status_code
++                # at all -- treat those as retryable too. Exception: NIM returns
++                # 400 "DEGRADED function cannot be invoked" while an endpoint is
++                # unhealthy -- that's a transient service condition, retry it.
++                status = getattr(e, "status_code", None)
++                if status is not None and status < 500 and "DEGRADED" not in str(e):
+                     raise
+                 if attempt == self.max_retries - 1:
+                     raise
+diff --git a/evaluation/rlm/rlm.py b/evaluation/rlm/rlm.py
+index f805778..a609edc 100644
+--- a/evaluation/rlm/rlm.py
++++ b/evaluation/rlm/rlm.py
+@@ -29,6 +29,9 @@ import ast
+ import contextlib
+ import io
+ import re
++import signal
++import threading
++import time
+ import traceback
+ from dataclasses import dataclass, field
+ from typing import Callable, Optional
+@@ -56,7 +59,7 @@ RULES:
+       (keep each call under ~8000 characters). Capture the result:
+       ans = llm_query(...) then print(ans).
+     * `print(...)`: anything you print is shown back to you in the NEXT message
+-      (truncated to {obs_limit} chars), so print only what you need to see.
++      (truncated to {obs_limit} chars), so print only what you need to see.{note_tool}
+ - Strategy: peek at structure first (e.g. `print(context[:2000])`,
+   `print(len(context))`, regex search), then narrow down with string ops or
+   chunked `llm_query` calls. Do NOT print the whole context.
+@@ -104,6 +107,30 @@ FOLD_MARKER = (
+     "below."
+ )
+ 
++NOTE_TOOL_HELP = (
++    "\n    * `note(text: str)`: save a SHORT finding to a persistent scratchpad. "
++    "The scratchpad is shown back to you on every turn, so notes never scroll "
++    "out of view — save key facts, indices, and partial answers there."
++)
++
++SCRATCHPAD_TEMPLATE = "[SCRATCHPAD] Your saved notes so far (persistent — always visible):\n{notes}\n[END SCRATCHPAD]"
++
++FOLD_SCRATCHPAD_TEMPLATE = (
++    "[MEMORY NOTICE] {n} earlier turn(s) were dropped to stay within your memory "
++    "budget. Raw output from them is gone, but the REPL is persistent (your "
++    "variables still exist) and this scratchpad survived:\n"
++    "{notes}\n[END SCRATCHPAD] Continue from the recent output below."
++)
++
++
++class _ExecTimeout(Exception):
++    """Raised by the SIGALRM handler when model-generated code exceeds its budget."""
++
++
++def _raise_exec_timeout(signum, frame):  # pragma: no cover - signal handler
++    raise _ExecTimeout()
++
++
+ CODE_RE = re.compile(r"```(?:python|repl|py)?[ \t]*\n?(.*?)```", re.DOTALL)
+ STMT_KEYWORDS = r"print|import|from|for|while|if|elif|try|except|finally|with|return|FINAL_VAR|FINAL"
+ ONELINE_FIX_RE = re.compile(rf"(?<=[\)\w'\"])\s+(?=(?:{STMT_KEYWORDS})\b)")
+@@ -165,6 +192,21 @@ class MemoryBudget:
+     keep_recent_turns: int = 3
+ 
+ 
++@dataclass
++class Scratchpad:
++    """Opt-in persistent notes for the root model (orthogonal to MemoryBudget).
++
++    Enables a `note(text)` REPL tool; saved notes are re-injected into the
++    root's view every turn (and survive budget eviction when a MemoryBudget is
++    also set).
++
++    max_notes_tokens : cap on the notes block injected into context; oldest
++                       text is truncated away once exceeded.
++    """
++
++    max_notes_tokens: int = 1024
++
++
+ @dataclass
+ class RLMResult:
+     answer: str | None
+@@ -184,8 +226,12 @@ class RLM:
+         obs_limit: int = 6000,
+         max_subcall_chars: int = 32000,
+         budget: Optional[MemoryBudget] = None,
++        scratchpad: Optional[Scratchpad] = None,
+         token_counter: Optional[Callable[[str], int]] = None,
+         cache_subcalls: bool = True,
++        exec_timeout: Optional[float] = 60.0,
++        run_timeout: Optional[float] = 900.0,
++        max_sub_calls: Optional[int] = 40,
+     ):
+         self.root = root_client
+         self.sub = sub_client or root_client
+@@ -193,28 +239,76 @@ class RLM:
+         self.obs_limit = obs_limit
+         self.max_subcall_chars = max_subcall_chars
+         self.budget = budget
++        self.scratchpad = scratchpad
+         self.cache_subcalls = cache_subcalls
++        # Each guard below is independently disabled by passing None (or 0 from the
++        # CLI). They are on by default because an unguarded run can consume a SLURM
++        # allocation on one pathological example -- but a debugging session that
++        # wants to watch a single example run to completion can switch any of them
++        # off without affecting the others.
++        self.exec_timeout = exec_timeout
++        # Wall-clock ceiling for ONE example. exec_timeout deliberately excludes
++        # llm_query time (a slow sub-call is legitimate), and NIMClient retries with
++        # backoff -- so without a separate deadline a single pathological example can
++        # stall a job for hours. None disables.
++        self.run_timeout = run_timeout
++        self.max_sub_calls = max_sub_calls
++        self._sub_call_budget: Optional[int] = None
++        self._deadline: Optional[float] = None
+         self.tok = TokenCounter(token_counter)
++        # True only while _exec's SIGALRM code-timeout is armed; lets llm_query
++        # pause that watchdog around its (legit, possibly slow) sub-LLM call.
++        self._alarm_active = False
+ 
+     # ---------------- REPL plumbing ----------------
+-    def _make_env(self, context: str, metrics: dict, cache: dict) -> dict:
++    def _make_env(self, context: str, metrics: dict, cache: dict, notes: list) -> dict:
+         final_box: dict = {"value": None, "done": False}
+ 
+         def llm_query(prompt: str) -> str:
+-            prompt = str(prompt)[: self.max_subcall_chars]
+-            if self.cache_subcalls and prompt in cache:
++            # Key on the FULL prompt. Keying on the TRUNCATED one makes two different
++            # calls that share a 32k-char prefix collide -- e.g. context[0:100000] and
++            # context[0:200000] -- silently returning one slice's answer for the other.
++            key = str(prompt)
++            if self.cache_subcalls and key in cache:
+                 metrics["sub_cache_hits"] += 1
+-                return cache[prompt]
+-            ans = self.sub.chat(
+-                [
+-                    {"role": "system", "content": SUB_SYSTEM_PROMPT},
+-                    {"role": "user", "content": prompt},
+-                ]
+-            )
++                return cache[key]
++            if self._sub_call_budget is not None and metrics["sub_calls"] >= self._sub_call_budget:
++                return (
++                    "[SUB-CALL LIMIT REACHED] No further llm_query calls are "
++                    "available for this example. Answer from what you have already "
++                    "seen, or use plain string/regex operations on `context`."
++                )
++            prompt = key[: self.max_subcall_chars]
++            if len(key) > self.max_subcall_chars:
++                prompt += (
++                    f"\n[NOTE: your prompt was truncated at "
++                    f"{self.max_subcall_chars} chars; pass a smaller snippet]"
++                )
++            # Pause the code-exec watchdog (armed in _exec) around this blocking
++            # sub-LLM call: a slow-but-legit network call / rate-limit sleep must
++            # NOT be mistaken for a runaway loop. Only pure-Python time between
++            # sub-calls counts toward exec_timeout.
++            remaining = None
++            if self._alarm_active:
++                remaining, _ = signal.setitimer(signal.ITIMER_REAL, 0)
++            try:
++                ans = self.sub.chat(
++                    [
++                        {"role": "system", "content": SUB_SYSTEM_PROMPT},
++                        {"role": "user", "content": prompt},
++                    ]
++                )
++            finally:
++                # `remaining is not None`, not `remaining` -- setitimer returns 0.0
++                # for an already-expired timer, and a truthiness test then skips
++                # re-arming, silently disabling the exec watchdog for the REST of the
++                # cell while _alarm_active still reads True.
++                if self._alarm_active and remaining is not None:
++                    signal.setitimer(signal.ITIMER_REAL, max(remaining, 0.05))
+             metrics["sub_calls"] += 1
+             metrics["sub_call_tokens"] += self.tok.count(prompt) + self.tok.count(ans)
+             if self.cache_subcalls:
+-                cache[prompt] = ans
++                cache[key] = ans
+             return ans
+ 
+         def FINAL(answer) -> None:
+@@ -228,6 +322,17 @@ class RLM:
+             "re": re,
+         }
+ 
++        if self.scratchpad is not None:
++
++            def note(text) -> str:
++                text = str(text).strip()
++                if text:
++                    notes.append(text)
++                    metrics["notes_saved"] += 1
++                return f"[saved note #{len(notes)}]"
++
++            env["note"] = note
++
+         def FINAL_VAR(name) -> None:
+             final_box["value"] = str(env.get(str(name), f"<missing var {name}>"))
+             final_box["done"] = True
+@@ -258,6 +363,16 @@ class RLM:
+                         "```python block with real newlines."
+                     )
+         buf = io.StringIO()
++        # Bound model-generated code with a wall-clock timeout so an infinite or
++        # runaway loop can't hang the whole benchmark. SIGALRM interrupts a stuck
++        # pure-Python loop between bytecodes (main thread only); it does NOT
++        # interrupt a C-level regex — a known CPython limitation.
++        use_alarm = (
++            bool(self.exec_timeout)
++            and hasattr(signal, "SIGALRM")
++            and threading.current_thread() is threading.main_thread()
++        )
++        old_handler = None
+         try:
+             with contextlib.redirect_stdout(buf):
+                 try:
+@@ -276,6 +391,10 @@ class RLM:
+                         ):
+                             literals.append(str(node.args[0].value))
+                 env["_rlm_final_literals"] = literals
++                if use_alarm:
++                    old_handler = signal.signal(signal.SIGALRM, _raise_exec_timeout)
++                    signal.setitimer(signal.ITIMER_REAL, self.exec_timeout)
++                    self._alarm_active = True
+                 if tree and tree.body and isinstance(tree.body[-1], ast.Expr):
+                     last = tree.body[-1]
+                     assign = ast.Assign(
+@@ -293,8 +412,27 @@ class RLM:
+                         print(val if isinstance(val, str) else repr(val))
+                 else:
+                     exec(code, env)  # noqa: S102
+-        except Exception:
++        except _ExecTimeout:
++            buf.write(
++                f"\n[TIMEOUT] your code ran longer than {self.exec_timeout:.0f}s and was "
++                "aborted — almost certainly an infinite or runaway loop. Rewrite it to "
++                "terminate: avoid unbounded while-loops, bound every iteration, and operate "
++                "on slices of `context` instead of rescanning it repeatedly."
++            )
++        except KeyboardInterrupt:
++            raise  # operator Ctrl-C must still stop the run
++        except BaseException:
++            # BaseException, not Exception: model code calling exit()/quit()/sys.exit()
++            # raises SystemExit, which would otherwise escape _exec, escape run(), and
++            # escape run_benchmark's `except Exception` -- terminating the whole sweep
++            # mid-campaign. Treat it as an ordinary cell failure.
+             buf.write("\n[EXCEPTION]\n" + traceback.format_exc(limit=3))
++        finally:
++            self._alarm_active = False
++            if use_alarm:
++                signal.setitimer(signal.ITIMER_REAL, 0)
++                if old_handler is not None:
++                    signal.signal(signal.SIGALRM, old_handler)
+         out = buf.getvalue()
+         if len(out) > obs_limit:
+             half = obs_limit // 2
+@@ -309,6 +447,15 @@ class RLM:
+     def _budget_note(self) -> str:
+         if self.budget is None:
+             return ""
++        if self.scratchpad is not None:
++            return (
++                f"\n- MEMORY BUDGET: your working context is capped at ~{self.budget.max_context_tokens} "
++                "tokens. Once you exceed it, your OLDEST turns are DROPPED automatically. Raw REPL "
++                "output that scrolls out vanishes, but Python VARIABLES persist across turns and "
++                "your note() SCRATCHPAD is always re-shown. So save anything you will need for "
++                "FINAL with note('...') (or keep it in a variable); never rely on old output "
++                "staying visible."
++            )
+         return (
+             f"\n- MEMORY BUDGET: your working context is capped at ~{self.budget.max_context_tokens} "
+             "tokens. Once you exceed it, your OLDEST turns are DROPPED automatically and are gone "
+@@ -318,6 +465,14 @@ class RLM:
+             "output staying visible."
+         )
+ 
++    def _notes_block(self, notes: list) -> str:
++        text = "\n".join(f"- {n}" for n in notes) if notes else "(nothing saved yet)"
++        cap = self.scratchpad.max_notes_tokens if self.scratchpad else 1024
++        # keep the scratchpad itself within its sub-budget (drop OLDEST text first)
++        while self.tok.count(text) > cap and len(text) > 200:
++            text = "- ...[oldest notes truncated]\n" + text[int(len(text) * 0.2) :]
++        return text
++
+     # ---------------- main loop ----------------
+     def run(self, context: str, task: str) -> RLMResult:
+         metrics = {
+@@ -331,8 +486,14 @@ class RLM:
+             "evictions": 0,
+             "budget": (self.budget.max_context_tokens if self.budget else None),
+         }
++        if self.scratchpad is not None:
++            metrics["scratchpad"] = True
++            metrics["notes_saved"] = 0
+         cache: dict = {}
+-        env = self._make_env(context, metrics, cache)
++        notes: list = []
++        self._sub_call_budget = self.max_sub_calls
++        self._deadline = time.monotonic() + self.run_timeout if self.run_timeout else None
++        env = self._make_env(context, metrics, cache, notes)
+ 
+         system_msg = {
+             "role": "system",
+@@ -342,13 +503,14 @@ class RLM:
+                 max_steps=self.max_steps,
+                 task=task,
+                 budget_note=self._budget_note(),
++                note_tool=(NOTE_TOOL_HELP if self.scratchpad is not None else ""),
+             ),
+         }
+         begin_msg = {"role": "user", "content": "Begin. Write your first code block."}
+ 
+         full_history: list = []  # all (assistant, user) messages, server-side
+         evicted_count = 0  # number of leading pairs already dropped (evicted)
+-        transcript = []
++        transcript: list = []
+         nudges = 0
+         seen_output = ""  # grounding accumulator — NEVER compacted
+ 
+@@ -357,6 +519,14 @@ class RLM:
+             nonlocal evicted_count
+             base = [system_msg, begin_msg]
+             if self.budget is None:
++                # Scratchpad notes are re-injected every turn even without a
++                # budget — that visibility is the whole point of the tool.
++                if self.scratchpad is not None and notes:
++                    notes_msg = {
++                        "role": "user",
++                        "content": SCRATCHPAD_TEMPLATE.format(notes=self._notes_block(notes)),
++                    }
++                    return base + [notes_msg] + full_history, 0
+                 return base + full_history, 0
+ 
+             n_pairs = len(full_history) // 2
+@@ -366,7 +536,22 @@ class RLM:
+ 
+             def assemble(kept_pairs, fold_n):
+                 msgs = list(base)
+-                if fold_n > 0:
++                if self.scratchpad is not None:
++                    if fold_n > 0:
++                        msgs.append(
++                            {
++                                "role": "user",
++                                "content": FOLD_SCRATCHPAD_TEMPLATE.format(n=fold_n, notes=self._notes_block(notes)),
++                            }
++                        )
++                    elif notes:
++                        msgs.append(
++                            {
++                                "role": "user",
++                                "content": SCRATCHPAD_TEMPLATE.format(notes=self._notes_block(notes)),
++                            }
++                        )
++                elif fold_n > 0:
+                     msgs.append(
+                         {"role": "user", "content": FOLD_MARKER.format(n=fold_n)}
+                     )
+@@ -391,6 +576,10 @@ class RLM:
+             return sent, fold_n
+ 
+         for step in range(1, self.max_steps + 1):
++            if self._deadline is not None and time.monotonic() > self._deadline:
++                # Out of wall-clock. A distinct end_reason so a timeout stays
++                # distinguishable from a genuine abstention when triaging.
++                return RLMResult(None, step, False, transcript, "run_timeout", metrics)
+             metrics["steps"] = step
+             sent, _ = build_sent()
+             ctx_tokens = self.tok.count_messages(sent)
+@@ -552,11 +741,86 @@ class RLM:
+         return RLMResult(None, self.max_steps, False, transcript, "max_steps", metrics)
+ 
+ 
++def _is_context_overflow(exc: Exception) -> bool:
++    """True for a 400 that means 'prompt too long', not some other bad request.
++
++    Matched on message text because the OpenAI client surfaces vLLM's error as a
++    generic BadRequestError; vLLM's wording is
++    "This model's maximum context length is 40960 tokens...".
++    """
++    if getattr(exc, "status_code", None) != 400:
++        return False
++    msg = str(exc).lower()
++    return "context length" in msg or "context_length" in msg or "too long" in msg
++
++
+ def vanilla_answer(
+-    client: NIMClient, context: str, task: str, char_limit: int = 400_000
++    client: NIMClient,
++    context: str,
++    task: str,
++    char_limit: int = 400_000,
++    max_prompt_tokens: Optional[int] = None,
++    token_counter: Optional[Callable[[str], int]] = None,
++    stats: Optional[dict] = None,
+ ) -> str:
+-    """Baseline: stuff (possibly truncated) context directly into the prompt."""
++    """Baseline: stuff (possibly truncated) context directly into the prompt.
++
++    `stats`, if given, is filled with how much context actually survived
++    truncation. The caller needs this to separate "the model got it wrong" from
++    "the answer was never in the prompt". Without it the vanilla arm's score is
++    not comparable to a KVPress run, which always sees the full context: on a
++    200k-char synthetic with a 100k limit vanilla is structurally capped, and a
++    bare score column reads that cap as model accuracy.
++    """
+     truncated = context[:char_limit]
+-    note = "" if len(context) <= char_limit else "\n[NOTE: document truncated]"
+-    prompt = f"Document:\n{truncated}{note}\n\nTask: {task}\nAnswer concisely."
++
++    def build(body: str) -> str:
++        note = "" if len(context) <= len(body) else "\n[NOTE: document truncated]"
++        return f"Document:\n{body}{note}\n\nTask: {task}\nAnswer concisely."
++
++    prompt = build(truncated)
++
++    # A CHARACTER limit is not a token limit. `--vanilla-char-limit 100000` assumes
++    # ~4 chars/token, but dense subsets tokenize far tighter -- RULER's `cwe`
++    # (repeated word lists) and `niah_multikey_3` (UUID-like keys) run ~2.5, so 100k
++    # chars is ~40k tokens and the server rejected EVERY request with a 400
++    # "maximum context length is 40960 tokens". Those cells scored 0.0 for vanilla
++    # from a harness error rather than from the model. Shrink until it really fits.
++    if max_prompt_tokens:
++        tok = TokenCounter(token_counter)
++        while tok.count(prompt) > max_prompt_tokens and len(truncated) > 2000:
++            truncated = truncated[: int(len(truncated) * 0.8)]
++            prompt = build(truncated)
++
++    # ...but the PREDICTIVE shrink above cannot be trusted on its own, because the
++    # counter is not the server's tokenizer. TokenCounter uses tiktoken cl100k_base
++    # when installed and `len // 4` when not -- and `len // 4` is exactly the 4
++    # chars/token assumption this whole block exists to escape, so on a box without
++    # tiktoken the loop is a silent no-op. Even with tiktoken, cl100k and Qwen3's
++    # BPE disagree by well over the available headroom on the dense subsets.
++    #
++    # So treat the estimate as a first guess and let the SERVER be the authority:
++    # shrink and retry whenever it rejects the prompt for length. This is tokenizer-
++    # independent and cannot silently no-op.
++    def record(retries: int) -> None:
++        if stats is not None:
++            stats.update(
++                context_chars=len(context),
++                context_chars_used=len(truncated),
++                truncated=len(truncated) < len(context),
++                shrink_retries=retries,
++            )
++
++    for attempt in range(12):
++        try:
++            out = client.chat([{"role": "user", "content": prompt}])
++            record(attempt)
++            return out
++        except Exception as e:  # noqa: BLE001 - narrowed by the guard below
++            if not _is_context_overflow(e) or len(truncated) <= 2000:
++                record(attempt)
++                raise
++            truncated = truncated[: int(len(truncated) * 0.8)]
++            prompt = build(truncated)
++    record(12)
+     return client.chat([{"role": "user", "content": prompt}])
+diff --git a/evaluation/rlm/run_benchmark.py b/evaluation/rlm/run_benchmark.py
+index 3bf4e61..fa4829d 100644
+--- a/evaluation/rlm/run_benchmark.py
++++ b/evaluation/rlm/run_benchmark.py
+@@ -20,9 +20,9 @@ import yaml
+ from evaluation.benchmarks.registry import RULER_32K_TASKS, SCORER_REGISTRY
+ from evaluation.benchmarks.results import score_prediction_frame
+ 
+-from .client import NIMClient
++from .client import NIMClient, RateLimiter
+ from .datasets import available_datasets, canonical_dataset_name, load_examples
+-from .rlm import RLM, MemoryBudget, vanilla_answer
++from .rlm import RLM, MemoryBudget, Scratchpad, vanilla_answer
+ 
+ 
+ def normalize(s: str) -> str:
+@@ -37,9 +37,18 @@ def is_correct(pred: str | None, answers: list[str]) -> bool:
+ 
+ 
+ def load_done(path: Path) -> set:
++    """IDs already completed. Records that died with a harness/API exception
++    (e.g. a transient NIM outage) don't count -- re-running retries them."""
+     if not path.exists():
+         return set()
+-    return {json.loads(line)["id"] for line in open(path) if line.strip()}
++    done = set()
++    for line in open(path):
++        if not line.strip():
++            continue
++        record = json.loads(line)
++        if not record.get("error"):
++            done.add(record["id"])
++    return done
+ 
+ 
+ def write_run_artifacts(
+@@ -48,25 +57,66 @@ def write_run_artifacts(
+     dataset_name: str,
+     config: dict,
+ ) -> dict:
+-    """Materialize the common predictions/config/metrics result contract."""
++    """Materialize the common predictions/config/metrics result contract.
++
++    The headline score comes from the shared canonical scorer, so it is the same
++    number a KVPress run of this dataset reports and the two are directly
++    comparable. Everything RLM-specific lands under ``runtime``.
++    """
+     records = [json.loads(line) for line in checkpoint_path.read_text().splitlines() if line.strip()]
+     frame = pd.DataFrame(records).rename(columns={"pred": "predicted_answer"})
+     frame.to_csv(run_dir / "predictions.csv", index=False)
+ 
++    # An example that died with an API/harness exception is a MISSING measurement,
++    # not a wrong answer. score_prediction_frame fills a null prediction with "",
++    # which every scorer then marks 0 -- so a NIM outage would show up as the RLM
++    # arm being less accurate than KVPress, which never makes network calls and so
++    # can never take this hit. Score only the examples that actually produced an
++    # answer, and report the shortfall separately.
++    errored = frame["error"].notna() if "error" in frame else pd.Series(False, index=frame.index)
++    scored_frame = frame[~errored]
++
+     if dataset_name in SCORER_REGISTRY:
+-        metrics = score_prediction_frame(dataset_name, frame)
++        metrics = score_prediction_frame(dataset_name, scored_frame) if len(scored_frame) else {}
+     else:
+-        count = len(frame)
+-        metrics = {"accuracy": float(frame["correct"].sum() / count) if count else 0.0}
++        count = len(scored_frame)
++        metrics = {"accuracy": float(scored_frame["correct"].sum() / count) if count else 0.0}
++
+     count = len(frame)
+-    metrics["runtime"] = {
++    scored = len(scored_frame)
++    runtime = {
+         "examples": count,
+-        "progress_match": float(frame["correct"].sum() / count) if count else 0.0,
+-        "average_tokens": float(frame["tokens"].mean()) if count else 0.0,
+-        "average_latency_s": float(frame["latency_s"].mean()) if count else 0.0,
+-        "unfinished": int((~frame["finished"].astype(bool)).sum()) if count else 0,
+-        "errors": int(frame["error"].notna().sum()) if count and "error" in frame else 0,
++        "scored": scored,
++        "errors": int(errored.sum()),
++        "progress_match": float(scored_frame["correct"].sum() / scored) if scored else 0.0,
++        "average_tokens": float(scored_frame["tokens"].mean()) if scored else 0.0,
++        "average_latency_s": float(scored_frame["latency_s"].mean()) if scored else 0.0,
++        "unfinished": int((~scored_frame["finished"].astype(bool)).sum()) if scored else 0,
+     }
++
++    # Peak simultaneous root context is RLM's analogue of KVPress's
++    # `average_retained_context_tokens` -- both say "how much context did the model
++    # hold at once", which is the axis a memory sweep varies.
++    if scored and "metrics" in scored_frame:
++        peaks = [
++            m.get("peak_context_tokens")
++            for m in scored_frame["metrics"]
++            if isinstance(m, dict) and m.get("peak_context_tokens")
++        ]
++        if peaks:
++            runtime["average_peak_context_tokens"] = float(sum(peaks) / len(peaks))
++
++    # The vanilla arm's ceiling: if the gold never survived truncation, its score is
++    # a property of the char/token limit, not of the model. KVPress compresses
++    # rather than truncates, so this column is what makes the gap interpretable.
++    if scored and "truncated" in scored_frame:
++        truncated = scored_frame["truncated"].fillna(False).astype(bool)
++        runtime["truncated_fraction"] = float(truncated.sum() / scored)
++        if "context_chars_used" in scored_frame and "context_chars" in scored_frame:
++            retained = scored_frame["context_chars_used"] / scored_frame["context_chars"]
++            runtime["average_context_chars_retained"] = float(retained.mean())
++
++    metrics["runtime"] = runtime
+     (run_dir / "metrics.json").write_text(json.dumps(metrics, indent=2) + "\n")
+     (run_dir / "config.yaml").write_text(yaml.safe_dump(config, sort_keys=False))
+     return metrics
+@@ -99,6 +149,16 @@ def main() -> None:
+     ap.add_argument("--rpm", type=int, default=35)
+     ap.add_argument("--max-steps", type=int, default=12)
+     ap.add_argument("--vanilla-char-limit", type=int, default=400_000)
++    ap.add_argument(
++        "--vanilla-max-prompt-tokens",
++        type=int,
++        default=None,
++        help="hard TOKEN ceiling for the vanilla prompt; the char limit alone "
++        "overflows the served window on densely-tokenising subsets (RULER cwe / "
++        "niah_multikey_3), which the server rejects with a 400 and which then "
++        "scores 0.0 from a harness error rather than from the model. Set to "
++        "(max-model-len - max-tokens - margin), e.g. 34000 for a 40960 window",
++    )
+     # --- RLM memory-budget knobs (no budget unless --max-context-tokens is set) ---
+     # Eviction-only: out-of-budget turns are simply dropped (no notes/summarization).
+     ap.add_argument(
+@@ -113,6 +173,42 @@ def main() -> None:
+         default=3,
+         help="recent (assistant,observation) pairs to keep verbatim under budget",
+     )
++    # --- RLM scratchpad knobs (off unless --scratchpad; orthogonal to the budget) ---
++    ap.add_argument(
++        "--scratchpad",
++        action="store_true",
++        help="give the RLM root a note() tool; notes are re-shown every turn and survive budget eviction",
++    )
++    ap.add_argument(
++        "--max-notes-tokens",
++        type=int,
++        default=1024,
++        help="cap on the scratchpad block injected into context",
++    )
++    # --- Runaway guards. Each is independent; pass 0 to disable just that one. ---
++    ap.add_argument(
++        "--exec-timeout",
++        type=float,
++        default=60.0,
++        help="wall-clock seconds of PURE-PYTHON execution a single RLM code block may run before "
++        "being aborted (guards against model-generated infinite loops); time spent inside "
++        "llm_query sub-calls is excluded. 0 disables",
++    )
++    ap.add_argument(
++        "--run-timeout",
++        type=float,
++        default=900.0,
++        help="wall-clock seconds for ONE example before the RLM gives up (end_reason=run_timeout). "
++        "exec-timeout does not bound llm_query time, so without this a single pathological "
++        "example can stall a job for hours. 0 disables",
++    )
++    ap.add_argument(
++        "--max-sub-calls",
++        type=int,
++        default=40,
++        help="cap on llm_query calls per example; further calls return a notice instead of "
++        "hitting the API. 0 disables",
++    )
+     ap.add_argument("--out", default="evaluation/results/rlm")
+     ap.add_argument("--debug", action="store_true", help="print every RLM step (model reply, code, REPL output) live")
+     ap.add_argument(
+@@ -133,8 +229,12 @@ def main() -> None:
+     out_dir.mkdir(parents=True, exist_ok=True)
+     modes = ["vanilla", "rlm"] if args.mode == "both" else [args.mode]
+ 
+-    root = NIMClient(model=args.root_model, base_url=args.base_url, rpm=args.rpm)
+-    sub = NIMClient(model=args.sub_model, base_url=args.base_url, rpm=args.rpm)
++    # One limiter shared by root + sub so the rpm cap is per-account (two separate
++    # limiters would let the process issue up to ~2x rpm and trip 429s).
++    limiter = RateLimiter(args.rpm)
++    client_kw = dict(base_url=args.base_url, rpm=args.rpm, limiter=limiter)
++    root = NIMClient(model=args.root_model, **client_kw)
++    sub = NIMClient(model=args.sub_model, **client_kw)
+     if args.no_think:
+         eb = {"chat_template_kwargs": {"enable_thinking": False}}
+         root.extra_body = sub.extra_body = eb
+@@ -144,12 +244,33 @@ def main() -> None:
+             max_context_tokens=args.max_context_tokens,
+             keep_recent_turns=args.keep_recent_turns,
+         )
+-    rlm = RLM(root_client=root, sub_client=sub, max_steps=args.max_steps, budget=budget)
++    scratchpad = Scratchpad(max_notes_tokens=args.max_notes_tokens) if args.scratchpad else None
++    rlm = RLM(
++        root_client=root,
++        sub_client=sub,
++        max_steps=args.max_steps,
++        budget=budget,
++        scratchpad=scratchpad,
++        # `or None` is what makes each guard independently switchable off from the
++        # CLI: argparse cannot pass None for a float/int flag, so 0 is the off
++        # switch and is translated here.
++        exec_timeout=args.exec_timeout or None,
++        run_timeout=args.run_timeout or None,
++        max_sub_calls=args.max_sub_calls or None,
++    )
+ 
+     for mode in modes:
+         slug = args.root_model.replace("/", "_")
+         task_slug = (args.data_dir or "default").replace("/", "_")
+-        run_dir = out_dir / f"{dataset_name}__{task_slug}__{slug}__{mode}"
++        # Anything that changes results must be in the directory name, or two
++        # configurations share a checkpoint.jsonl and silently merge. (compare.py
++        # reads config.yaml, not this name, so nothing else depends on the format.)
++        components = [dataset_name, task_slug, slug, mode]
++        if mode == "rlm" and args.max_context_tokens is not None:
++            components.append(f"ctx{args.max_context_tokens}")
++        if mode == "rlm" and scratchpad is not None:
++            components.append("scratchpad")
++        run_dir = out_dir / "__".join(components)
+         run_dir.mkdir(parents=True, exist_ok=True)
+         res_path = run_dir / "checkpoint.jsonl"
+         tdir = run_dir / "transcripts"
+@@ -179,8 +300,21 @@ def main() -> None:
+                     question = f"{question}\n{ex['answer_prefix']}"
+                 try:
+                     if mode == "vanilla":
+-                        pred = vanilla_answer(root, ex["context"], question, char_limit=args.vanilla_char_limit)
++                        vstats: dict = {}
++                        pred = vanilla_answer(
++                            root,
++                            ex["context"],
++                            question,
++                            char_limit=args.vanilla_char_limit,
++                            max_prompt_tokens=args.vanilla_max_prompt_tokens,
++                            stats=vstats,
++                        )
+                         record.update(pred=pred, steps=1, finished=True, end_reason="")
++                        # Was the gold even inside the prompt we sent? Without this a
++                        # truncated vanilla arm's score is indistinguishable from a
++                        # model failure -- and unlike KVPress, which compresses the
++                        # full context, this arm can simply not have seen the answer.
++                        record.update(vstats)
+                     else:
+                         r = rlm.run(ex["context"], question)
+                         record.update(
+@@ -236,6 +370,10 @@ def main() -> None:
+             "backend": "rlm",
+             "dataset": dataset_name,
+             "data_dir": args.data_dir,
++            # `model` duplicates root_model under the key KVPress's config.yaml
++            # uses, so a comparison joins the two backends on (dataset, data_dir,
++            # model) without special-casing either one.
++            "model": args.root_model,
+             "mode": mode,
+             "root_model": args.root_model,
+             "sub_model": args.sub_model,
+@@ -243,7 +381,12 @@ def main() -> None:
+             "limit": args.limit,
+             "max_steps": args.max_steps,
+             "vanilla_char_limit": args.vanilla_char_limit,
++            "vanilla_max_prompt_tokens": args.vanilla_max_prompt_tokens,
+             "memory_budget": asdict(budget) if budget else None,
++            "scratchpad": asdict(scratchpad) if scratchpad else None,
++            "exec_timeout": args.exec_timeout or None,
++            "run_timeout": args.run_timeout or None,
++            "max_sub_calls": args.max_sub_calls or None,
+         }
+         metrics = write_run_artifacts(
+             res_path,
+diff --git a/evaluation/rlm/test_guards.py b/evaluation/rlm/test_guards.py
+new file mode 100644
+index 0000000..21ee783
+--- /dev/null
++++ b/evaluation/rlm/test_guards.py
+@@ -0,0 +1,215 @@
++# SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-License-Identifier: Apache-2.0
++"""Tests for the runaway guards and the scratchpad -- each on AND off.
++
++Run from the repository root (the module uses absolute `evaluation.*` imports):
++    python -m pytest evaluation/rlm/test_guards.py
++"""
++
++import time
++import unittest
++
++from evaluation.rlm.rlm import RLM, MemoryBudget, Scratchpad
++
++
++class _ScriptedClient:
++    """Returns canned replies in order, then loops on the last one."""
++
++    def __init__(self, replies):
++        self.replies = list(replies)
++        self.seen: list = []
++        self.calls = 0
++
++    def chat(self, messages, **kw):
++        self.seen.append(messages)
++        reply = self.replies[min(self.calls, len(self.replies) - 1)]
++        self.calls += 1
++        return reply
++
++
++def _code(body: str) -> str:
++    return f"```python\n{body}\n```"
++
++
++# The harness refuses FINAL() on a literal the model never saw in real REPL output
++# (its anti-guessing check), so a fixture that wants to finish must compute and
++# print the answer first, then FINAL the variable holding it.
++def _finish(value: str) -> list[str]:
++    return [_code(f"ans = {value!r}\nprint(ans)"), _code("FINAL(ans)")]
++
++
++class ExecTimeoutTest(unittest.TestCase):
++    def test_a_runaway_loop_is_aborted_and_reported_to_the_model(self):
++        root = _ScriptedClient([_code("while True:\n    pass")] + _finish("done"))
++        rlm = RLM(root_client=root, max_steps=4, exec_timeout=1.0)
++
++        started = time.monotonic()
++        result = rlm.run("some context", "do the thing")
++        elapsed = time.monotonic() - started
++
++        self.assertLess(elapsed, 20, "the infinite loop should have been cut short")
++        self.assertIn("[TIMEOUT]", result.transcript[0]["observation"])
++        # The model gets to see the timeout and recover, rather than the run dying.
++        self.assertEqual(result.answer, "done")
++
++    def test_exec_timeout_none_disables_the_watchdog(self):
++        root = _ScriptedClient(_finish("ok"))
++        rlm = RLM(root_client=root, max_steps=3, exec_timeout=None)
++
++        result = rlm.run("ctx", "task")
++
++        self.assertNotIn("[TIMEOUT]", result.transcript[0]["observation"])
++        self.assertEqual(result.answer, "ok")
++
++    def test_model_code_calling_exit_does_not_kill_the_sweep(self):
++        root = _ScriptedClient([_code("import sys\nsys.exit(1)")] + _finish("survived"))
++        rlm = RLM(root_client=root, max_steps=4)
++
++        result = rlm.run("ctx", "task")
++
++        self.assertIn("[EXCEPTION]", result.transcript[0]["observation"])
++        self.assertEqual(result.answer, "survived")
++
++
++class RunTimeoutTest(unittest.TestCase):
++    def test_deadline_ends_the_example_with_its_own_end_reason(self):
++        class _SlowClient(_ScriptedClient):
++            def chat(self, messages, **kw):
++                time.sleep(0.25)
++                return super().chat(messages, **kw)
++
++        root = _SlowClient([_code("print('still going')")])
++        rlm = RLM(root_client=root, max_steps=50, run_timeout=0.5)
++
++        result = rlm.run("ctx", "task")
++
++        self.assertEqual(result.end_reason, "run_timeout")
++        self.assertFalse(result.finished)
++        self.assertIsNone(result.answer)
++        self.assertLess(root.calls, 50, "should have stopped well before max_steps")
++
++    def test_run_timeout_none_disables_the_deadline(self):
++        root = _ScriptedClient(_finish("quick"))
++        rlm = RLM(root_client=root, max_steps=3, run_timeout=None)
++
++        result = rlm.run("ctx", "task")
++
++        self.assertEqual(result.end_reason, "final_called")
++        self.assertEqual(result.answer, "quick")
++
++
++class SubCallCapTest(unittest.TestCase):
++    def test_cap_returns_a_notice_instead_of_hitting_the_api(self):
++        root = _ScriptedClient(
++            [
++                _code("for i in range(5):\n    print(llm_query('q%d' % i))"),
++                _code("FINAL('end')"),
++            ]
++        )
++        sub = _ScriptedClient(["sub answer"])
++        rlm = RLM(root_client=root, sub_client=sub, max_steps=3, max_sub_calls=2, cache_subcalls=False)
++
++        result = rlm.run("ctx", "task")
++
++        self.assertEqual(sub.calls, 2, "must stop calling the API at the cap")
++        self.assertIn("[SUB-CALL LIMIT REACHED]", result.transcript[0]["observation"])
++
++    def test_max_sub_calls_none_disables_the_cap(self):
++        root = _ScriptedClient(
++            [
++                _code("for i in range(5):\n    print(llm_query('q%d' % i))"),
++                _code("FINAL('end')"),
++            ]
++        )
++        sub = _ScriptedClient(["sub answer"])
++        rlm = RLM(root_client=root, sub_client=sub, max_steps=3, max_sub_calls=None, cache_subcalls=False)
++
++        rlm.run("ctx", "task")
++
++        self.assertEqual(sub.calls, 5)
++
++
++class SubCallCacheKeyTest(unittest.TestCase):
++    def test_prompts_sharing_a_truncated_prefix_do_not_collide(self):
++        """Keying the cache on the TRUNCATED prompt returns one slice's answer for another."""
++        long_a = "A" * 100 + "first tail"
++        long_b = "A" * 100 + "second tail"
++        root = _ScriptedClient(
++            [
++                _code(f"print(llm_query({long_a!r}))\nprint(llm_query({long_b!r}))"),
++                _code("FINAL('end')"),
++            ]
++        )
++        sub = _ScriptedClient(["answer one", "answer two"])
++        # Truncation point falls inside the shared prefix, so both prompts are sent
++        # to the sub-model as the identical string.
++        rlm = RLM(root_client=root, sub_client=sub, max_steps=3, max_subcall_chars=50)
++
++        result = rlm.run("ctx", "task")
++
++        self.assertEqual(sub.calls, 2, "distinct prompts must not share a cache entry")
++        observation = result.transcript[0]["observation"]
++        self.assertIn("answer one", observation)
++        self.assertIn("answer two", observation)
++
++
++class ScratchpadTest(unittest.TestCase):
++    def test_note_tool_absent_unless_enabled(self):
++        root = _ScriptedClient([_code("note('x')"), _code("FINAL('end')")])
++        rlm = RLM(root_client=root, max_steps=3)
++
++        result = rlm.run("ctx", "task")
++
++        self.assertIn("NameError", result.transcript[0]["observation"])
++        self.assertNotIn("note(text", root.seen[0][0]["content"])
++
++    def test_notes_persist_and_are_reinjected_every_turn(self):
++        root = _ScriptedClient(
++            [
++                _code("note('the passkey is 8391')"),
++                _code("print('thinking')"),
++                _code("FINAL('8391')"),
++            ]
++        )
++        rlm = RLM(root_client=root, max_steps=4, scratchpad=Scratchpad())
++
++        result = rlm.run("ctx", "task")
++
++        self.assertIn("note(text", root.seen[0][0]["content"], "the tool must be documented in the prompt")
++        # By the third turn the note is still in the sent messages.
++        third_turn = "".join(m["content"] for m in root.seen[2])
++        self.assertIn("the passkey is 8391", third_turn)
++        self.assertEqual(result.metrics["notes_saved"], 1)
++        self.assertTrue(result.metrics["scratchpad"])
++
++    def test_notes_survive_budget_eviction(self):
++        root = _ScriptedClient(
++            [
++                _code("note('keep me')"),
++                _code("print('x' * 4000)"),
++                _code("print('y' * 4000)"),
++                _code("FINAL('done')"),
++            ]
++        )
++        rlm = RLM(
++            root_client=root,
++            max_steps=5,
++            budget=MemoryBudget(max_context_tokens=1200, keep_recent_turns=1),
++            scratchpad=Scratchpad(),
++        )
++
++        result = rlm.run("ctx", "task")
++
++        self.assertGreater(result.metrics["evictions"], 0, "the budget should have evicted turns")
++        last_turn = "".join(m["content"] for m in root.seen[-1])
++        self.assertIn("keep me", last_turn, "the note must outlive the evicted turn that created it")
++
++    def test_notes_block_is_capped(self):
++        rlm = RLM(root_client=_ScriptedClient([""]), scratchpad=Scratchpad(max_notes_tokens=20))
++        block = rlm._notes_block(["padding " * 200])
++        self.assertIn("oldest notes truncated", block)
++        self.assertLess(rlm.tok.count(block), 200)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/evaluation/rlm/test_run_benchmark.py b/evaluation/rlm/test_run_benchmark.py
+new file mode 100644
+index 0000000..512dbf7
+--- /dev/null
++++ b/evaluation/rlm/test_run_benchmark.py
+@@ -0,0 +1,153 @@
++# SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-License-Identifier: Apache-2.0
++"""Tests for the properties that make an RLM run comparable to a KVPress run.
++
++Run from the repository root (the module uses absolute `evaluation.*` imports):
++    python -m pytest evaluation/rlm/test_run_benchmark.py
++"""
++
++import json
++import tempfile
++import unittest
++from pathlib import Path
++
++from evaluation.rlm.rlm import vanilla_answer
++from evaluation.rlm.run_benchmark import load_done, write_run_artifacts
++
++
++def _checkpoint(records: list[dict]) -> tuple[Path, Path]:
++    run_dir = Path(tempfile.mkdtemp())
++    path = run_dir / "checkpoint.jsonl"
++    path.write_text("".join(json.dumps(r) + "\n" for r in records))
++    return path, run_dir
++
++
++def _answered(example_id: str, answer: str, pred: str, peak: int = 4096) -> dict:
++    return dict(
++        id=example_id,
++        task="32k",
++        answer=answer,
++        pred=pred,
++        correct=answer == pred,
++        tokens=10,
++        latency_s=1.0,
++        finished=True,
++        metrics={"peak_context_tokens": peak},
++    )
++
++
++class ErroredRecordTest(unittest.TestCase):
++    """An API failure is a missing measurement, not a wrong answer.
++
++    KVPress runs locally and never makes network calls, so it cannot take this
++    hit. Counting a NIM outage as a zero would show up as the RLM arm being less
++    accurate, which is the one thing this comparison must not get wrong.
++    """
++
++    records = [
++        _answered("a", "alpha", "alpha"),
++        _answered("b", "beta", "beta"),
++        _answered("c", "gamma", "wrong"),
++        dict(
++            id="d",
++            task="32k",
++            answer="delta",
++            pred=None,
++            correct=False,
++            tokens=0,
++            latency_s=0.5,
++            finished=False,
++            error="APIError: 503 Service Unavailable",
++        ),
++    ]
++
++    def test_error_is_excluded_from_the_score_but_still_reported(self):
++        path, run_dir = _checkpoint(self.records)
++        metrics = write_run_artifacts(path, run_dir, "synthetic_kv_32k", {"backend": "rlm"})
++
++        # 2 of the 3 ANSWERED examples are right. Scoring the error as "" would
++        # give 50.0 and understate the arm by 16.7 points.
++        self.assertAlmostEqual(metrics["32k"]["string_match"], 200 / 3, places=1)
++        self.assertEqual(metrics["32k"]["num_samples"], 3)
++        self.assertEqual(metrics["runtime"]["scored"], 3)
++        self.assertEqual(metrics["runtime"]["errors"], 1)
++        self.assertEqual(metrics["runtime"]["examples"], 4)
++
++    def test_errored_example_is_retried_on_resume(self):
++        path, _ = _checkpoint(self.records)
++        self.assertEqual(load_done(path), {"a", "b", "c"})
++
++    def test_peak_context_tokens_is_reported_for_the_cost_axis(self):
++        path, run_dir = _checkpoint([_answered("a", "x", "x", peak=4000), _answered("b", "y", "y", peak=4200)])
++        metrics = write_run_artifacts(path, run_dir, "synthetic_kv_32k", {"backend": "rlm"})
++        self.assertAlmostEqual(metrics["runtime"]["average_peak_context_tokens"], 4100.0)
++
++
++class _ContextOverflow(Exception):
++    status_code = 400
++
++    def __str__(self):
++        return "This model's maximum context length is 40960 tokens"
++
++
++class _BadRequest(Exception):
++    status_code = 400
++
++    def __str__(self):
++        return "invalid model id"
++
++
++class _FakeClient:
++    """Rejects prompts over `limit` characters, as vLLM rejects them over tokens."""
++
++    def __init__(self, limit: int, error=_ContextOverflow):
++        self.limit = limit
++        self.error = error
++        self.calls = 0
++
++    def chat(self, messages):
++        self.calls += 1
++        if len(messages[0]["content"]) > self.limit:
++            raise self.error()
++        return "the answer"
++
++
++class VanillaTruncationTest(unittest.TestCase):
++    """The vanilla arm's ceiling has to be visible, and self-inflicted.
++
++    A character limit is not a token limit, so on densely-tokenising subsets the
++    server used to reject every request; those cells then scored 0.0 from a
++    harness error rather than from the model.
++    """
++
++    context = "x" * 200_000
++
++    def test_shrinks_and_retries_until_the_server_accepts_the_prompt(self):
++        client = _FakeClient(limit=50_000)
++        stats: dict = {}
++        answer = vanilla_answer(client, self.context, "find it", char_limit=400_000, stats=stats)
++
++        self.assertEqual(answer, "the answer")
++        self.assertGreater(client.calls, 1)
++        self.assertTrue(stats["truncated"])
++        self.assertLessEqual(stats["context_chars_used"], 50_000)
++
++    def test_records_truncation_even_when_the_first_call_succeeds(self):
++        client = _FakeClient(limit=10**9)
++        stats: dict = {}
++        vanilla_answer(client, self.context, "find it", char_limit=100_000, stats=stats)
++
++        self.assertEqual(client.calls, 1)
++        self.assertEqual(stats["context_chars"], 200_000)
++        self.assertEqual(stats["context_chars_used"], 100_000)
++        self.assertTrue(stats["truncated"])
++
++    def test_a_non_length_400_is_not_swallowed_by_the_retry_loop(self):
++        client = _FakeClient(limit=0, error=_BadRequest)
++        with self.assertRaises(_BadRequest):
++            vanilla_answer(client, self.context, "find it", stats={})
++        self.assertEqual(client.calls, 1)
++
++
++if __name__ == "__main__":
++    unittest.main()
+-- 
+2.51.0
+

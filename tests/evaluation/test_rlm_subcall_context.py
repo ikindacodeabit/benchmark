@@ -5,9 +5,9 @@ sub-backend.
 
 A split-capable sub client receives the context slice as a separate argument so
 the press can compress it apart from the question. These tests pin three things:
-the dispatch contract, the fallback behavior on plain clients, and — most
-importantly — that the DENSE prompt rendering used by the in-flight NIM/vLLM
-arms did not change (a wording change mid-campaign would confound them).
+the dispatch contract, the fallback behavior on plain clients, and the DENSE
+prompt rendering — which is pinned so that a wording change is always a
+deliberate act, since it re-baselines every arm that reads it.
 """
 
 import time
@@ -98,9 +98,27 @@ def test_context_is_truncated_and_the_notice_rides_the_question_side():
 
     llm_query("Q", "x" * 500)
     (call,) = sub.split_calls
-    assert len(call["context"]) == 100
+    # The slice gets whatever the question leaves of the ONE budget: 100 - len("Q").
+    assert len(call["context"]) == 99
     assert "[NOTE: your prompt was truncated at 100 chars" in call["question"]
     assert "[NOTE:" not in call["context"]
+
+
+def test_the_two_sides_share_one_budget_rather_than_getting_one_each():
+    """Capping each side at max_subcall_chars let a split call carry ~2x the size
+    the prompt advertises -- which is what the sub model's KV fit check then
+    rejects, with a string the root is free to ignore."""
+    sub = FakeSplitClient()
+    llm_query, _, _ = _llm_query(_rlm(sub, max_subcall_chars=1000))
+
+    llm_query("q" * 5000, "x" * 5000)
+    (call,) = sub.split_calls
+    question_without_notice = call["question"].split("\n[NOTE:")[0]
+    assert len(question_without_notice) + len(call["context"]) <= 1000
+    # The question is an instruction, not the payload: it gets a quarter, the
+    # slice takes the rest, so a long question cannot squeeze the slice to nothing.
+    assert len(question_without_notice) == 250
+    assert len(call["context"]) == 750
 
 
 def test_cache_distinguishes_the_same_question_over_different_slices():
@@ -166,15 +184,19 @@ def test_repetition_breaker_routes_through_chat_split():
 
 FINISH_CODE = "```python\nFINAL(context[:5])\n```"
 
-# The exact llm_query bullet the NIM/vLLM arms have been running with. If this
-# assertion fails, the change would put arms 2/3 mid-campaign on a different
-# prompt than their existing checkpoints — bump this pin only on purpose.
+# The exact llm_query bullet the dense (NIM/vLLM) arms run with. Changing it
+# re-baselines every arm that reads it, so bump this pin only on purpose.
+#
+# Generation 2: the cap is rendered from max_subcall_chars instead of the fixed
+# "~8000 characters" the text used to claim while enforcement was at 32000 --
+# the root was being told to send a quarter of what it was allowed to.
 PINNED_DENSE_HELP = """\
     * `llm_query(prompt: str) -> str`: ask a sub-LLM about text. IMPORTANT: the
       sub-LLM CANNOT see `context` or any of your variables — it sees ONLY the
       prompt string you pass. You MUST embed the actual text snippet inside the
       prompt, e.g. llm_query("Answer X based on this text:\\n" + context[i:j])
-      (keep each call under ~8000 characters). Capture the result:
+      (each call is truncated at 32000 characters, so pass a focused
+      snippet, not the whole document). Capture the result:
       ans = llm_query(...) then print(ans)."""
 
 
@@ -187,7 +209,7 @@ def _system_prompt(sub):
 
 
 def test_dense_prompt_rendering_is_pinned():
-    assert LLM_QUERY_HELP_DENSE == PINNED_DENSE_HELP
+    assert LLM_QUERY_HELP_DENSE.format(max_chars=32000) == PINNED_DENSE_HELP
     prompt = _system_prompt(FakeClient())
     assert PINNED_DENSE_HELP in prompt
     assert EXAMPLE_LLM_QUERY_DENSE in prompt

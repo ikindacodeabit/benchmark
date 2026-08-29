@@ -293,40 +293,28 @@ calls and measured nothing. `average_sub_compression_ratio` well below
 
 ## 7. Known issues
 
-Recorded so they are not rediscovered as bugs.
+Recorded so they are not rediscovered as bugs. The list was longer; see
+[`fix_rlm.md`](fix_rlm.md) for what was fixed and why.
 
 1. **`KVzipPress` masks rather than frees.** A bigger chunk costs full GPU memory. Sizing
-   from the budget buys comparability, not headroom.
+   from the budget buys comparability, not headroom. This is why the reported cost axis is
+   `max(root_peak, sub_peak)` — the sub model's KV is resident whatever the budget says.
 2. **The advertised cap is a suggestion.** `rlm.py` truncates slices on the way up but never
    pads them, and the press derives its ratio from what actually arrived. A root that sends
    small slices produces a realized ratio near 0 no matter what was advertised.
-3. **Question and context are capped independently** (`rlm.py:328-341`), so one split call
-   can carry up to 2× the advertised cap. `reserve_tokens` absorbs the common case; a very
-   large derived chunk plus a very large question can still exceed the fit check and come
-   back as a retry notice.
-4. **Decimal GB vs binary GiB coexist on purpose.** Budgets are decimal (they must match the
+3. **Decimal GB vs binary GiB coexist on purpose.** Budgets are decimal (they must match the
    published matrix numbers); the GPU fit headroom is binary (it measures device memory).
-5. **Auto sizing is not bit-reproducible across machines.** `mem_get_info` is a device-global
+4. **Auto sizing is not bit-reproducible across machines.** `mem_get_info` is a device-global
    reading that a co-tenant process changes — hence the recorded resolved value and the
    resume check.
-6. **`make test` does not cover `evaluation/rlm/`.** The target collects `tests/` only, which
-   is why the sizing tests live in `tests/evaluation/test_rlm_sizing.py`.
-7. **`run_infolab.sh setup` still clones `snu-mllab/KVzip`**, installs flash-attn and builds
-   `tiny_api_cuda` (lines 163–181). The current backend uses kvpress's own press and needs
-   none of it.
-8. **Venv conflict.** The backend imports `kvpress`, which wants `transformers>=4.56`, but the
+5. **Venv conflict.** The backend imports `kvpress`, which wants `transformers>=4.56`, but the
    main `.venv` is pinned to `4.51.3` because vLLM 0.8.5 calls `all_special_tokens_extended`,
-   removed in 5.x.
-9. **`evaluation/rlm/loft128k/README.md` is stale** — it still documents physical eviction,
-   `KVZIP_DIR`, `--compression-ratio` and `.venv-kvpress`, all from the standalone-KVzip
-   backend that was replaced.
-10. **`evaluation/rlm/test_kvzip_direct_smoke.py` hardcodes a model path**
-    (`/home/rethinkingai-self/...`) and is a `__main__` script, not a pytest test.
-11. **The dense help text advertises "~8000 characters" while enforcement is at 32,000**
-    (`rlm.py:102` vs `rlm.py:331`). Pinned deliberately; not a bug to fix mid-campaign.
-12. **Two different chars-per-token assumptions remain elsewhere:** `TokenCounter` uses 4
-    (`rlm.py:189`), the adaptive observation limit uses 3 (`rlm.py:667`). Neither is
-    calibrated; only the sub-call chunk path is.
+   removed in 5.x. Two venvs remain the answer until the vLLM pin can move.
+6. **The root's context estimate is not the server's.** `TokenCounter` is tiktoken or
+   `len // CHARS_PER_TOKEN_ESTIMATE`, and `count_messages` approximates chat overhead at
+   4 tokens per message. `peak_context_tokens` prefers the server's own count when the
+   client reports one, but the eviction decisions that *precede* a call are still made on
+   the estimate — which is why the server gets the final say via the overflow retry.
 
 ---
 
@@ -335,5 +323,7 @@ Recorded so they are not rediscovered as bugs.
 - [`evaluation/rlm/README.md`](evaluation/rlm/README.md) — the RLM harness itself: guards,
   scratchpad, benchmarks, metrics.
 - [`evaluation/rlm/loft128k/README.md`](evaluation/rlm/loft128k/README.md) — the LOFT-128k
-  arm-by-arm runbook (see issue 9 above).
+  arm-by-arm runbook.
+- [`fix_rlm.md`](fix_rlm.md) — the audit that produced the generation-2 changes: what was
+  broken, what was fixed, and what is deliberately left alone.
 - [`evaluation/README.md`](evaluation/README.md) — the KVPress evaluation matrix.

@@ -23,6 +23,8 @@ from typing import Any, Iterator, Optional
 import pandas as pd
 import yaml
 
+from evaluation.results_layout import RESULTS_ROOT
+
 # Scorers disagree on what to call the headline number, and some nest it per task.
 # Checked in order; the first hit wins. Both backends run the SAME scorer for a
 # given dataset, so whichever key is picked is picked identically for both -- that
@@ -34,6 +36,12 @@ import yaml
 # no key hit at all and three numeric entries, so they failed the single-numeric
 # fallback below and were dropped from the comparison entirely.
 SCORE_KEYS = ("average", "string_match", "exact_match", "score", "accuracy", "subspan_em", "f1")
+
+# ...but "first hit in a global priority list" is a fragile way to pick a headline:
+# a scorer that reports two of these keys gets whichever happens to sit earlier,
+# silently. Where a dataset has a documented primary metric, name it here and the
+# ordering above never comes into play.
+DATASET_SCORE_KEY = {"loft": "subspan_em"}
 
 # Reported by the RLM harness about itself; never a benchmark score.
 RUNTIME_KEY = "runtime"
@@ -53,9 +61,12 @@ def _flatten(metrics: dict, prefix: str = "") -> dict[str, Any]:
     return flat
 
 
-def headline_score(metrics: dict) -> tuple[Optional[str], Optional[float]]:
+def headline_score(metrics: dict, dataset: Optional[str] = None) -> tuple[Optional[str], Optional[float]]:
     """Pick the comparable number out of a scorer's metrics dict."""
     flat = _flatten(metrics)
+    preferred = DATASET_SCORE_KEY.get(dataset or "")
+    if preferred is not None and isinstance(flat.get(preferred), (int, float)):
+        return preferred, float(flat[preferred])
     for key in SCORE_KEYS:
         value = flat.get(key)
         if isinstance(value, (int, float)):
@@ -89,6 +100,11 @@ def describe_configuration(backend: str, config: dict) -> str:
         mode = config.get("mode", "rlm")
         budget = (config.get("memory_budget") or {}).get("max_context_tokens")
         label = f"{mode}" if budget is None else f"{mode}@ctx{budget}"
+        # The scratchpad arm is a different experiment from plain RLM, and the two
+        # rendered identically here -- so the table showed two `rlm` rows per task
+        # and the groupby checks below read them as duplicates of one configuration.
+        if config.get("scratchpad"):
+            label += "+scratchpad"
         # Without these, two arm-4 runs that differ only in their sub-call KV budget
         # or chunk size -- the whole point of the arm -- render as the same row.
         kv_budget = config.get("sub_kv_memory_budget")
@@ -107,7 +123,7 @@ def describe_configuration(backend: str, config: dict) -> str:
 
 def build_row(run_dir: Path, config: dict, metrics: dict) -> dict[str, Any]:
     backend = config.get("backend", "kvpress")
-    metric_name, score = headline_score(metrics)
+    metric_name, score = headline_score(metrics, config.get("dataset"))
     runtime = metrics.get(RUNTIME_KEY, {}) if isinstance(metrics.get(RUNTIME_KEY), dict) else {}
 
     data_dir = config.get("data_dir")
@@ -129,10 +145,16 @@ def build_row(run_dir: Path, config: dict, metrics: dict) -> dict[str, Any]:
     # tokens were live at peak", which is what KV memory is proportional to -- so
     # this is the column to plot score against for either backend.
     if backend == "rlm":
+        # For an arm with KV-compressed sub-calls this is max(root, sub): while the
+        # root holds ~2k tokens the sub model is holding a whole slice of KV on the
+        # GPU, and counting only the root made that arm look far cheaper than it is.
+        # `_root` keeps the un-mixed number visible beside it.
         row["context_tokens_held"] = runtime.get("average_peak_context_tokens")
+        row["context_tokens_root"] = runtime.get("average_peak_context_tokens_root")
         row["total_tokens"] = runtime.get("average_tokens")
         row["examples"] = runtime.get("scored")
         row["errors"] = runtime.get("errors")
+        row["abstained"] = runtime.get("abstained")
         # Only meaningful for the vanilla arm, and the reason its score may be a
         # property of the truncation limit rather than of the model.
         row["context_retained"] = runtime.get("average_context_chars_retained")
@@ -149,7 +171,7 @@ def build_row(run_dir: Path, config: dict, metrics: dict) -> dict[str, Any]:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--results-dir", default="evaluation/results", help="tree holding both KVPress and RLM run dirs")
+    ap.add_argument("--results-dir", default=RESULTS_ROOT, help="tree holding both KVPress and RLM run dirs")
     ap.add_argument("--dataset", default=None, help="restrict to one dataset")
     ap.add_argument("--model", default=None, help="restrict to one model id")
     ap.add_argument("--csv", default=None, help="also write the joined table here")
@@ -184,9 +206,11 @@ def main() -> None:
             "metric",
             "score",
             "context_tokens_held",
+            "context_tokens_root",
             "total_tokens",
             "context_retained",
             "kv_memory_gb",
+            "abstained",
             "errors",
         )
         if c in frame.columns
