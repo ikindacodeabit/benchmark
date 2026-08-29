@@ -77,6 +77,47 @@ keep the diff reviewable. `make style` was already failing on master for
   with tiktoken while the server reports its own tokenizer's count. The
   server-reported number is preferred where available (`Usage.last_prompt_tokens`).
 
+## LOFT campaign tooling (`evaluation/rlm/loft128k/`)
+
+Found in the 2026-08-29 pre-campaign audit. The blocking and GPU-safety ones were
+fixed (need-based `util_for` + `ROOT_NEED_MIB`, `MIN_FREE_MIB` 30000→33000,
+`KVZIP_PYTHON` honouring an external `VENV`, `RLM_SUB_GPU` on the `run` path,
+`download_data.sh` no longer forcing `$HOME`). These were left:
+
+- **`flock` key omits `LENGTH` and the arm-4 budget/arm.** `run_cells.sh` locks on
+  `.lock.$DATASET[.kvpress]`, so a 32k and a 1m run of the same subset collide
+  unless they use different `RESULTS`, and the arm-4 grid can only be
+  dataset-parallel, never budget-parallel. The lock also lives on NFS, where
+  `flock` semantics are version-dependent — verify with a deliberate double-launch
+  before trusting it as a duplicate-run guard.
+- **Arms 1–3 always exit 0.** Both invocations end in `|| echo "WARN..."`, so
+  `auto`'s `FAILED` accounting is blind to them; only the arm-4 lane propagates
+  failure. A dead server shows up as a fast, silent, empty run.
+- **`cleanup` never kills the worker subshells**, only the servers (`PIDS`, not
+  `WPIDS`), and `pkill -TERM -P` is one level deep, so vLLM EngineCore
+  grandchildren can survive an abort. Terminal Ctrl-C happens to work because
+  SIGINT reaches the whole foreground process group; `kill <pid>` does not.
+  Check `nvidia-smi` after any abort.
+- **`kvzip-baseline` (cell 5) has no lock and no trap**, and inherits
+  `memory_budget_unit`, `seed`, `model_kwargs` and
+  `synthetic_kv_metadata_override` un-overridden from
+  `evaluation/evaluate_config.yaml` — whose `model:` is a path on a host that is
+  no longer reachable (masked only because the script overrides `model`).
+- **README arm-4 smoke commands pass the retired `KV_RATIOS`**; the code reads
+  `KV_BUDGETS`, so those "one-example smokes" silently run the default
+  `0.512 1` grid — twice the intended work.
+- **Arm 4c is missing from the README arm table** despite existing in
+  `run_cells.sh` (`--max-subcall-chars auto` + `--target-compression-ratio`).
+  It is documented only in `RLM.md`.
+- **Stale comment in `run_infolab.sh`'s colocation branch** claims an overlong
+  root transcript "400s, is recorded as an error, and is retried on resume". The
+  code evicts and retries (`rlm.py`, counter `overflow_evictions`).
+- **README's clone instruction names a branch that is not current.**
+
+`slurm/loft128k_a100.slurm` is self-labelled UNVERIFIED and has never been
+submitted; it also traps only `EXIT` (orphaning vLLM) and stages caches under
+`$HOME`. Do not copy it as a template.
+
 ## Upstream kvpress bugs (unmodified files, not fixed here)
 
 Found during the audit, left in place because these files are byte-identical to

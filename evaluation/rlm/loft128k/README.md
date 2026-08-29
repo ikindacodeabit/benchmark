@@ -86,15 +86,19 @@ GPU=1 bash evaluation/rlm/loft128k/run_infolab.sh serve
 DATASETS="nq" bash evaluation/rlm/loft128k/run_infolab.sh run
 ```
 
-**Contention is the main risk.** On an empty 48 GB card the util cap lands at 0.85
-(~33 GB of KV, ~1.8 concurrent 128k sequences). On a card already holding another
-user's 13 GB job it lands near 0.59 (~20 GB of KV, ~1.1 sequences) — still
-correct, just slow. Check `nvidia-smi` before launching and prefer the emptiest
-cards.
+**Contention is the main risk.** The server asks for what it needs —
+`ROOT_NEED_MIB` (default 31000 MiB: ~19.1 GiB of KV for one 139264-token
+sequence, ~7.5 GiB of weights, ~2 GB of overhead) — plus whatever co-tenants
+already hold, rather than for the whole card. On an empty 48 GB card that is a
+util of about 0.64; on one holding another user's 13 GB job, about 0.90. Cards
+with less than `MIN_FREE_MIB` (33000) free are skipped entirely. Check
+`nvidia-smi` before launching and prefer the emptiest cards.
 
-Each subset is 110 examples: `_load_loft` concatenates **dev (10) then test
-(100)**, in that order. So `LIMIT` values of 10 or less sample the dev split only
-— fine for a smoke test, not a result. `LIMIT=110` is the whole subset.
+Each subset is 110 examples **at 128k and 1m**: `_load_loft` concatenates
+**dev (10) then test (100)**, in that order. So `LIMIT` values of 10 or less
+sample the dev split only — fine for a smoke test, not a result. `LIMIT=110` is
+the whole subset. (At 32k, `qampari` and `quest` are 70 rows, not 110: their test
+splits ship 60.)
 
 ## The KV-compression arms (4a/4b and the kvzip baseline)
 

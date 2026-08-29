@@ -17,11 +17,11 @@
 #   DATASETS="nq" LIMIT=3 LENGTH=32k bash evaluation/rlm/loft128k/run_infolab.sh run
 #
 # SIZING on a 48 GB card. Qwen3-4B-2507 is 36 layers x 8 KV heads x 128 head_dim
-# = 144 KiB per token, so one 128k sequence needs ~18 GB of KV on top of ~8 GB of
-# bf16 weights. On an EMPTY card (util cap 0.85 -> ~41 GB) that is roughly 1.8
-# concurrent sequences. On a card already holding another user's 13 GB job the cap
-# lands near 0.59 -> ~29 GB, which fits the weights and barely ONE 128k sequence.
-# It still runs; it is just slow. Prefer the emptiest cards.
+# = 144 KiB per token, so one 139264-token sequence needs ~19.1 GiB of KV on top
+# of ~7.5 GiB of bf16 weights, plus ~2 GB of activations and non-torch overhead:
+# about 29 GB, which is what ROOT_NEED_MIB encodes. The server asks for THAT much
+# rather than for the whole card, so co-tenants keep what they hold. Prefer the
+# emptiest cards anyway -- a card with under MIN_FREE_MIB free is skipped.
 set -euo pipefail
 
 MODEL="${MODEL:-Qwen/Qwen3-4B-Instruct-2507}"
@@ -56,8 +56,10 @@ KVPRESS_VENV="${KVPRESS_VENV:-.venv-kvpress}"
 if [ -n "${KVPRESS_ARMS:-}" ]; then
     MIN_FREE_MIB="${MIN_FREE_MIB:-38000}"
 else
-    # 8 GB of weights plus enough KV for at least one 128k sequence.
-    MIN_FREE_MIB="${MIN_FREE_MIB:-30000}"
+    # Must cover ROOT_NEED_MIB plus HEADROOM_MIB: at 30000 the gate admitted cards
+    # on which a 139264-token window only just fit, and a co-tenant arriving during
+    # startup pushed the engine core over.
+    MIN_FREE_MIB="${MIN_FREE_MIB:-33000}"
 fi
 # Leave headroom so a co-tenant's job growing slightly does not OOM the server.
 HEADROOM_MIB="${HEADROOM_MIB:-2000}"
@@ -68,6 +70,11 @@ KV_ROOT_MAX_LEN="${KV_ROOT_MAX_LEN:-65536}"
 # overhead. Capping it stops a near-empty card from handing the root a KV pool
 # far larger than its window can ever use.
 ROOT_BUDGET_MIB="${ROOT_BUDGET_MIB:-21000}"
+# What a NON-colocated root may take for itself (see the sizing note in the header):
+# ~19.1 GiB of KV for one 139264-token sequence, ~7.5 GiB of weights, ~2 GB of
+# activations and non-torch overhead. Asking for this rather than for the whole
+# card is what keeps a shared host usable by everyone else on it.
+ROOT_NEED_MIB="${ROOT_NEED_MIB:-31000}"
 
 # Some infolab hosts mix A6000 (sm_86) and RTX 6000 Ada (sm_89). CUDA orders
 # devices FASTEST_FIRST by default while nvidia-smi reports PCI order, so without
@@ -298,12 +305,19 @@ pick_gpus() {
 # shortfall. That is not theoretical: on bee 2026-08-18, util 0.44 on a card with
 # ~10 GB of co-tenants left the root 1.40 GiB of KV against the 9.00 GiB one
 # 65536-token sequence needs, and the engine core refused to start.
+# Take what the server NEEDS, not the whole card. The previous shape was
+# (t-f) + (f-h), whose free terms cancel to (t-h)/t -- a constant 0.90 on any card
+# bigger than 20 GB, with HEADROOM_MIB inert. That claimed 90% of a shared GPU
+# however little the server actually needed, and the 0.90 ceiling then silently
+# capped the headroom at 10% of the card. Same total-device correction as before,
+# but the "own" term is now bounded by ROOT_NEED_MIB, exactly as kv_util_for does.
 util_for() {
     local idx="$1" free total
     free=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits -i "$idx")
     total=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits -i "$idx")
-    awk -v f="$free" -v t="$total" -v h="$HEADROOM_MIB" \
-        'BEGIN{u=(t-f+f-h)/t; if(u>0.90)u=0.90; if(u<0.50)u=0.50; printf "%.2f", u}'
+    awk -v f="$free" -v t="$total" -v h="$HEADROOM_MIB" -v n="$ROOT_NEED_MIB" \
+        'BEGIN{own=f-h; if(own>n)own=n; u=(t-f+own)/t;
+               if(u>0.90)u=0.90; if(u<0.50)u=0.50; printf "%.2f", u}'
 }
 
 # Colocation variant: the root shares the card with the ~16 GB in-process sub
@@ -387,10 +401,23 @@ serve)
     ;;
 
 run)
+    # Arm 4 hosts a ~16 GB sub model in-process, and run_cells.sh pins it with
+    # CUDA_VISIBLE_DEVICES="${RLM_SUB_GPU:-0}". `auto` passes RLM_SUB_GPU; this
+    # path did not, so the sub model landed on physical GPU 0 whatever card was
+    # serving -- somebody else's, on a shared host. Demand the card explicitly
+    # rather than guessing, since this path cannot know which GPU serves $PORT.
+    SUB_GPU_FOR_RUN="${RLM_SUB_GPU:-${GPU:-}}"
+    if [ -n "${KVPRESS_ARMS:-}" ] && [ -z "$SUB_GPU_FOR_RUN" ]; then
+        echo "ERROR: KVPRESS_ARMS is set but neither RLM_SUB_GPU nor GPU is." >&2
+        echo "  Arm 4 loads a ~16 GB sub model; name the card to put it on, e.g." >&2
+        echo "  RLM_SUB_GPU=4 ... $0 run" >&2
+        exit 2
+    fi
     for ds in $DATASETS; do
         DATASET="$ds" LENGTH="$LENGTH" PORT="$PORT" LIMIT="$LIMIT" \
             RESULTS="$RESULTS" MODEL="$MODEL" LOGS="$LOGS" \
-            KVPRESS_PYTHON="$KVPRESS_VENV/bin/python" \
+            VENV="$VENV" KVZIP_PYTHON="$VENV/bin/python" \
+            ${SUB_GPU_FOR_RUN:+RLM_SUB_GPU="$SUB_GPU_FOR_RUN"} \
             bash evaluation/rlm/loft128k/run_cells.sh
     done
     ;;
@@ -469,7 +496,7 @@ auto)
                 if [ $((j % ${#GPUS[@]})) -eq "$i" ]; then
                     DATASET="${DS_ARR[$j]}" LENGTH="$LENGTH" PORT="$p" LIMIT="$LIMIT" \
                         RESULTS="$RESULTS" MODEL="$MODEL" LOGS="$LOGS" \
-                        KVPRESS_PYTHON="$KVPRESS_VENV/bin/python" \
+                        VENV="$VENV" KVZIP_PYTHON="$VENV/bin/python" \
                         RLM_SUB_GPU="$sub_gpu" \
                         bash evaluation/rlm/loft128k/run_cells.sh || true
                 fi

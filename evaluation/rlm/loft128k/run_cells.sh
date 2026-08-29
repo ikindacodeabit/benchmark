@@ -92,7 +92,10 @@ fi
 # so no separate venv is needed); the sub model is hosted in-process on
 # RLM_SUB_GPU.
 if [ -n "${KVPRESS_ARMS:-}" ]; then
-    KVPY="${KVZIP_PYTHON:-.venv/bin/python}"
+    # Default off VENV, not a bare `.venv`: the venv is not always inside the repo
+    # (on the infolab hosts it lives on scratch, e.g. /mnt/nas/$USER/venvs/rlm),
+    # and a repo-relative default also silently depends on the caller's cwd.
+    KVPY="${KVZIP_PYTHON:-${VENV:-.venv}/bin/python}"
     if [ ! -x "$KVPY" ]; then
         echo "ERROR: no venv python at $KVPY; run run_infolab.sh setup first (or set KVZIP_PYTHON)" >&2
         exit 1

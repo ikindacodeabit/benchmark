@@ -11,9 +11,29 @@ set -euo pipefail
 LOFT_LENGTHS="${LOFT_LENGTHS:-128k}"
 export LOFT_LENGTHS
 
-export HF_HOME="$HOME/hf_cache"
+# Honour a pre-set HF_HOME/VENV instead of overriding them. Both used to be
+# hardcoded to $HOME, which is a small quota-capped NFS mount on the infolab
+# hosts -- staging LOFT there fails with "OSError: [Errno 122] Disk quota
+# exceeded" partway through, and a repo-relative .venv does not exist when the
+# venv lives on scratch. Defaults match run_infolab.sh's RLM_SCRATCH layout.
+RLM_SCRATCH="${RLM_SCRATCH:-/mnt/nas/$USER}"
+export HF_HOME="${HF_HOME:-$RLM_SCRATCH/hf_cache}"
+case "$HF_HOME" in
+"$HOME"/*)
+    echo "ERROR: HF_HOME=$HF_HOME is under \$HOME, which is quota-capped here." >&2
+    echo "  Set HF_HOME (or RLM_SCRATCH) to a big writable path before running." >&2
+    exit 1
+    ;;
+esac
+mkdir -p "$HF_HOME"
 
-source .venv/bin/activate
+VENV="${VENV:-.venv}"
+if [ ! -x "$VENV/bin/activate" ] && [ ! -f "$VENV/bin/activate" ]; then
+    echo "ERROR: no venv at $VENV; set VENV=<path to your venv>" >&2
+    exit 1
+fi
+# shellcheck disable=SC1091
+source "$VENV/bin/activate"
 
 python - <<'EOF'
 import os
