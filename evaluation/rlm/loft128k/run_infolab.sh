@@ -32,11 +32,22 @@ DATASETS="${DATASETS:-nq hotpotqa musique qampari quest}"
 RESULTS="${RESULTS:-evaluation/results/loft128k}"
 LOGS="${LOGS:-$RESULTS/logs}"
 VENV="${VENV:-.venv}"
-# Second venv for the cell-5 kvzip vanilla baseline (kvpress evaluate.py). The
-# RLM venv above pins transformers==4.51.3 for the vLLM server; kvpress needs
-# >=4.56 (new Cache API), so the two cannot share an environment. Arm 4 does not
-# use this venv: it hosts its sub model in-process from the MAIN venv.
+# Second venv for anything that imports kvpress: the cell-5 kvzip baseline AND
+# the arm-4 driver. The RLM venv above pins transformers==4.51.3 for the vLLM
+# server; kvpress needs >=4.56 (new Cache API), so the two cannot share an
+# environment. This used to claim arm 4 ran from the MAIN venv "because KVzip
+# pins 4.51.3 too" -- it does not work: under 4.51.3 the imports all succeed and
+# KVzipPress() constructs fine, so the mistake only surfaces once the press
+# touches a DynamicCache that has no `.layers`.
 KVPRESS_VENV="${KVPRESS_VENV:-.venv-kvpress}"
+# Which python runs the ARM-4 driver. It must be the kvpress venv, not $VENV:
+# $VENV pins transformers==4.51.3 because vLLM 0.8.5 calls
+# `all_special_tokens_extended` (gone in 5.x), but kvpress needs >=4.56 for the
+# new Cache API -- under 4.51.3 `DynamicCache()` has no `.layers` and the press
+# fails once it touches the cache. Both constraints are satisfiable at once only
+# because they live in different PROCESSES: the vLLM server is its own process on
+# $VENV, while the arm-4 driver only speaks HTTP to it and can run on 5.x.
+KVZIP_PYTHON="${KVZIP_PYTHON:-$KVPRESS_VENV/bin/python}"
 
 # --- arm-4 colocation mode (KVPRESS_ARMS=1) -----------------------------------
 # Arm 4 puts TWO models on one card: the vLLM root server plus the in-process HF
@@ -416,7 +427,7 @@ run)
     for ds in $DATASETS; do
         DATASET="$ds" LENGTH="$LENGTH" PORT="$PORT" LIMIT="$LIMIT" \
             RESULTS="$RESULTS" MODEL="$MODEL" LOGS="$LOGS" \
-            VENV="$VENV" KVZIP_PYTHON="$VENV/bin/python" \
+            VENV="$VENV" KVZIP_PYTHON="$KVZIP_PYTHON" \
             ${SUB_GPU_FOR_RUN:+RLM_SUB_GPU="$SUB_GPU_FOR_RUN"} \
             bash evaluation/rlm/loft128k/run_cells.sh
     done
@@ -496,7 +507,7 @@ auto)
                 if [ $((j % ${#GPUS[@]})) -eq "$i" ]; then
                     DATASET="${DS_ARR[$j]}" LENGTH="$LENGTH" PORT="$p" LIMIT="$LIMIT" \
                         RESULTS="$RESULTS" MODEL="$MODEL" LOGS="$LOGS" \
-                        VENV="$VENV" KVZIP_PYTHON="$VENV/bin/python" \
+                        VENV="$VENV" KVZIP_PYTHON="$KVZIP_PYTHON" \
                         RLM_SUB_GPU="$sub_gpu" \
                         bash evaluation/rlm/loft128k/run_cells.sh || true
                 fi

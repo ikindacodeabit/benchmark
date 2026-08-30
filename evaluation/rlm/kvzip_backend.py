@@ -179,7 +179,18 @@ class KVzipSubClient:
         self.model = model
         self.extra_body: Optional[dict] = None  # assignable no-op (chat_template_kwargs don't apply here)
         self.usage = Usage()
-        hf_model = AutoModelForCausalLM.from_pretrained(model, dtype="auto", device_map="auto", trust_remote_code=True)
+        # `torch_dtype`, not `dtype`: this backend runs from the MAIN venv, which
+        # pins transformers==4.51.3 because vLLM 0.8.5 calls
+        # `all_special_tokens_extended` (removed in 5.x). 4.51.3 knows only
+        # `torch_dtype` and forwards an unrecognised `dtype` straight to the model
+        # constructor, so arm 4 died at load with
+        # "Qwen3ForCausalLM.__init__() got an unexpected keyword argument 'dtype'".
+        # transformers 5.x still accepts `torch_dtype` (modeling_utils pops it with
+        # a deprecation warning), so the old spelling is the one that works in both
+        # this venv and .venv-kvpress.
+        hf_model = AutoModelForCausalLM.from_pretrained(
+            model, torch_dtype="auto", device_map="auto", trust_remote_code=True
+        )
         hf_model.eval()
         tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
         self.pipeline = KVPressTextGenerationPipeline(model=hf_model, tokenizer=tokenizer)

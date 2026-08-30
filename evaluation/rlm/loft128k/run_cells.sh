@@ -94,9 +94,10 @@ fi
 # served by a SMALL root server (see run_infolab.sh colocation sizing), and a
 # vanilla arm pointed at it would shrink-retry against the reduced window and
 # merge truncated rows into the existing vanilla checkpoints. The driver runs
-# from the MAIN venv (KVzip pins transformers==4.51.3, same as the vLLM server,
-# so no separate venv is needed); the sub model is hosted in-process on
-# RLM_SUB_GPU.
+# from the KVPRESS venv, NOT the main one -- kvpress needs transformers >=4.56
+# for the new Cache API while the main venv pins 4.51.3 for vLLM 0.8.5. Only the
+# vLLM server needs that pin, and it is a separate process, so the two live
+# side by side. The sub model is hosted in-process on RLM_SUB_GPU.
 if [ -n "${KVPRESS_ARMS:-}" ]; then
     # Default off VENV, not a bare `.venv`: the venv is not always inside the repo
     # (on the infolab hosts it lives on scratch, e.g. /mnt/nas/$USER/venvs/rlm),
