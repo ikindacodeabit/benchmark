@@ -329,9 +329,12 @@ class AbstentionTest(unittest.TestCase):
     no way to say it: FINAL("unknown") is by construction absent from the output
     it describes, so the grounding guard read the honest ending as a guess."""
 
+    # These two cover the GROUNDING exemption, which is orthogonal to the effort
+    # gate below -- so they switch that gate off rather than satisfying it, and a
+    # change to one cannot quietly mask the other.
     def test_final_none_ends_the_run_without_a_grounding_check(self):
         root = _ScriptedClient([_code("FINAL_NONE('the document never mentions it')")])
-        rlm = RLM(root_client=root, max_steps=3, exec_timeout=None)
+        rlm = RLM(root_client=root, max_steps=3, exec_timeout=None, min_sub_calls_before_abstain=0)
 
         result = rlm.run("ctx", "task")
         self.assertEqual(result.end_reason, "abstained")
@@ -341,11 +344,90 @@ class AbstentionTest(unittest.TestCase):
 
     def test_final_none_is_honored_in_prose_too(self):
         root = _ScriptedClient(["I searched thoroughly. FINAL_NONE('not present')"])
-        rlm = RLM(root_client=root, max_steps=3, exec_timeout=None)
+        rlm = RLM(root_client=root, max_steps=3, exec_timeout=None, min_sub_calls_before_abstain=0)
 
         result = rlm.run("ctx", "task")
         self.assertEqual(result.end_reason, "abstained")
         self.assertIsNone(result.answer)
+
+
+class PrematureAbstentionTest(unittest.TestCase):
+    """Absence is the one claim REPL output cannot ground, which made FINAL_NONE the
+    cheapest way out of a hard example. On the LOFT-1m smoke 5 of 6 abstentions came
+    after a single failed substring search with zero sub-calls -- the root had looked
+    for the whole natural-language question as a literal string. So abstaining gets an
+    EFFORT test where answering gets a grounding test."""
+
+    def test_giving_up_without_reading_anything_is_rejected_and_nudged(self):
+        root = _ScriptedClient(
+            [
+                _code("FINAL_NONE('query term not found in the document')"),
+                _code("print(llm_query('who?', context))"),
+                _code("FINAL_NONE('genuinely absent')"),
+            ]
+        )
+        sub = _ScriptedClient(["nothing relevant here"])
+        rlm = RLM(root_client=root, sub_client=sub, max_steps=5, exec_timeout=None)
+
+        result = rlm.run("ctx", "task")
+
+        self.assertEqual(result.metrics["premature_abstentions"], 1)
+        self.assertEqual(result.end_reason, "abstained", "the second, earned abstention stands")
+        self.assertEqual(result.metrics["abstain_reason"], "genuinely absent")
+        # The nudge has to name the actual mistake; "search harder" alone left the
+        # root re-running the same doomed literal lookup.
+        nudge = "".join(m["content"] for m in root.seen[-1] if m["role"] == "user")
+        self.assertIn("DISTINCTIVE", nudge)
+
+    def test_an_abstention_backed_by_a_sub_call_is_accepted_immediately(self):
+        root = _ScriptedClient(
+            [
+                _code("print(llm_query('who?', context))"),
+                _code("FINAL_NONE('read it, not there')"),
+            ]
+        )
+        sub = _ScriptedClient(["no mention of that"])
+        rlm = RLM(root_client=root, sub_client=sub, max_steps=4, exec_timeout=None)
+
+        result = rlm.run("ctx", "task")
+
+        self.assertEqual(result.end_reason, "abstained")
+        self.assertEqual(result.metrics.get("premature_abstentions", 0), 0)
+
+    def test_a_determined_abstention_is_let_through_rather_than_looping(self):
+        # Nudging forever would burn every step on a model that cannot search.
+        root = _ScriptedClient([_code("FINAL_NONE('still nothing')")])
+        rlm = RLM(root_client=root, max_steps=8, exec_timeout=None)
+
+        result = rlm.run("ctx", "task")
+
+        self.assertEqual(result.end_reason, "abstained")
+        self.assertEqual(result.metrics["premature_abstentions"], 2, "at most two nudges")
+
+    def test_the_prose_path_is_gated_too(self):
+        root = _ScriptedClient(
+            [
+                "I could not find it. FINAL_NONE('not present')",
+                _code("print(llm_query('who?', context))"),
+                "Now I am sure. FINAL_NONE('really not present')",
+            ]
+        )
+        sub = _ScriptedClient(["no mention"])
+        rlm = RLM(root_client=root, sub_client=sub, max_steps=5, exec_timeout=None)
+
+        result = rlm.run("ctx", "task")
+
+        self.assertEqual(result.metrics["premature_abstentions"], 1)
+        self.assertEqual(result.end_reason, "abstained")
+
+    def test_zero_disables_the_gate(self):
+        root = _ScriptedClient([_code("FINAL_NONE('nope')")])
+        rlm = RLM(root_client=root, max_steps=3, exec_timeout=None, min_sub_calls_before_abstain=0)
+
+        result = rlm.run("ctx", "task")
+
+        self.assertEqual(result.end_reason, "abstained")
+        self.assertEqual(result.metrics.get("premature_abstentions", 0), 0)
 
 
 class ReplyParsingTest(unittest.TestCase):

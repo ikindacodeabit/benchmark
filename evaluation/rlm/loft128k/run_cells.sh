@@ -19,6 +19,12 @@ RESULTS="${RESULTS:-evaluation/results/loft128k}"
 MODEL="${MODEL:-Qwen/Qwen3-4B-Instruct-2507}"
 MAX_NOTES_TOKENS="${MAX_NOTES_TOKENS:-1024}"
 LOGS="${LOGS:-$RESULTS/logs}"
+# Arms 1-3 caps. Defaults are the 128k values; LENGTH=1m needs both raised (see
+# the --vanilla-char-limit note above COMMON). The arm-4 lanes already take their
+# timeout from KV_RUN_TIMEOUT_4*, so this keeps every cap on the same footing.
+VANILLA_CHAR_LIMIT="${VANILLA_CHAR_LIMIT:-700000}"
+VANILLA_MAX_PROMPT_TOKENS="${VANILLA_MAX_PROMPT_TOKENS:-134000}"
+RUN_TIMEOUT="${RUN_TIMEOUT:-900}"
 
 export TOKENIZERS_PARALLELISM=false
 export PYTHONUNBUFFERED=1
@@ -167,6 +173,13 @@ fi
 # The 400k default would silently cut the baseline to ~77% of the document and
 # hand the RLM arm a win it did not earn. Bound the prompt by TOKENS instead.
 #
+# At LENGTH=1m the 700k default binds FIRST -- a ~931k-token LOFT-1m document is
+# ~3.7M characters, so the char cap, not the token cap, decides what the baseline
+# reads, and `context_retained` then reports the truncation ratio (~0.19) instead
+# of the fraction the model actually saw (~0.14 = 134k tokens / ~931k). Raise
+# VANILLA_CHAR_LIMIT above the document size at 1m so the TOKEN cap governs and
+# the metric means what it says.
+#
 # NOTE: no --no-think and no --reasoning-parser anywhere in this pipeline.
 # Qwen3-*-Instruct-2507 is a non-thinking model; it emits no <think> blocks, and
 # the enable_thinking chat-template kwarg does not apply to its template.
@@ -178,10 +191,10 @@ COMMON=(
     --root-model "$MODEL"
     --sub-model "$MODEL"
     --max-steps 50
-    --vanilla-char-limit 700000
-    --vanilla-max-prompt-tokens 134000
+    --vanilla-char-limit "$VANILLA_CHAR_LIMIT"
+    --vanilla-max-prompt-tokens "$VANILLA_MAX_PROMPT_TOKENS"
     --exec-timeout 60
-    --run-timeout 900
+    --run-timeout "$RUN_TIMEOUT"
     --max-sub-calls 40
     --out "$RESULTS"
 )

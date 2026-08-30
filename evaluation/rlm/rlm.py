@@ -67,6 +67,14 @@ RULES:
 - Strategy: peek at structure first (e.g. `print(context[:2000])`,
   `print(len(context))`, regex search), then narrow down with string ops or
   chunked `llm_query` calls. Do NOT print the whole context.
+- SEARCH TERMS: never search for the question itself. A query like "first who
+  wants to be a millionaire winner uk" appears nowhere in any document as a
+  literal string, so searching for it proves nothing. Pull out the DISTINCTIVE
+  terms — proper nouns, names, titles, numbers, rare words — and search for each
+  one SEPARATELY and case-insensitively, e.g.
+  `idx = context.lower().find(term.lower())`. For that query you would try
+  "millionaire", then "jackpot", then "winner". Try several terms before
+  concluding anything is absent.
 - If a search or extraction returns ZERO matches or fewer than the task implies,
   that is USUALLY a signal your pattern is wrong — not that the answer is empty.
   Print a sample of the text around a likely keyword to see the actual format,
@@ -80,7 +88,9 @@ RULES:
 - If, after genuinely searching, the document does NOT contain the answer, end
   with FINAL_NONE("short reason") instead of guessing. Abstaining is a legitimate
   ending and is always better than inventing a value. Do NOT abstain on your first
-  empty search — try at least one different pattern or tactic first.
+  empty search — try at least one different pattern or tactic first. An abstention
+  backed by NO llm_query call will be rejected: you must have actually read some of
+  the document before you can claim the answer is not in it.
 - You have at most {max_steps} code turns. Be efficient.{budget_note}
 
 Example of a correct session (3 turns):
@@ -141,6 +151,22 @@ SUB_SYSTEM_PROMPT = (
     "provided in the prompt. Be concise and factual."
 )
 
+# Sent when a model gives up without having read anything (see
+# min_sub_calls_before_abstain). Names the specific mistake -- searching for the
+# whole question -- because "search harder" alone left the root re-running the
+# same doomed literal lookup with a different slice.
+PREMATURE_ABSTAIN_NUDGE = (
+    "REJECTED: you called FINAL_NONE without ever calling llm_query, so you have not "
+    "actually read any of the document and cannot know the answer is absent. A "
+    "natural-language question almost never appears verbatim in a document, so a "
+    "failed search for the whole query proves nothing at all. Extract the DISTINCTIVE "
+    "terms instead -- proper nouns, names, titles, numbers, rare words -- and search "
+    "for each one SEPARATELY and case-insensitively, e.g. "
+    "idx = context.lower().find(term.lower()). When a term hits, print the text around "
+    "it to see the format, then pass that slice to llm_query. Only abstain once several "
+    "different terms have genuinely failed."
+)
+
 FOLD_MARKER = (
     "[MEMORY NOTICE] {n} earlier turn(s) were dropped to stay within your memory "
     "budget. They are gone from your context and were NOT saved anywhere — but the "
@@ -178,12 +204,34 @@ CODE_RE = re.compile(r"```(?:python|repl|py)?[ \t]*\n?(.*?)```", re.DOTALL)
 # with no closing one. Without this the reply reads as "no code block", burns a nudge,
 # and after three such replies the raw truncated text is returned as the answer.
 UNTERMINATED_CODE_RE = re.compile(r"```(?:python|repl|py)?[ \t]*\n(.*)\Z", re.DOTALL)
-STMT_KEYWORDS = r"print|import|from|for|while|if|elif|try|except|finally|with|return|note|FINAL_NONE|FINAL_VAR|FINAL"
+# Spellings of the terminal calls the REPL accepts. Small models typo the case
+# constantly: on the LOFT-1m smoke one example burned several of its 38 steps on
+# `NameError: name 'Final' is not defined` before the repetition breaker cut it
+# off. Accepting the variants is free -- but MISSING one is not, so the env, the
+# AST literal-scan and the prose regexes below are all derived from these tuples.
+# A spelling the env accepted while the scan missed it would walk a guessed
+# literal straight past the grounding guard, which is a worse bug than the typo.
+FINAL_NAMES = ("FINAL", "Final", "final")
+FINAL_NONE_NAMES = ("FINAL_NONE", "Final_None", "FINAL_None", "final_none")
+FINAL_VAR_NAMES = ("FINAL_VAR", "Final_Var", "FINAL_Var", "final_var")
+_ALL_TERMINAL_NAMES = FINAL_NONE_NAMES + FINAL_VAR_NAMES + FINAL_NAMES  # longest-first
+
+STMT_KEYWORDS = (
+    r"print|import|from|for|while|if|elif|try|except|finally|with|return|note|"
+    + "|".join(_ALL_TERMINAL_NAMES)
+)
 ONELINE_FIX_RE = re.compile(rf"(?<=[\)\w'\"])\s+(?=(?:{STMT_KEYWORDS})\b)")
-TEXT_FINAL_RE = re.compile(r"FINAL\(\s*(?:\"\"\"|'''|\"|')(.*?)(?:\"\"\"|'''|\"|')\s*\)", re.DOTALL)
-TEXT_FINAL_VAR_RE = re.compile(r"FINAL_VAR\(\s*[\"'](\w+)[\"']\s*\)")
+_FINAL_ALT = "|".join(FINAL_NAMES)
+_FINAL_NONE_ALT = "|".join(FINAL_NONE_NAMES)
+_FINAL_VAR_ALT = "|".join(FINAL_VAR_NAMES)
+TEXT_FINAL_RE = re.compile(
+    rf"(?:{_FINAL_ALT})\(\s*(?:\"\"\"|'''|\"|')(.*?)(?:\"\"\"|'''|\"|')\s*\)", re.DOTALL
+)
+TEXT_FINAL_VAR_RE = re.compile(rf"(?:{_FINAL_VAR_ALT})\(\s*[\"'](\w+)[\"']\s*\)")
 # FINAL_NONE may be written bare or with a reason, in code or in prose.
-TEXT_FINAL_NONE_RE = re.compile(r"FINAL_NONE\(\s*(?:(?:\"\"\"|'''|\"|')(.*?)(?:\"\"\"|'''|\"|'))?\s*\)", re.DOTALL)
+TEXT_FINAL_NONE_RE = re.compile(
+    rf"(?:{_FINAL_NONE_ALT})\(\s*(?:(?:\"\"\"|'''|\"|')(.*?)(?:\"\"\"|'''|\"|'))?\s*\)", re.DOTALL
+)
 
 # A sub client that cannot fit a slice reports it as an ordinary return string
 # (kvzip_backend._generate), which the root is free to ignore. Recognised here so
@@ -329,6 +377,9 @@ class RLM:
         run_timeout: Optional[float] = 900.0,
         max_sub_calls: Optional[int] = 40,
         subcall_deadline_check: bool = False,
+        min_sub_calls_before_abstain: int = 1,
+        max_unproductive_steps: int = 3,
+        max_error_steps: int = 3,
     ):
         self.root = root_client
         self.sub = sub_client or root_client
@@ -356,6 +407,24 @@ class RLM:
         # on because one code cell can loop over many multi-minute in-process
         # sub-calls without ever reaching the per-step check.
         self.subcall_deadline_check = subcall_deadline_check
+        # How many llm_query calls an abstention must be backed by. FINAL has to be
+        # earned (the grounding guard rejects a literal never seen in REPL output),
+        # but FINAL_NONE was free -- and "the answer is absent" is the one claim no
+        # output can ground, which made abstaining the cheapest way out of a hard
+        # example. On the LOFT-1m smoke, 5 of 6 abstentions came after a SINGLE
+        # failed substring search with zero sub-calls: the root had searched for the
+        # whole natural-language question as a literal string, found nothing (as it
+        # never could), and declared the document silent on the matter. 0 disables.
+        self.min_sub_calls_before_abstain = min_sub_calls_before_abstain
+        # Consecutive cells printing nothing before the run is broken out of. The
+        # repetition breaker only catches IDENTICAL code, which a model rambling in
+        # comments slips past while learning nothing (see the unproductive-step
+        # breaker in run). 0 disables.
+        self.max_unproductive_steps = max_unproductive_steps
+        # Consecutive cells raising before the run is broken out of. Neither of the
+        # other two breakers sees this: an exception counts as output, and broken
+        # code that changes between attempts is never an exact repeat. 0 disables.
+        self.max_error_steps = max_error_steps
         self._sub_call_budget: Optional[int] = None
         self._deadline: Optional[float] = None
         self.tok = TokenCounter(token_counter)
@@ -506,10 +575,11 @@ class RLM:
         env = {
             "context": context,
             "llm_query": llm_query,
-            "FINAL": FINAL,
-            "FINAL_NONE": FINAL_NONE,
             "re": re,
         }
+        # Case variants bound to the same callables (see FINAL_NAMES).
+        env.update({name: FINAL for name in FINAL_NAMES})
+        env.update({name: FINAL_NONE for name in FINAL_NONE_NAMES})
 
         if self.scratchpad is not None:
 
@@ -535,7 +605,7 @@ class RLM:
             final_box["value"] = str(env[key])
             final_box["done"] = True
 
-        env["FINAL_VAR"] = FINAL_VAR
+        env.update({name: FINAL_VAR for name in FINAL_VAR_NAMES})
         env["_final_box"] = final_box
         return env
 
@@ -591,7 +661,9 @@ class RLM:
                         if (
                             isinstance(node, ast.Call)
                             and isinstance(node.func, ast.Name)
-                            and node.func.id == "FINAL"
+                            # Every accepted spelling, or an aliased call would
+                            # carry a guessed literal past the grounding guard.
+                            and node.func.id in FINAL_NAMES
                             and node.args
                         ):
                             static = _static_string(node.args[0])
@@ -750,6 +822,8 @@ class RLM:
         nudges = 0
         last_code_norm: str | None = None  # repetition-breaker state (see below)
         repeat_count = 0
+        no_output_count = 0  # unproductive-step state (see below)
+        error_count = 0  # repeated-exception state (see below)
         seen_output = ""  # grounding accumulator — NEVER compacted, never truncated
 
         def _grounded(val: str) -> bool:
@@ -761,6 +835,15 @@ class RLM:
             labels in the prompt -- so that whole class of tasks had no guard at all.
             """
             return val in seen_output or _mentions(task, val)
+
+        def _abstention_earned() -> bool:
+            """Has this run read enough of the document to claim the answer is absent?
+
+            Absence is the one claim REPL output cannot ground, so it gets an effort
+            test rather than a grounding test: a run that never called llm_query has
+            not read the document at all, whatever its searches returned.
+            """
+            return metrics["sub_calls"] >= self.min_sub_calls_before_abstain
 
         def build_sent() -> tuple[list, int]:
             """Construct the bounded view actually sent to the root model."""
@@ -895,7 +978,22 @@ class RLM:
                 mn = TEXT_FINAL_NONE_RE.search(reply)
                 if mn:
                     # An abstention needs no grounding: "I found nothing" is exactly
-                    # the claim that cannot appear in the output it is about.
+                    # the claim that cannot appear in the output it is about. It does
+                    # need EFFORT, though -- see _abstention_earned.
+                    if not _abstention_earned() and nudges < 2:
+                        nudges += 1
+                        metrics["premature_abstentions"] = metrics.get("premature_abstentions", 0) + 1
+                        transcript.append(
+                            {
+                                "step": step,
+                                "reply": reply,
+                                "code": None,
+                                "observation": "[premature FINAL_NONE rejected]",
+                            }
+                        )
+                        full_history.append({"role": "assistant", "content": reply})
+                        full_history.append({"role": "user", "content": PREMATURE_ABSTAIN_NUDGE})
+                        continue
                     transcript.append(
                         {
                             "step": step,
@@ -1007,6 +1105,15 @@ class RLM:
             if env["_final_box"]["done"]:
                 val = env["_final_box"]["value"]
                 if env["_final_box"].get("abstained"):
+                    if not _abstention_earned() and nudges < 2:
+                        nudges += 1
+                        metrics["premature_abstentions"] = metrics.get("premature_abstentions", 0) + 1
+                        env["_final_box"]["done"] = False
+                        env["_final_box"]["abstained"] = False
+                        env["_final_box"]["reason"] = ""
+                        full_history.append({"role": "assistant", "content": reply})
+                        full_history.append({"role": "user", "content": PREMATURE_ABSTAIN_NUDGE})
+                        continue
                     metrics["abstain_reason"] = env["_final_box"].get("reason", "")
                     return RLMResult(None, step, True, transcript, "abstained", metrics)
                 if val in (env.get("_rlm_final_literals") or []) and not _grounded(val):
@@ -1045,7 +1152,38 @@ class RLM:
                 repeat_count = 1
                 last_code_norm = code_norm
 
-            if repeat_count >= 3:
+            # --- Unproductive-step breaker ---
+            # The repetition breaker keys on IDENTICAL code, which a model that
+            # rambles in comments defeats without ever learning anything: on the
+            # LOFT-1m smoke one example spent 11 of 13 steps emitting comment-only
+            # cells ("the correct dwarf is X -- no, actually Y -- no...") that printed
+            # nothing, each textually different, until run_timeout killed it 32
+            # minutes in. A cell that produces no output teaches the model nothing,
+            # so N of them in a row is the same dead end by another route.
+            # startswith, not ==: _exec appends note markers and the multi-block
+            # warning to the observation, and a cell that printed nothing is still
+            # unproductive with one of those stuck on the end.
+            if self.max_unproductive_steps and obs.strip().startswith("[no output]"):
+                no_output_count += 1
+            else:
+                no_output_count = 0
+
+            # --- Repeated-exception breaker ---
+            # The third route to the same dead end. An exception IS output, so the
+            # no-output counter resets on every one; and a model retrying slightly
+            # different broken code never repeats a cell exactly, so the repetition
+            # breaker does not fire either. On the LOFT-1m smoke one example threw on
+            # 34 of its 38 steps -- SyntaxError, then NameError on a mis-cased FINAL --
+            # and was only caught at step 37, by which point it had spent 73% of the
+            # entire run's tokens.
+            if self.max_error_steps and "[EXCEPTION]" in obs:
+                error_count += 1
+            else:
+                error_count = 0
+
+            unproductive = self.max_unproductive_steps and no_output_count >= self.max_unproductive_steps
+            erroring = self.max_error_steps and error_count >= self.max_error_steps
+            if repeat_count >= 3 or unproductive or erroring:
                 # Still looping after the nudge: answer from the real REPL output
                 # accumulated so far (grounded), plus the task. Bypasses FINAL()'s
                 # literal-grounding guard deliberately — this is the escape hatch.
@@ -1078,22 +1216,65 @@ class RLM:
                     fb_tokens = self.tok.count(fb_prompt)
                 metrics["sub_calls"] += 1
                 metrics["sub_call_tokens"] += fb_tokens + self.tok.count(ans)
+                if erroring:
+                    why = f"{error_count} consecutive cells that raised"
+                elif unproductive:
+                    why = f"{no_output_count} consecutive cells that printed nothing"
+                else:
+                    why = "3 identical code cells"
                 transcript.append(
                     {
                         "step": step,
                         "reply": "[repetition-breaker fallback]",
                         "code": None,
-                        "observation": "[forced grounded answer after 3 identical code cells]",
+                        "observation": f"[forced grounded answer after {why}]",
                         # The answer was extracted BY the harness, not chosen by the
                         # model, and it skipped the grounding guard. Triage must be
                         # able to tell these apart from answers the model committed to.
                         "forced": True,
                     }
                 )
-                return RLMResult(ans, step, True, transcript, "repetition_broken", metrics)
+                # Distinct end_reasons: all three are forced answers, but "went quiet",
+                # "kept crashing" and "got stuck on one cell" call for different fixes,
+                # and collapsing them would hide whichever dominates a campaign.
+                if erroring:
+                    end_reason = "error_loop_broken"
+                elif unproductive:
+                    end_reason = "unproductive_broken"
+                else:
+                    end_reason = "repetition_broken"
+                return RLMResult(ans, step, True, transcript, end_reason, metrics)
 
             full_history.append({"role": "assistant", "content": reply})
-            if repeat_count == 2:
+            if self.max_error_steps and error_count == self.max_error_steps - 1:
+                full_history.append(
+                    {
+                        "role": "user",
+                        "content": f"STOP: your last {error_count} code cells all raised an exception, so "
+                        "none of them ran. Read the traceback in the output above and fix the "
+                        "actual error before doing anything else. Write the SIMPLEST possible "
+                        "cell that works — one statement, e.g. "
+                        "print(context.lower().count('term')) — and build up from there once it "
+                        "runs. The terminal calls are FINAL(value), FINAL_NONE('reason') and "
+                        "FINAL_VAR('name'); case variants are accepted, but nothing else is.",
+                    }
+                )
+            elif self.max_unproductive_steps and no_output_count == self.max_unproductive_steps - 1:
+                full_history.append(
+                    {
+                        "role": "user",
+                        "content": f"STOP: your last {no_output_count} code cells printed NOTHING, so you "
+                        "have learned nothing from them. Commented-out reasoning and recalling "
+                        "facts from memory do not count — you cannot answer from memory here, "
+                        "only from text you have actually SEEN in a REPL output. Your next cell "
+                        "MUST call print() on something real: print(len(context)), "
+                        "print(context[:2000]) to see the format, or "
+                        "idx = context.lower().find(term.lower()); print(context[idx-200:idx+500]) "
+                        "for a distinctive term. If a term is genuinely absent, print that you "
+                        "checked it and try a DIFFERENT term.",
+                    }
+                )
+            elif repeat_count == 2:
                 full_history.append(
                     {
                         "role": "user",

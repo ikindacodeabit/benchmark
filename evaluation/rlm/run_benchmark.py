@@ -65,6 +65,9 @@ RESUME_CRITICAL_KEYS = (
     "exec_timeout",
     "run_timeout",
     "max_sub_calls",
+    "min_sub_calls_before_abstain",
+    "max_unproductive_steps",
+    "max_error_steps",
     "vanilla_char_limit",
     "vanilla_max_prompt_tokens",
     "sub_max_context_tokens",
@@ -447,6 +450,34 @@ def main() -> None:
         help="cap on llm_query calls per example; further calls return a notice instead of "
         "hitting the API. 0 disables",
     )
+    ap.add_argument(
+        "--min-sub-calls-before-abstain",
+        type=int,
+        default=1,
+        help="llm_query calls an abstention must be backed by; FINAL_NONE below this is "
+        "rejected with a nudge (at most twice, sharing the FINAL nudge budget) telling the "
+        "root to search distinctive keywords rather than the whole question. Guards the "
+        "cheapest way out of a hard example: claiming absence without having read anything. "
+        "0 disables",
+    )
+    ap.add_argument(
+        "--max-unproductive-steps",
+        type=int,
+        default=3,
+        help="consecutive code cells printing NOTHING before the run is broken out of with a "
+        "forced grounded answer (end_reason=unproductive_broken); nudged one step earlier. "
+        "The repetition breaker only catches identical code, which a model rambling in "
+        "comments slips past while learning nothing. 0 disables",
+    )
+    ap.add_argument(
+        "--max-error-steps",
+        type=int,
+        default=3,
+        help="consecutive code cells raising an exception before the run is broken out of "
+        "(end_reason=error_loop_broken); nudged one step earlier. Neither other breaker sees "
+        "this: an exception counts as output, and broken code that changes between attempts "
+        "is never an exact repeat. 0 disables",
+    )
     # --- Sub-call backend (arm 4: KV-compressed sub-calls; see kvzip_backend.py) ---
     # `http` keeps today's behavior: sub-calls go to the same OpenAI-compatible
     # server as the root. `kvzip` loads the sub model IN-PROCESS through
@@ -658,6 +689,9 @@ def main() -> None:
         # In-process sub-calls can take minutes each; without an in-call check a
         # single code cell looping over slices sails past the per-step deadline.
         subcall_deadline_check=(args.sub_backend == "kvzip"),
+        min_sub_calls_before_abstain=args.min_sub_calls_before_abstain,
+        max_unproductive_steps=args.max_unproductive_steps,
+        max_error_steps=args.max_error_steps,
     )
 
     for mode in modes:
@@ -854,6 +888,9 @@ def build_run_config(
         "exec_timeout": args.exec_timeout or None,
         "run_timeout": args.run_timeout or None,
         "max_sub_calls": args.max_sub_calls or None,
+        "min_sub_calls_before_abstain": args.min_sub_calls_before_abstain,
+        "max_unproductive_steps": args.max_unproductive_steps,
+        "max_error_steps": args.max_error_steps,
         "no_think": bool(args.no_think),
         "sub_backend": args.sub_backend,
         "press": args.press if args.sub_backend == "kvzip" else None,
