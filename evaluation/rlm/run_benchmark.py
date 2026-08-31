@@ -19,14 +19,19 @@ from typing import Any
 import pandas as pd
 import yaml
 
-from evaluation.benchmarks.registry import LOFT_TASKS, RULER_32K_TASKS, SCORER_REGISTRY
+from evaluation.benchmarks.registry import LOFT_TASKS, LONGBENCH_128K_SUBSETS, RULER_32K_TASKS, SCORER_REGISTRY
 from evaluation.benchmarks.results import score_prediction_frame
 from evaluation.results_layout import RLM_RESULTS_DIR
 
 from .client import LLMClient
 from .datasets import available_datasets, canonical_dataset_name, load_examples
 from .rlm import RLM, MemoryBudget, Scratchpad, vanilla_answer
-from .sizing import DEFAULT_RESERVE_TOKENS
+from .sizing import (
+    DEFAULT_RESERVE_TOKENS,
+    FIXED_CHUNK_CHAR_OVERSHOOT,
+    compression_ratio_from_factor,
+    fixed_chunk_char_cap,
+)
 
 # The historical hand-picked chunk size. Named because it is compared against in
 # build_run_dir_components as well as being the argparse default -- as two separate
@@ -84,8 +89,38 @@ RESUME_CRITICAL_KEYS = (
     "memory_budget",
     "scratchpad",
     "target_compression_ratio",
+    "compression_factor",
+    "fixed_chunk",
     "no_think",
 )
+
+
+def resolve_compression_target(args: argparse.Namespace) -> float | None:
+    """Validate sizing flags and return the ratio used by the existing planner."""
+    auto_chunk = args.max_subcall_chars == "auto"
+    factor = getattr(args, "compression_factor", None)
+    ratio = getattr(args, "target_compression_ratio", None)
+    fixed_chunk = bool(getattr(args, "fixed_chunk", False))
+
+    if factor is not None and ratio is not None:
+        raise ValueError("--compression-factor and --target-compression-ratio are mutually exclusive")
+    if factor is not None:
+        ratio = compression_ratio_from_factor(factor)
+    if fixed_chunk and (args.sub_backend != "kvzip" or not auto_chunk):
+        raise ValueError("--fixed-chunk requires --sub-backend kvzip and --max-subcall-chars auto")
+    if auto_chunk and args.sub_backend != "kvzip":
+        raise ValueError("--max-subcall-chars auto requires --sub-backend kvzip (the http path has no KV budget)")
+    if auto_chunk and ratio is None:
+        raise ValueError("--max-subcall-chars auto requires --compression-factor or --target-compression-ratio")
+    if ratio is not None:
+        if not auto_chunk:
+            raise ValueError("compression factor/target ratio only applies with --max-subcall-chars auto")
+        if not 0.0 <= ratio < 1.0:
+            raise ValueError("--target-compression-ratio must be in [0.0, 1.0)")
+    if fixed_chunk:
+        if getattr(args, "min_subcall_chars", 0):
+            raise ValueError("--fixed-chunk derives its own floor; do not also pass --min-subcall-chars")
+    return ratio
 
 
 def resume_conflicts(run_dir: Path, config: dict) -> list[str]:
@@ -272,6 +307,14 @@ def write_run_artifacts(
             expanded = sum(m.get("sub_slices_expanded", 0) for m in scored_frame["metrics"] if isinstance(m, dict))
             runtime["sub_slice_expanded_fraction"] = float(expanded / total_calls)
 
+        rlm_metrics = [m for m in scored_frame["metrics"] if isinstance(m, dict)]
+        runtime["sub_slice_unlocatable_calls"] = int(sum(m.get("sub_slice_unlocatable_calls", 0) for m in rlm_metrics))
+        coverage = [
+            m.get("document_coverage_fraction") for m in rlm_metrics if m.get("document_coverage_fraction") is not None
+        ]
+        if coverage:
+            runtime["document_coverage_fraction"] = float(sum(coverage) / len(coverage))
+
     # Sub-side KV retention: the direct analogue of KVPress's
     # `average_retained_context_tokens`, but measured over llm_query sub-calls --
     # "how much of each context slice did the sub model effectively attend to".
@@ -292,6 +335,13 @@ def write_run_artifacts(
             )
             runtime["average_sub_compression_ratio"] = float(
                 sum(s.get("average_compression_ratio", 0.0) for s in sub_kv) / n_kv
+            )
+            average_ratio = runtime["average_sub_compression_ratio"]
+            runtime["realized_compression_factor"] = float(1.0 / (1.0 - average_ratio)) if average_ratio < 1.0 else None
+            runtime["sub_context_tokens_on_target_fraction"] = (
+                float(sum(s.get("context_tokens_on_target_calls", 0) for s in sub_kv) / total_calls)
+                if total_calls
+                else 0.0
             )
             # How often the root actually used the two-arg form. Near 0 means the
             # arm degenerated to dense one-arg calls and is NOT measuring the press.
@@ -374,14 +424,17 @@ def build_run_dir_components(args: argparse.Namespace, mode: str, scratchpad: Sc
     # A floor changes both the prompt and the slices, so a floored run must never
     # share a checkpoint with the unfloored run of the same subset. Only stamped
     # when non-zero, so every existing run directory keeps its name.
-    if mode == "rlm" and getattr(args, "min_subcall_chars", 0):
+    if mode == "rlm" and getattr(args, "min_subcall_chars", 0) and not getattr(args, "fixed_chunk", False):
         components.append(f"min{args.min_subcall_chars}")
     # After the `sub` component, so every hand-sized slug stays byte-identical to
     # what it was before auto-sizing existed. This marker is the ONLY thing
     # separating an auto run that happens to resolve to exactly the default size
     # from the hand-sized default -- neither carries a `sub<N>` component.
     if mode == "rlm" and sizing_mode == "auto":
-        components.append(f"autosub{args.target_compression_ratio:g}")
+        factor = getattr(args, "compression_factor", None)
+        components.append(f"autosubx{factor:g}" if factor is not None else f"autosub{args.target_compression_ratio:g}")
+    if mode == "rlm" and getattr(args, "fixed_chunk", False):
+        components.append("fixed")
     return components
 
 
@@ -543,7 +596,7 @@ def main() -> None:
     ap.add_argument(
         "--memory-budget-unit",
         default="GB",
-        choices=["MB", "GB"],
+        choices=["MB", "GB", "tokens"],
         help="unit for --memory-budget (kvzip backend)",
     )
     ap.add_argument(
@@ -568,7 +621,8 @@ def main() -> None:
         "Required for the KV-compression arm to measure anything: a slice under "
         "--press-min-tokens skips the press entirely",
     )
-    ap.add_argument(
+    compression_target = ap.add_mutually_exclusive_group()
+    compression_target.add_argument(
         "--target-compression-ratio",
         type=float,
         default=None,
@@ -576,6 +630,20 @@ def main() -> None:
         "when the root fills it (chunk = token_budget / (1 - ratio)). This only sets the size "
         "advertised to the root -- the press still derives each call's actual ratio from the "
         "slice the root really sent, reported as runtime.average_sub_compression_ratio",
+    )
+    compression_target.add_argument(
+        "--compression-factor",
+        type=float,
+        default=None,
+        help="with --max-subcall-chars auto: human-readable chunk/retained-token factor; "
+        "converted to ratio = 1 - 1/factor. A factor of 1 is uncompressed",
+    )
+    ap.add_argument(
+        "--fixed-chunk",
+        action="store_true",
+        help="make the auto-sized chunk exact: derive an oversized character floor, reserve "
+        "question room in the character cap, and token-truncate every sub-call to the "
+        "budget-derived chunk. Fails if the model window or GPU cap would shrink the cell",
     )
     ap.add_argument(
         "--subcall-reserve-tokens",
@@ -639,21 +707,16 @@ def main() -> None:
     # _load_loft after the clients are already built.
     if dataset_name == "loft" and args.data_dir not in LOFT_TASKS:
         ap.error("--dataset loft requires --data-dir with one of: " + ", ".join(LOFT_TASKS))
+    if dataset_name == "longbench128k" and args.data_dir not in LONGBENCH_128K_SUBSETS:
+        ap.error("--dataset longbench128k requires --data-dir with one of: " + ", ".join(LONGBENCH_128K_SUBSETS))
 
     # --- auto chunk sizing: validate the combination before anything expensive ---
     auto_chunk = args.max_subcall_chars == "auto"
     args.subcall_sizing_mode = "auto" if auto_chunk else "fixed"
-    if auto_chunk and args.sub_backend != "kvzip":
-        # The http path has no KV budget, no press and no local tokenizer, so a
-        # derived size would be a fabricated number recorded in config.yaml.
-        ap.error("--max-subcall-chars auto requires --sub-backend kvzip (the http path has no KV budget)")
-    if auto_chunk and args.target_compression_ratio is None:
-        ap.error("--max-subcall-chars auto requires --target-compression-ratio")
-    if args.target_compression_ratio is not None:
-        if not auto_chunk:
-            ap.error("--target-compression-ratio only applies with --max-subcall-chars auto")
-        if not 0.0 <= args.target_compression_ratio < 1.0:
-            ap.error("--target-compression-ratio must be in [0.0, 1.0)")
+    try:
+        args.target_compression_ratio = resolve_compression_target(args)
+    except ValueError as exc:
+        ap.error(str(exc))
     if args.min_subcall_chars < 0:
         ap.error("--min-subcall-chars must be >= 0 (0 disables the floor)")
     # A floor above the ceiling is silently self-cancelling: _expand_subcall widens
@@ -708,13 +771,25 @@ def main() -> None:
             target_compression_ratio=args.target_compression_ratio,
             cli_max_context_tokens=args.sub_max_context_tokens,
             reserve_tokens=args.subcall_reserve_tokens,
+            char_overshoot=(FIXED_CHUNK_CHAR_OVERSHOOT if args.fixed_chunk else 1.0),
+            require_budget_binding=args.fixed_chunk,
+            # In fixed mode this value is the OUTPUT of planning (N), not an
+            # input cap. Applying the legacy 34K ceiling here would silently
+            # collapse every larger grid cell before N could be installed.
+            apply_cli_context_cap=not args.fixed_chunk,
         )
-        args.max_subcall_chars = subcall_sizing.chars
+        if args.fixed_chunk:
+            args.min_subcall_chars = subcall_sizing.chars
+            args.max_subcall_chars = fixed_chunk_char_cap(args.min_subcall_chars)
+            args.sub_max_context_tokens = subcall_sizing.tokens
+            sub.max_context_tokens = subcall_sizing.tokens
+        else:
+            args.max_subcall_chars = subcall_sizing.chars
         # A target ratio is only actually delivered when the KV BUDGET is what
         # limits the chunk. If the sub model's window or --sub-max-context-tokens
         # binds first, the run silently measures a different ratio than the one
         # asked for, and only runtime.subcall_sizing_binding records it.
-        if subcall_sizing.binding != "budget":
+        if not args.fixed_chunk and subcall_sizing.binding != "budget":
             print(
                 f"!! --target-compression-ratio {args.target_compression_ratio:g} is NOT what this run "
                 f"will deliver: the chunk size is limited by {subcall_sizing.binding!r} "
@@ -973,6 +1048,8 @@ def build_run_config(
         # check compares against.
         "subcall_sizing_mode": args.subcall_sizing_mode,
         "target_compression_ratio": args.target_compression_ratio,
+        "compression_factor": args.compression_factor,
+        "fixed_chunk": bool(args.fixed_chunk),
         "max_subcall_chars_resolved": args.max_subcall_chars,
         "subcall_sizing": asdict(subcall_sizing) if subcall_sizing else None,
         "sub_max_tokens": args.sub_max_tokens if args.sub_backend == "kvzip" else None,

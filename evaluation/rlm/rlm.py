@@ -579,6 +579,23 @@ class RLM:
         # `llm_query`'s second parameter is also called `context` and shadows the
         # document inside it, so bind the document under a name the closure keeps.
         document = context
+        coverage_spans: list[tuple[int, int]] = []
+
+        def record_coverage(start: int, end: int) -> None:
+            """Merge one real document span and expose the union as a fraction."""
+            coverage_spans.append((start, end))
+            covered = 0
+            current_start = current_end = -1
+            for span_start, span_end in sorted(coverage_spans):
+                if span_start > current_end:
+                    if current_end >= 0:
+                        covered += current_end - current_start
+                    current_start, current_end = span_start, span_end
+                else:
+                    current_end = max(current_end, span_end)
+            if current_end >= 0:
+                covered += current_end - current_start
+            metrics["document_coverage_fraction"] = covered / len(document) if document else 0.0
 
         def llm_query(prompt: str, context: str | None = None) -> str:
             # Key on the FULL strings. Keying on the TRUNCATED ones makes two
@@ -599,8 +616,14 @@ class RLM:
             # sub_calls alone, so counting here would let the expanded FRACTION
             # exceed 1.0.
             expanded = False
+            needs_expansion = bool(
+                chunk
+                and self.min_subcall_chars > 0
+                and len(chunk) < min(self.min_subcall_chars, len(document))
+            )
             if chunk is not None:
                 chunk, expanded = self._expand_subcall(chunk, document)
+            unlocatable = needs_expansion and not expanded
             key = (question, chunk)
             if self.cache_subcalls and key in cache:
                 metrics["sub_cache_hits"] += 1
@@ -635,6 +658,11 @@ class RLM:
                 question = f"{question}\n\n{chunk}"
                 chunk = None
             question, chunk, truncated = self._cap_subcall(question, chunk)
+            document_span = None
+            if chunk is not None:
+                start = document.find(chunk)
+                if start >= 0:
+                    document_span = (start, start + len(chunk))
             if truncated:
                 # Always on the QUESTION side: on the split path the context slice
                 # is what gets compressed, and a notice buried there can be evicted.
@@ -677,6 +705,8 @@ class RLM:
             metrics["sub_calls"] += 1
             if expanded:
                 metrics["sub_slices_expanded"] = metrics.get("sub_slices_expanded", 0) + 1
+            if unlocatable:
+                metrics["sub_slice_unlocatable_calls"] = metrics.get("sub_slice_unlocatable_calls", 0) + 1
             metrics["sub_call_tokens"] += (
                 self.tok.count(question) + (self.tok.count(chunk) if chunk else 0) + self.tok.count(ans)
             )
@@ -695,6 +725,8 @@ class RLM:
                 # neighbours free memory, and caching would make the failure permanent.
                 metrics["sub_fit_failures"] = metrics.get("sub_fit_failures", 0) + 1
                 return ans
+            if document_span is not None:
+                record_coverage(*document_span)
             if self.cache_subcalls:
                 cache[key] = ans
             return ans
@@ -913,6 +945,8 @@ class RLM:
             # .get(..., 0) + 1, it was absent from a healthy run's metrics and
             # downstream aggregation had to special-case its absence.
             "sub_fit_failures": 0,
+            "sub_slice_unlocatable_calls": 0,
+            "document_coverage_fraction": 0.0,
             "evictions": 0,
             "overflow_evictions": 0,
             "budget": (self.budget.max_context_tokens if self.budget else None),

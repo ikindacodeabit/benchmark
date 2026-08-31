@@ -26,6 +26,7 @@ MEMORY_UNIT_TO_BYTES = {
     "MB": 1000**2,
     "GB": 1000**3,
 }
+TOKEN_MEMORY_UNIT = "TOKENS"
 
 
 def compute_token_budget_from_memory(
@@ -46,13 +47,17 @@ def compute_token_budget_from_memory(
         raise ValueError(f"memory_budget must be positive, got {memory_budget}")
 
     normalized_unit = memory_budget_unit.strip().upper()
-    if normalized_unit not in MEMORY_UNIT_TO_BYTES:
-        supported_units = ", ".join(MEMORY_UNIT_TO_BYTES)
+    if normalized_unit not in {*MEMORY_UNIT_TO_BYTES, TOKEN_MEMORY_UNIT}:
+        supported_units = ", ".join((*MEMORY_UNIT_TO_BYTES, TOKEN_MEMORY_UNIT))
         raise ValueError(f"Unsupported memory_budget_unit={memory_budget_unit!r}. Supported units: {supported_units}")
 
     bytes_per_token = get_model_adapter(model).kv_bytes_per_token(model, batch_size)
-    memory_budget_bytes = int(memory_budget * MEMORY_UNIT_TO_BYTES[normalized_unit])
-    token_budget = int(memory_budget_bytes // bytes_per_token)
+    if normalized_unit == TOKEN_MEMORY_UNIT:
+        token_budget = int(memory_budget)
+        memory_budget_bytes = token_budget * bytes_per_token
+    else:
+        memory_budget_bytes = int(memory_budget * MEMORY_UNIT_TO_BYTES[normalized_unit])
+        token_budget = int(memory_budget_bytes // bytes_per_token)
     if token_budget < 1:
         raise ValueError(
             f"A {memory_budget:g} {memory_budget_unit} KV budget is smaller than one KV token "

@@ -32,6 +32,7 @@ directory name depends on these types on every path.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Sequence
 
@@ -58,6 +59,12 @@ DEFAULT_RESERVE_TOKENS = 1024
 # (press_min_tokens) and the root is better off reading the slice itself.
 DEFAULT_MIN_TOKENS = 1024
 
+# Fixed-grid mode deliberately overshoots the calibrated character estimate so
+# the backend's exact token cap, rather than natural chars/token variance, decides
+# how many context tokens reach the model.
+FIXED_CHUNK_CHAR_OVERSHOOT = 1.15
+FIXED_CHUNK_QUESTION_ALLOWANCE_CHARS = 4000
+
 
 @dataclass(frozen=True)
 class SubcallSizing:
@@ -79,6 +86,7 @@ class SubcallSizing:
     uncompressed_tokens: int  # what the budget alone asked for, before clamping
     chars_per_token: float
     chars_per_token_source: str  # "calibrated" | "clamped" | "fallback"
+    char_overshoot: float
     realized_ratio_if_filled: float
     caps: dict = field(default_factory=dict)
 
@@ -88,8 +96,33 @@ class SubcallSizing:
             f"{self.chars} chars ({self.tokens} tok), binding={self.binding}, "
             f"budget={self.token_budget} tok, target_ratio={self.target_compression_ratio:g}, "
             f"ratio_if_filled={self.realized_ratio_if_filled:.3f}, "
-            f"chars/token={self.chars_per_token:.2f} ({self.chars_per_token_source})"
+            f"chars/token={self.chars_per_token:.2f} ({self.chars_per_token_source}), "
+            f"char_overshoot={self.char_overshoot:.3f}"
         )
+
+
+def compression_ratio_from_factor(compression_factor: float) -> float:
+    """Convert a human-readable ``Nx`` compression factor to a press ratio."""
+    if compression_factor < 1.0:
+        raise ValueError(f"compression_factor must be >= 1, got {compression_factor}")
+    return 1.0 - (1.0 / compression_factor)
+
+
+def fixed_chunk_char_cap(
+    floor_chars: int,
+    question_allowance_chars: int = FIXED_CHUNK_QUESTION_ALLOWANCE_CHARS,
+) -> int:
+    """Cap that leaves ``floor_chars`` available after the 1/4 question share.
+
+    :meth:`RLM._cap_subcall` gives a long question at most one quarter of the
+    total character budget. The 4/3 expansion therefore guarantees that at
+    least ``floor_chars + question_allowance_chars`` remain for the slice.
+    """
+    if floor_chars < 1:
+        raise ValueError(f"floor_chars must be positive, got {floor_chars}")
+    if question_allowance_chars < 0:
+        raise ValueError("question_allowance_chars must be non-negative")
+    return math.ceil((floor_chars + question_allowance_chars) * 4 / 3)
 
 
 def gpu_fit_token_cap(
@@ -174,6 +207,8 @@ def size_subcall_chunk(
     gpu_free_bytes: Optional[int] = None,
     reserve_tokens: int = DEFAULT_RESERVE_TOKENS,
     min_tokens: int = DEFAULT_MIN_TOKENS,
+    char_overshoot: float = 1.0,
+    require_budget_binding: bool = False,
 ) -> SubcallSizing:
     """Resolve the advertised sub-call chunk size.
 
@@ -194,6 +229,8 @@ def size_subcall_chunk(
         raise ValueError(f"token_budget must be positive, got {token_budget}")
     if chars_per_token <= 0:
         raise ValueError(f"chars_per_token must be positive, got {chars_per_token}")
+    if char_overshoot < 1.0:
+        raise ValueError(f"char_overshoot must be >= 1, got {char_overshoot}")
 
     # target 0.0 degenerates to the budget itself: a chunk that fits uncompressed.
     uncompressed_tokens = int(token_budget // (1.0 - target_compression_ratio))
@@ -205,13 +242,19 @@ def size_subcall_chunk(
         # the GPU provably cannot serve.
         "sub_window": None if sub_window_tokens is None else max(0, sub_window_tokens - reserve_tokens),
         "cli_cap": None if cli_max_context_tokens is None else max(0, cli_max_context_tokens - reserve_tokens),
-        "gpu_fit": (
-            None if gpu_free_bytes is None else gpu_fit_token_cap(gpu_free_bytes, kv_bytes_per_token)
-        ),
+        "gpu_fit": (None if gpu_free_bytes is None else gpu_fit_token_cap(gpu_free_bytes, kv_bytes_per_token)),
     }
     live = {name: value for name, value in caps.items() if value is not None}
     binding = min(live, key=lambda name: live[name])
     tokens = live[binding]
+
+    if require_budget_binding and binding != "budget":
+        table = ", ".join(f"{name}={value}" for name, value in caps.items())
+        raise RuntimeError(
+            f"fixed-chunk grid requires the KV budget to bind, but {binding!r} limited "
+            f"the chunk to {tokens} tokens. Caps considered: {table}. This cell would "
+            "silently become a different grid cell, so it will not run."
+        )
 
     if tokens < min_tokens:
         # Every cap is implausibly tight (a nearly-full GPU, a tiny window).
@@ -226,7 +269,7 @@ def size_subcall_chunk(
         )
 
     return SubcallSizing(
-        chars=int(tokens * chars_per_token),
+        chars=math.ceil(tokens * chars_per_token * char_overshoot),
         tokens=tokens,
         binding=binding,
         target_compression_ratio=target_compression_ratio,
@@ -237,6 +280,7 @@ def size_subcall_chunk(
         uncompressed_tokens=uncompressed_tokens,
         chars_per_token=chars_per_token,
         chars_per_token_source=chars_per_token_source,
+        char_overshoot=char_overshoot,
         # What the press would report IF the root filled the chunk. Same formula as
         # the pipeline's _compute_context_compression_ratio, so the two agree.
         realized_ratio_if_filled=1.0 - (min(tokens, token_budget) / tokens),

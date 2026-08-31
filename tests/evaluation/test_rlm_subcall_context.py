@@ -20,6 +20,7 @@ from evaluation.rlm.rlm import (
     RLM,
     SUB_SYSTEM_PROMPT,
 )
+from evaluation.rlm.sizing import fixed_chunk_char_cap
 
 
 class FakeClient:
@@ -300,9 +301,11 @@ def test_a_payload_the_root_assembled_is_left_alone():
     text to the root's question."""
     sub = FakeSplitClient()
     rlm = _floored(sub, 8192)
-    llm_query, _, _ = _llm_query(rlm, document=DOC)
+    llm_query, metrics, _ = _llm_query(rlm, document=DOC)
     llm_query("what?", "text the root built by concatenating fragments")
     assert len(sub.split_calls[0]["context"]) == len("text the root built by concatenating fragments")
+    assert metrics["sub_slice_unlocatable_calls"] == 1
+    assert metrics.get("document_coverage_fraction", 0.0) == 0.0
 
 
 def test_a_slice_already_over_the_floor_is_untouched():
@@ -353,6 +356,32 @@ def test_expansion_is_counted_and_payload_size_is_recorded():
     assert metrics["sub_slices_expanded"] == 1
     assert metrics["sub_payload_chars"] == 8192 + 20000
     assert metrics["sub_payload_chars_max"] == 20000
+
+
+def test_fixed_cap_arithmetic_never_squeezes_the_expanded_floor():
+    floor = 8192
+    sub = FakeSplitClient()
+    rlm = _floored(sub, floor, max_subcall_chars=fixed_chunk_char_cap(floor))
+    llm_query, _, _ = _llm_query(rlm, document=DOC)
+
+    llm_query("q" * 100_000, DOC[:100])
+
+    assert len(sub.split_calls[0]["context"]) == floor
+
+
+def test_document_coverage_merges_overlapping_spans():
+    sub = FakeSplitClient(replies=["first", "second"])
+    rlm = _floored(sub, 1000)
+    llm_query, metrics, _ = _llm_query(rlm, document=DOC)
+    llm_query("first?", DOC[1000:1100])
+    llm_query("second?", DOC[1200:1300])
+
+    spans = []
+    for call in sub.split_calls:
+        start = DOC.find(call["context"])
+        spans.append((start, start + len(call["context"])))
+    expected_union = max(end for _, end in spans) - min(start for start, _ in spans)
+    assert metrics["document_coverage_fraction"] == expected_union / len(DOC)
 
 
 def test_expansion_is_counted_only_when_the_call_actually_happens():

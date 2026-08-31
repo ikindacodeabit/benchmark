@@ -17,7 +17,13 @@ import yaml
 
 from evaluation.rlm import run_benchmark as rb
 from evaluation.rlm.rlm import Scratchpad, vanilla_answer
-from evaluation.rlm.run_benchmark import build_run_dir_components, load_done, resume_conflicts, write_run_artifacts
+from evaluation.rlm.run_benchmark import (
+    build_run_dir_components,
+    load_done,
+    resolve_compression_target,
+    resume_conflicts,
+    write_run_artifacts,
+)
 
 
 def _checkpoint(records: list[dict]) -> tuple[Path, Path]:
@@ -131,6 +137,12 @@ class ResumeGuardTest(unittest.TestCase):
         run_dir = self._run_dir(limit=110, max_steps=50, sub_model="a/b")
         self.assertEqual(resume_conflicts(run_dir, {"limit": 110, "max_steps": 50, "sub_model": "a/b"}), [])
 
+    def test_fixed_grid_axes_are_resume_critical(self):
+        run_dir = self._run_dir(fixed_chunk=True, compression_factor=8)
+        conflicts = resume_conflicts(run_dir, {"fixed_chunk": True, "compression_factor": 16})
+        self.assertEqual(len(conflicts), 1)
+        self.assertIn("compression_factor", conflicts[0])
+
     def test_a_missing_config_does_not_block_a_resume(self):
         """Checkpoints written before config.yaml was saved up front are still
         resumable -- the guard reports what it can prove, not what it assumes."""
@@ -165,6 +177,9 @@ def _args(**overrides) -> argparse.Namespace:
         max_subcall_chars=32000,
         subcall_sizing_mode="fixed",
         target_compression_ratio=None,
+        compression_factor=None,
+        fixed_chunk=False,
+        min_subcall_chars=0,
     )
     base.update(overrides)
     return argparse.Namespace(**base)
@@ -218,6 +233,35 @@ class RunDirComponentsTest(unittest.TestCase):
         second = build_run_dir_components(_args(**auto, max_subcall_chars=99000), "rlm", None)
         self.assertEqual(first, second)
 
+    def test_fixed_factor_grid_has_human_readable_axes(self):
+        args = _args(
+            dataset="longbench128k",
+            data_dir="narrativeqa",
+            sub_backend="kvzip",
+            press="kvzip",
+            memory_budget=8192,
+            memory_budget_unit="tokens",
+            subcall_sizing_mode="auto",
+            target_compression_ratio=0.9375,
+            compression_factor=16,
+            fixed_chunk=True,
+            max_subcall_chars=769047,
+            min_subcall_chars=572785,
+        )
+        self.assertEqual(
+            build_run_dir_components(args, "rlm", Scratchpad()),
+            [
+                "longbench128k",
+                "narrativeqa",
+                "Qwen_Qwen3-4B-Instruct-2507",
+                "rlm",
+                "scratchpad",
+                "kvzip-kvzip8192tokens",
+                "autosubx16",
+                "fixed",
+            ],
+        )
+
     def test_a_split_filter_gets_its_own_directory(self):
         """A dev-split smoke run must not resume into the real run's checkpoint --
         but `all` adds nothing, so existing directories keep their names."""
@@ -234,6 +278,42 @@ class RunDirComponentsTest(unittest.TestCase):
             build_run_dir_components(args, "vanilla", Scratchpad()),
             ["loft", "nq_128k", "Qwen_Qwen3-4B-Instruct-2507", "vanilla"],
         )
+
+
+class FixedChunkFlagTest(unittest.TestCase):
+    def test_factor_is_converted_to_the_existing_ratio_axis(self):
+        args = _args(
+            sub_backend="kvzip",
+            max_subcall_chars="auto",
+            compression_factor=8,
+            fixed_chunk=True,
+        )
+        self.assertEqual(resolve_compression_target(args), 0.875)
+
+    def test_fixed_chunk_requires_auto_kvzip_and_owns_its_floor(self):
+        with self.assertRaisesRegex(ValueError, "requires --sub-backend kvzip"):
+            resolve_compression_target(_args(fixed_chunk=True, compression_factor=2))
+        with self.assertRaisesRegex(ValueError, "derives its own floor"):
+            resolve_compression_target(
+                _args(
+                    sub_backend="kvzip",
+                    max_subcall_chars="auto",
+                    compression_factor=2,
+                    fixed_chunk=True,
+                    min_subcall_chars=100,
+                )
+            )
+
+    def test_factor_and_ratio_are_mutually_exclusive_even_for_programmatic_callers(self):
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            resolve_compression_target(
+                _args(
+                    sub_backend="kvzip",
+                    max_subcall_chars="auto",
+                    compression_factor=2,
+                    target_compression_ratio=0.5,
+                )
+            )
 
 
 class SubKvAggregationTest(unittest.TestCase):
@@ -254,6 +334,7 @@ class SubKvAggregationTest(unittest.TestCase):
                 {
                     "calls": 4,
                     "split_calls": 3,
+                    "context_tokens_on_target_calls": 4,
                     "average_context_tokens": 8000.0,
                     "average_retained_context_tokens": 4000.0,
                     "average_compression_ratio": 0.5,
@@ -264,6 +345,7 @@ class SubKvAggregationTest(unittest.TestCase):
                 {
                     "calls": 2,
                     "split_calls": 0,
+                    "context_tokens_on_target_calls": 1,
                     "average_context_tokens": 6000.0,
                     "average_retained_context_tokens": 3000.0,
                     "average_compression_ratio": 0.5,
@@ -279,11 +361,24 @@ class SubKvAggregationTest(unittest.TestCase):
         self.assertAlmostEqual(runtime["average_sub_retained_context_tokens"], 3500.0)
         self.assertAlmostEqual(runtime["average_sub_compression_ratio"], 0.5)
         self.assertAlmostEqual(runtime["sub_split_call_fraction"], 0.5)
+        self.assertAlmostEqual(runtime["realized_compression_factor"], 2.0)
+        self.assertAlmostEqual(runtime["sub_context_tokens_on_target_fraction"], 5 / 6)
 
     def test_runs_without_sub_kv_report_nothing(self):
         path, run_dir = _checkpoint([_answered("a", "x", "x")])
         metrics = write_run_artifacts(path, run_dir, "synthetic_kv_32k", {"backend": "rlm"})
         self.assertNotIn("average_sub_retained_context_tokens", metrics["runtime"])
+
+    def test_fixed_read_health_metrics_are_aggregated(self):
+        records = [_answered("a", "x", "x"), _answered("b", "x", "x")]
+        records[0]["metrics"].update(document_coverage_fraction=0.75, sub_slice_unlocatable_calls=2)
+        records[1]["metrics"].update(document_coverage_fraction=0.25, sub_slice_unlocatable_calls=1)
+        path, run_dir = _checkpoint(records)
+
+        metrics = write_run_artifacts(path, run_dir, "synthetic_kv_32k", {"backend": "rlm"})
+
+        self.assertEqual(metrics["runtime"]["sub_slice_unlocatable_calls"], 3)
+        self.assertEqual(metrics["runtime"]["document_coverage_fraction"], 0.5)
 
 
 class _ContextOverflow(Exception):

@@ -8,12 +8,14 @@ backends that do not use pandas during inference.
 """
 
 import logging
+import os
+from pathlib import Path
 from typing import Any, Iterator, Mapping, Optional
 
 import pandas as pd
 from datasets import load_dataset
 
-from evaluation.benchmarks.registry import RULER_32K_TASKS
+from evaluation.benchmarks.registry import LONGBENCH_128K_SUBSETS, RULER_32K_TASKS
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +61,27 @@ def _load_loft(task: str) -> pd.DataFrame:
         raise ValueError(f"Missing required columns: {missing_columns}")
 
     print(f"  ✓ Loaded {len(df)} LOFT samples from {task}")
+    return df
+
+
+def _load_longbench128k(task: str) -> pd.DataFrame:
+    """Load one locally built, uniformly padded LongBench-128K subset."""
+    if task not in LONGBENCH_128K_SUBSETS:
+        valid = ", ".join(LONGBENCH_128K_SUBSETS)
+        raise ValueError(f"Unknown LongBench-128K subset {task!r}; expected one of: {valid}")
+
+    data_root = Path(os.environ.get("RLM_DATA_DIR", os.path.expanduser("~/rlm_data")))
+    parquet_path = data_root / "longbench128k" / task / "data.parquet"
+    if not parquet_path.exists():
+        raise FileNotFoundError(
+            f"{parquet_path} is missing; build the local pack with "
+            "python -m evaluation.benchmarks.longbench128k.build_dataset"
+        )
+    df = pd.read_parquet(parquet_path)
+    required = {"context", "question", "answers", "all_classes", "task", "gold_depth"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"LongBench-128K parquet is missing columns: {sorted(missing)}")
     return df
 
 
@@ -155,6 +178,8 @@ def load_benchmark_dataset(
 
     if dataset_name == "loft":
         df = _load_loft(_require_task(dataset_name, task))
+    elif dataset_name == "longbench128k":
+        df = _load_longbench128k(_require_task(dataset_name, task))
     elif dataset_name in {"synthetic_kv", "synthetic_kv_32k"}:
         df = _load_synthetic_kv(
             dataset_name,
@@ -197,9 +222,16 @@ def _scoring_fields_from_row(row: Mapping[str, Any], answers: list[str]) -> dict
         raw_answer = raw_answer.tolist()
 
     fields: dict[str, Any] = {"answer": raw_answer, "answers": answers}
-    for name in ("all_classes", "difficulty", "length"):
+    for name in ("all_classes", "difficulty", "length", "gold_depth"):
         value = row.get(name)
         if value is None:
+            # LongBench's QA rows explicitly carry all_classes=null. Its scorer
+            # still indexes that column before dispatching to qa_f1_score, so
+            # dropping the field turns a valid QA run into a KeyError at final
+            # scoring time. Preserve an explicit null; continue ignoring fields
+            # that are genuinely absent from the source schema.
+            if name == "all_classes" and name in row:
+                fields[name] = None
             continue
         if hasattr(value, "tolist") and not isinstance(value, str):
             value = value.tolist()

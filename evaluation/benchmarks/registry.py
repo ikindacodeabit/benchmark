@@ -23,6 +23,9 @@ DATASET_REGISTRY = {
     "infinitebench": "MaxJeblick/InfiniteBench",
     "longbench": "Xnhyacinth/LongBench",
     "longbench-e": "Xnhyacinth/LongBench",
+    # Sentinel consumed by loaders._load_longbench128k; this pack is generated
+    # locally from ~/rlm_data/longbench.jsonl and is never fetched from the Hub.
+    "longbench128k": "local://longbench128k",
     "longbench-v2": "simonjegou/LongBench-v2",
     "needle_in_haystack": "alessiodevoto/paul_graham_essays",
     "aime25": "alessiodevoto/aime25",
@@ -42,6 +45,7 @@ SCORER_REGISTRY = {
     "infinitebench": _lazy_scorer("infinite_bench"),
     "longbench": _lazy_scorer("longbench"),
     "longbench-e": _lazy_scorer("longbench", "calculate_metrics_e"),
+    "longbench128k": _lazy_scorer("longbench128k"),
     "longbench-v2": _lazy_scorer("longbenchv2"),
     "needle_in_haystack": _lazy_scorer("needle_in_haystack"),
     "aime25": _lazy_scorer("aime25"),
@@ -52,6 +56,9 @@ SCORER_REGISTRY = {
     "synthetic_kv": _lazy_scorer("synthetickv64k"),
     "synthetic_kv_32k": _lazy_scorer("synthetickv32k"),
 }
+
+
+LONGBENCH_128K_SUBSETS = ("musique", "hotpotqa", "2wikimqa", "narrativeqa", "qasper", "triviaqa")
 
 
 # LOFT ships six task categories, but only the RAG subsets have been mirrored to

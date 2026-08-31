@@ -225,6 +225,9 @@ class KVzipSubClient:
         target_compression_ratio: float,
         cli_max_context_tokens: Optional[int] = None,
         reserve_tokens: int = DEFAULT_RESERVE_TOKENS,
+        char_overshoot: float = 1.0,
+        require_budget_binding: bool = False,
+        apply_cli_context_cap: bool = True,
     ) -> SubcallSizing:
         """Size the chunk advertised to the root from this client's KV budget.
 
@@ -265,9 +268,13 @@ class KVzipSubClient:
             memory_budget=self.memory_budget,
             memory_budget_unit=self.memory_budget_unit,
             sub_window_tokens=sub_window_tokens,
-            cli_max_context_tokens=cli_max_context_tokens or self.max_context_tokens,
+            cli_max_context_tokens=(
+                (cli_max_context_tokens or self.max_context_tokens) if apply_cli_context_cap else None
+            ),
             gpu_free_bytes=free_bytes,
             reserve_tokens=reserve_tokens,
+            char_overshoot=char_overshoot,
+            require_budget_binding=require_budget_binding,
         )
         self.subcall_sizing = sizing
         print(f"[kvzip] sub-chunk sizing: {sizing.describe()}")
@@ -318,17 +325,22 @@ class KVzipSubClient:
         free_bytes, _ = self._torch.cuda.mem_get_info()
         return ctx_tokens <= gpu_fit_token_cap(free_bytes, self._kv_bytes_per_token)
 
+    def _truncate_context_to_token_cap(self, context: str) -> tuple[str, int, int]:
+        """Return text, its measured token count, and requested tokens dropped."""
+        original_tokens = self._token_len(context)
+        if original_tokens <= self.max_context_tokens:
+            return context, original_tokens, 0
+        ids = self.pipeline.tokenizer.encode(context, add_special_tokens=False)
+        context = str(self.pipeline.tokenizer.decode(ids[: self.max_context_tokens]))
+        # The measured count, not the requested cap: decode -> encode is not
+        # token-count preserving for every tokenizer.
+        return context, self._token_len(context), original_tokens - self.max_context_tokens
+
     def _generate(self, context: str, question: str, split: bool, **kw: Any) -> str:
-        ctx_tokens = self._token_len(context)
-        if ctx_tokens > self.max_context_tokens:
+        context, ctx_tokens, dropped = self._truncate_context_to_token_cap(context)
+        if dropped:
             # Token-level analogue of kvpress's max_context_length truncation:
             # a 131072-char slice of dense text can exceed the model window.
-            ids = self.pipeline.tokenizer.encode(context, add_special_tokens=False)
-            # `decode` is annotated `str | list[str]` (it batches), but a single
-            # sequence in means a single string out.
-            context = str(self.pipeline.tokenizer.decode(ids[: self.max_context_tokens]))
-            dropped = ctx_tokens - self.max_context_tokens
-            ctx_tokens = self.max_context_tokens
             # Tell the root, the same way llm_query's char cap does. This used to
             # be silent, so a slice sized in chars that overflowed the token cap
             # lost its tail with nothing in the transcript to explain a miss.
@@ -363,9 +375,14 @@ class KVzipSubClient:
                 memory_budget=self.memory_budget if prune else None,
                 memory_budget_unit=self.memory_budget_unit,
                 max_new_tokens=max_new,
+                # Enforce the cell after the pipeline adds chat-template tokens.
+                # Raw decode->encode truncation alone can drift and the template
+                # itself adds a small header, both of which would move factor 1x
+                # away from the identity cell.
+                max_context_length=self.max_context_tokens,
             )
             answer = str(result["answer"])
-            stats = getattr(self.pipeline, "last_memory_budget_stats", {}) if prune else {}
+            stats = getattr(self.pipeline, "last_memory_budget_stats", {})
         except self._torch.cuda.OutOfMemoryError:
             return "[SUB-MODEL ERROR] the provided text did not fit in GPU memory; retry with a smaller snippet."
         finally:
@@ -378,7 +395,10 @@ class KVzipSubClient:
             {
                 "split": split,
                 "pressed": prune,
-                "context_tokens": ctx_tokens,
+                # Prefer the pipeline's post-chat-template count: this is the
+                # context length the press actually saw and used in its ratio.
+                "context_tokens": stats.get("context_tokens", ctx_tokens),
+                "target_context_tokens": self.max_context_tokens,
                 "retained_context_tokens": stats.get("retained_context_tokens", ctx_tokens),
                 "compression_ratio": stats.get("compression_ratio", 0.0) if prune else 0.0,
             }
@@ -399,10 +419,17 @@ class KVzipSubClient:
         if not calls:
             return {}
         n = len(calls)
+        on_target = sum(
+            1
+            for c in calls
+            if abs(c["context_tokens"] - c["target_context_tokens"]) <= 0.02 * c["target_context_tokens"]
+        )
         return {
             "calls": n,
             "split_calls": sum(1 for c in calls if c["split"]),
             "pressed_calls": sum(1 for c in calls if c["pressed"]),
+            "context_tokens_on_target_calls": on_target,
+            "target_context_tokens": self.max_context_tokens,
             "average_context_tokens": sum(c["context_tokens"] for c in calls) / n,
             "max_context_tokens": max(c["context_tokens"] for c in calls),
             "average_retained_context_tokens": sum(c["retained_context_tokens"] for c in calls) / n,

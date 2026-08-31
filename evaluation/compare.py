@@ -134,9 +134,16 @@ def describe_configuration(backend: str, config: dict) -> str:
         if kv_budget is not None:
             label += f"+kv{kv_budget:g}{config.get('sub_kv_memory_budget_unit', 'GB')}"
             if config.get("subcall_sizing_mode") == "auto":
-                label += f"@auto{config.get('target_compression_ratio', 0.0):g}"
+                factor = config.get("compression_factor")
+                label += (
+                    f"@autox{factor:g}"
+                    if factor is not None
+                    else f"@auto{config.get('target_compression_ratio', 0.0):g}"
+                )
             else:
                 label += f"@sub{config.get('max_subcall_chars')}"
+            if config.get("fixed_chunk"):
+                label += "+fixed"
         return label
     press = config.get("press_name", "unknown")
     if config.get("memory_budget") is not None:

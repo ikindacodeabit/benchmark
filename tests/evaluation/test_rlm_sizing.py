@@ -17,9 +17,12 @@ import unittest
 from evaluation.rlm.sizing import (
     CHARS_PER_TOKEN_BOUNDS,
     DEFAULT_CHARS_PER_TOKEN,
+    FIXED_CHUNK_CHAR_OVERSHOOT,
     KV_FIT_HEADROOM_BYTES,
     KV_FIT_SAFETY_FACTOR,
     calibrate_chars_per_token,
+    compression_ratio_from_factor,
+    fixed_chunk_char_cap,
     gpu_fit_token_cap,
     size_subcall_chunk,
 )
@@ -42,6 +45,12 @@ def _size(**overrides):
 
 
 class BudgetInversionTest(unittest.TestCase):
+    def test_factor_maps_to_the_grid_ratio(self):
+        for factor in (1, 2, 4, 8, 16):
+            self.assertEqual(compression_ratio_from_factor(factor), 1 - 1 / factor)
+        with self.assertRaises(ValueError):
+            compression_ratio_from_factor(0.5)
+
     def test_budget_binds_when_no_other_cap_is_supplied(self):
         sizing = _size()
         self.assertEqual(sizing.tokens, ONE_GB_TOKEN_BUDGET // 1 * 10)  # 6781 / 0.1
@@ -73,6 +82,20 @@ class BudgetInversionTest(unittest.TestCase):
     def test_nonpositive_budget_is_rejected(self):
         with self.assertRaises(ValueError):
             _size(token_budget=0)
+
+    def test_fixed_mode_overshoots_the_character_floor(self):
+        sizing = _size(
+            target_compression_ratio=0.5,
+            chars_per_token=3.8,
+            char_overshoot=FIXED_CHUNK_CHAR_OVERSHOOT,
+        )
+        self.assertEqual(sizing.chars, 59266)
+        self.assertEqual(sizing.char_overshoot, 1.15)
+
+    def test_fixed_character_cap_cannot_squeeze_the_floor(self):
+        floor = 65_536
+        cap = fixed_chunk_char_cap(floor)
+        self.assertGreaterEqual(cap - cap // 4, floor + 4000)
 
 
 class ClampTest(unittest.TestCase):
@@ -109,6 +132,14 @@ class ClampTest(unittest.TestCase):
         sizing = _size(target_compression_ratio=0.9, cli_max_context_tokens=34_000)
         self.assertEqual(sizing.uncompressed_tokens, ONE_GB_TOKEN_BUDGET * 10)
         self.assertLess(sizing.tokens, sizing.uncompressed_tokens)
+
+    def test_strict_grid_cell_raises_instead_of_accepting_a_binding_cap(self):
+        with self.assertRaisesRegex(RuntimeError, "different grid cell"):
+            _size(
+                target_compression_ratio=0.9,
+                cli_max_context_tokens=34_000,
+                require_budget_binding=True,
+            )
 
 
 class GpuFitTest(unittest.TestCase):
