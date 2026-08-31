@@ -151,8 +151,29 @@ if [ -n "${KVPRESS_ARMS:-}" ]; then
                 --max-sub-calls 16
                 --run-timeout "${KV_RUN_TIMEOUT_4C:-3600}"
             ) ;;
+            # 4d is 4b with a FLOOR under the slice instead of only a ceiling over
+            # it. 4a/4b/4c all measured a press that never engaged: the root sent a
+            # mean of 1023 chars per call against their caps, and 4b's realized
+            # slice was 384 tokens against a 1024-token press_min_tokens. Raising
+            # the ceiling had already been tried -- 32k->131k chars moved the slice
+            # by 108 tokens -- so this makes the size a rule the harness enforces.
+            #
+            # WHY 65536 AND NOT SOMETHING SMALLER. Two thresholds have to be cleared,
+            # and only the second one bites. press_min_tokens (1024 tok, ~4k chars)
+            # decides whether the press RUNS; the KV token budget decides whether it
+            # EVICTES anything, because the pipeline derives each call's ratio as
+            # 1 - min(ctx, budget)/ctx. At 1 GB the budget is ~6.8k tokens, so a
+            # 4k-token slice clears press_min_tokens and still compresses by exactly
+            # zero. 65536 chars is ~16k tokens: ratio ~0.59 at 1 GB, ~0.79 at
+            # 0.512 GB, and comfortably inside --sub-max-context-tokens (34000).
+            4d) EXTRA=(
+                --max-subcall-chars 131072
+                --min-subcall-chars "${KV_MIN_SUBCALL_CHARS:-65536}"
+                --max-sub-calls "${KV_MAX_SUB_CALLS_4D:-12}"
+                --run-timeout "${KV_RUN_TIMEOUT_4D:-3600}"
+            ) ;;
             *)
-                echo "ERROR: unknown KV_ARMS entry '$arm' (use 4a, 4b and/or 4c)" >&2
+                echo "ERROR: unknown KV_ARMS entry '$arm' (use 4a, 4b, 4c and/or 4d)" >&2
                 exit 2
                 ;;
             esac

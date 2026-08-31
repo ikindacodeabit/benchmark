@@ -64,9 +64,7 @@ RULES:
 {llm_query_help}
     * `print(...)`: anything you print is shown back to you in the NEXT message
       (truncated to {obs_limit} chars), so print only what you need to see.{note_tool}
-- Strategy: peek at structure first (e.g. `print(context[:2000])`,
-  `print(len(context))`, regex search), then narrow down with string ops or
-  chunked `llm_query` calls. Do NOT print the whole context.
+{read_strategy}
 - SEARCH TERMS: never search for the question itself. A query like "first who
   wants to be a millionaire winner uk" appears nowhere in any document as a
   literal string, so searching for it proves nothing. Pull out the DISTINCTIVE
@@ -145,6 +143,54 @@ LLM_QUERY_HELP_SPLIT = """\
       print(ans)."""
 
 EXAMPLE_LLM_QUERY_SPLIT = '        ans = llm_query("What was the March invoice total?", context[idx-200:idx+500])'
+
+# --- Large-read variants (min_subcall_chars > 0) --------------------------------
+#
+# WHY THESE EXIST. Auditing the finished LOFT-128k and LOFT-1m campaigns showed the
+# root sending a mean of 1023 characters per llm_query against a 32000-character
+# advertised cap -- 3% of its budget, with 96% of all 2338 resolved slices under
+# 2000 chars and not one call ever reaching the cap. Raising the cap 4x (to 131072)
+# moved the realized slice from 276 to 384 tokens, because a cap is a ceiling the
+# root may use, not a floor that makes it read. The reason is visible in the code
+# the root writes: the single most common slice shape across the 1m campaign is
+# `context[max(0, idx-500):idx+1000]` (17.4% of calls), a keyhole window around a
+# search hit -- a scaled-up copy of the 700-char worked example the prompt shows it.
+# One sentence saying "prefer FEWER, BIGGER slices" does not outvote a demonstration.
+#
+# So the demonstration changes, the strategy line stops saying "narrow down", and a
+# floor is stated as a rule rather than as a preference. `_expand_subcall` then
+# enforces it, because a 4B root's compliance with prose is not something a KV
+# compression measurement should rest on.
+READ_STRATEGY_DEFAULT = """\
+- Strategy: peek at structure first (e.g. `print(context[:2000])`,
+  `print(len(context))`, regex search), then narrow down with string ops or
+  chunked `llm_query` calls. Do NOT print the whole context."""
+
+READ_STRATEGY_LARGE = """\
+- Strategy: use string ops (`find`, regex) only to LOCATE the region that matters,
+  then hand that WHOLE REGION to `llm_query` in ONE call. Locating is free;
+  reading is what costs, and the sub-LLM reads through a compressed cache that
+  makes one large slice cheaper than many small ones. Do NOT print the whole
+  context, and do NOT send a narrow window around each hit -- send the region."""
+
+LLM_QUERY_HELP_SPLIT_LARGE = """\
+    * `llm_query(question: str, context_text: str) -> str`: ask a sub-LLM a
+      question about a piece of text. IMPORTANT: the sub-LLM CANNOT see
+      `context` or any of your variables — it sees ONLY what you pass. Put the
+      question in the FIRST argument and the raw document slice in the SECOND,
+      e.g. llm_query("What is X?", context[i:j]). The slice is read through a
+      COMPRESSED attention cache, so a large slice costs barely more than a
+      small one. SLICE SIZE IS A RULE, NOT A PREFERENCE: every slice must be at
+      least {min_chars} characters wide — anything shorter is widened for you —
+      and may be up to ~{max_chars}. A 1500-character window around a search hit
+      is the WRONG shape here; `context[max(0, i-{half}):i+{half}]` is the right
+      one. When you must cover a lot of ground, sweep it in strides of
+      {min_chars} rather than probing it with keyholes."""
+
+EXAMPLE_LLM_QUERY_SPLIT_LARGE = (
+    '        ans = llm_query("What was the March invoice total?",\n'
+    "                        context[max(0, idx-{half}):idx+{half}])"
+)
 
 SUB_SYSTEM_PROMPT = (
     "You are a helpful sub-model. Answer the question using ONLY the text "
@@ -369,6 +415,7 @@ class RLM:
         max_steps: int = 12,
         obs_limit: int = 6000,
         max_subcall_chars: int = 32000,
+        min_subcall_chars: int = 0,
         budget: Optional[MemoryBudget] = None,
         scratchpad: Optional[Scratchpad] = None,
         token_counter: Optional[Callable[[str], int]] = None,
@@ -386,6 +433,13 @@ class RLM:
         self.max_steps = max_steps
         self.obs_limit = obs_limit
         self.max_subcall_chars = max_subcall_chars
+        # Floor on the slice actually sent to the sub model. 0 = off, which is every
+        # arm run so far. Above 0 the prompt switches to the large-read variants AND
+        # `_expand_subcall` widens anything short of the floor in the source document.
+        # The enforcement is the load-bearing half: a KV-compression arm whose press
+        # only engages when a 4B model chooses large slices is measuring the model's
+        # prompt-following, not the press.
+        self.min_subcall_chars = min_subcall_chars
         self.budget = budget
         self.scratchpad = scratchpad
         self.cache_subcalls = cache_subcalls
@@ -456,8 +510,75 @@ class RLM:
             chunk, truncated = chunk[:room], True
         return question, chunk, truncated
 
+    def _read_instructions(self, split_capable: bool) -> dict:
+        """The three prompt slots that describe how to read: help, example, strategy.
+
+        Grouped because they must agree. They were previously chosen independently,
+        which is how the split prompt ended up asking for "FEWER, BIGGER slices" one
+        line above a worked example demonstrating a 700-character keyhole -- and the
+        example is what the root copied.
+
+        The large-read variants apply only on the split path: they promise that a big
+        slice is cheap, which is only true when the sub backend compresses its context.
+        """
+        large = self.min_subcall_chars > 0 and split_capable
+        if not large:
+            return {
+                "llm_query_help": (LLM_QUERY_HELP_SPLIT if split_capable else LLM_QUERY_HELP_DENSE).format(
+                    max_chars=self.max_subcall_chars
+                ),
+                "example_llm_query": (EXAMPLE_LLM_QUERY_SPLIT if split_capable else EXAMPLE_LLM_QUERY_DENSE),
+                "read_strategy": READ_STRATEGY_DEFAULT,
+            }
+        # Half-width, so the rendered `context[max(0, i-H):i+H]` is exactly the floor
+        # wide. Quoting the arithmetic rather than the floor is deliberate: the root
+        # writes centred windows around a hit, so this is the shape it will copy.
+        half = max(1, self.min_subcall_chars // 2)
+        return {
+            "llm_query_help": LLM_QUERY_HELP_SPLIT_LARGE.format(
+                max_chars=self.max_subcall_chars, min_chars=self.min_subcall_chars, half=half
+            ),
+            "example_llm_query": EXAMPLE_LLM_QUERY_SPLIT_LARGE.format(half=half),
+            "read_strategy": READ_STRATEGY_LARGE,
+        }
+
+    def _expand_subcall(self, chunk: str, document: str) -> tuple[str, bool]:
+        """Widen an undersized slice back out to ``min_subcall_chars``.
+
+        The root hands `llm_query` a STRING, not the indices it sliced with, so the
+        window is recovered by locating that string in the source document and
+        growing it symmetrically. A payload the root built rather than sliced
+        (concatenated fragments, an f-string) will not be found verbatim and is
+        left exactly as it was -- widening something whose position is unknown
+        would be inventing context, not restoring it.
+
+        Symmetric growth is re-anchored at both edges so a hit near the start or
+        the end of the document still yields a full-width window rather than a
+        truncated one.
+        """
+        floor = self.min_subcall_chars
+        if floor <= 0 or not chunk or len(chunk) >= floor:
+            return chunk, False
+        want = min(floor, len(document))
+        if want <= len(chunk):
+            return chunk, False
+        start = document.find(chunk)
+        if start < 0:
+            return chunk, False
+        # Centre the original slice inside the wider window, then clamp. The second
+        # max() re-anchors when the right edge hit the end of the document, so the
+        # window keeps its full width instead of shrinking.
+        grow = want - len(chunk)
+        new_start = max(0, start - grow // 2)
+        new_end = min(len(document), new_start + want)
+        new_start = max(0, new_end - want)
+        return document[new_start:new_end], True
+
     def _make_env(self, context: str, metrics: dict, cache: dict, notes: list) -> dict:
         final_box: dict = {"value": None, "done": False}
+        # `llm_query`'s second parameter is also called `context` and shadows the
+        # document inside it, so bind the document under a name the closure keeps.
+        document = context
 
         def llm_query(prompt: str, context: str | None = None) -> str:
             # Key on the FULL strings. Keying on the TRUNCATED ones makes two
@@ -467,6 +588,19 @@ class RLM:
             # the same question over two slices never collides either.
             question = str(prompt)
             chunk = None if context is None else str(context)
+            # Widen BEFORE keying, so the cache is keyed on what the sub model
+            # actually receives. (Only an exact repeat collapses: windows are centred
+            # on the slice, so two NEARBY probes widen to overlapping-but-distinct
+            # windows. Snapping them to a shared grid would collapse those too, but
+            # it would also let a hit land at the very edge of its window with its
+            # following context cut off -- the opposite of what a bigger read is for.)
+            # Counted only once the call actually happens, below: every early return
+            # past this point (cache hit, budget, deadline, fit failures) leaves
+            # sub_calls alone, so counting here would let the expanded FRACTION
+            # exceed 1.0.
+            expanded = False
+            if chunk is not None:
+                chunk, expanded = self._expand_subcall(chunk, document)
             key = (question, chunk)
             if self.cache_subcalls and key in cache:
                 metrics["sub_cache_hits"] += 1
@@ -541,9 +675,19 @@ class RLM:
                     # pure-Python code watchdog and aborting a cell that never looped.
                     signal.setitimer(signal.ITIMER_REAL, max(remaining, ALARM_REARM_FLOOR_S))
             metrics["sub_calls"] += 1
+            if expanded:
+                metrics["sub_slices_expanded"] = metrics.get("sub_slices_expanded", 0) + 1
             metrics["sub_call_tokens"] += (
                 self.tok.count(question) + (self.tok.count(chunk) if chunk else 0) + self.tok.count(ans)
             )
+            # Size of the PAYLOAD actually sent, separate from sub_call_tokens (which
+            # folds in the question and the decoded answer and so can only bound it).
+            # Recorded on every backend, not just kvzip: without it "how big are the
+            # root's slices" was only answerable by re-parsing saved transcripts, and
+            # the http arms had no chunk-size column at all.
+            payload = len(chunk) if chunk is not None else len(question)
+            metrics["sub_payload_chars"] = metrics.get("sub_payload_chars", 0) + payload
+            metrics["sub_payload_chars_max"] = max(metrics.get("sub_payload_chars_max", 0), payload)
             if chunk is not None:
                 metrics["sub_split_calls"] = metrics.get("sub_split_calls", 0) + 1
             if isinstance(ans, str) and ans.startswith(SUB_FIT_FAILURE_PREFIX):
@@ -807,10 +951,7 @@ class RLM:
                 ),
                 budget_note=self._budget_note(),
                 note_tool=(NOTE_TOOL_HELP if self.scratchpad is not None else ""),
-                llm_query_help=(LLM_QUERY_HELP_SPLIT if split_capable else LLM_QUERY_HELP_DENSE).format(
-                    max_chars=self.max_subcall_chars
-                ),
-                example_llm_query=(EXAMPLE_LLM_QUERY_SPLIT if split_capable else EXAMPLE_LLM_QUERY_DENSE),
+                **self._read_instructions(split_capable),
             ),
         }
         begin_msg = {"role": "user", "content": "Begin. Write your first code block."}

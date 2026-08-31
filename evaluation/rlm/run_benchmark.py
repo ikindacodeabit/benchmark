@@ -72,6 +72,10 @@ RESUME_CRITICAL_KEYS = (
     "vanilla_max_prompt_tokens",
     "sub_max_context_tokens",
     "press_min_tokens",
+    # In the slug too, but keep it here as well: the slug only distinguishes
+    # on/off-by-value, and resuming a floor-2048 run into a floor-16384 checkpoint
+    # would merge two different read regimes.
+    "min_subcall_chars",
     "sub_max_tokens",
     "data_dir",
     # Dicts: comparing them whole covers their nested knobs too
@@ -246,6 +250,28 @@ def write_run_artifacts(
             retained = scored_frame["context_chars_used"] / scored_frame["context_chars"]
             runtime["average_context_chars_retained"] = float(retained.mean())
 
+    # How big the root's slices actually were, on EVERY backend. This is the number
+    # the chunk-size question turns on, and until it was recorded the only way to
+    # answer it was to re-parse saved transcripts: sub_call_tokens folds in the
+    # question and the decoded answer, so it can only bound the slice from above.
+    # Reported next to subcall_chars_advertised -- the ratio between them is how far
+    # the root is from using the budget it was offered.
+    if scored and "metrics" in scored_frame:
+        payloads = [
+            (m.get("sub_payload_chars", 0), m.get("sub_calls", 0))
+            for m in scored_frame["metrics"]
+            if isinstance(m, dict) and m.get("sub_calls")
+        ]
+        total_calls = sum(calls for _, calls in payloads)
+        if total_calls:
+            runtime["average_sub_payload_chars"] = float(sum(chars for chars, _ in payloads) / total_calls)
+            runtime["max_sub_payload_chars"] = max(
+                (m.get("sub_payload_chars_max", 0) for m in scored_frame["metrics"] if isinstance(m, dict)),
+                default=0,
+            )
+            expanded = sum(m.get("sub_slices_expanded", 0) for m in scored_frame["metrics"] if isinstance(m, dict))
+            runtime["sub_slice_expanded_fraction"] = float(expanded / total_calls)
+
     # Sub-side KV retention: the direct analogue of KVPress's
     # `average_retained_context_tokens`, but measured over llm_query sub-calls --
     # "how much of each context slice did the sub model effectively attend to".
@@ -295,8 +321,12 @@ def write_run_artifacts(
     # The size we ASKED for, next to average_sub_compression_ratio which is what we
     # GOT. They differ whenever the root under-fills the chunk -- the expected
     # failure mode of auto sizing, and invisible without both numbers side by side.
-    if config.get("sub_backend") == "kvzip":
+    # Outside the kvzip guard: the advertised cap governs the http arms too, and the
+    # gap between it and average_sub_payload_chars is the finding, not a kvzip detail.
+    if config.get("mode") == "rlm":
         runtime["subcall_chars_advertised"] = config.get("max_subcall_chars")
+        runtime["subcall_chars_floor"] = config.get("min_subcall_chars") or 0
+    if config.get("sub_backend") == "kvzip":
         runtime["subcall_sizing_mode"] = config.get("subcall_sizing_mode")
         runtime["subcall_target_compression_ratio"] = config.get("target_compression_ratio")
         runtime["subcall_sizing_binding"] = (config.get("subcall_sizing") or {}).get("binding")
@@ -341,6 +371,11 @@ def build_run_dir_components(args: argparse.Namespace, mode: str, scratchpad: Sc
     sizing_mode = getattr(args, "subcall_sizing_mode", "fixed")
     if mode == "rlm" and sizing_mode == "fixed" and args.max_subcall_chars != DEFAULT_MAX_SUBCALL_CHARS:
         components.append(f"sub{args.max_subcall_chars}")
+    # A floor changes both the prompt and the slices, so a floored run must never
+    # share a checkpoint with the unfloored run of the same subset. Only stamped
+    # when non-zero, so every existing run directory keeps its name.
+    if mode == "rlm" and getattr(args, "min_subcall_chars", 0):
+        components.append(f"min{args.min_subcall_chars}")
     # After the `sub` component, so every hand-sized slug stays byte-identical to
     # what it was before auto-sizing existed. This marker is the ONLY thing
     # separating an auto run that happens to resolve to exactly the default size
@@ -522,6 +557,18 @@ def main() -> None:
         "(requires --sub-backend kvzip)",
     )
     ap.add_argument(
+        "--min-subcall-chars",
+        type=int,
+        default=0,
+        help="FLOOR on the context slice sent to the sub model (0 = off, the behaviour of "
+        "every arm so far). --max-subcall-chars is a ceiling the root may use and mostly "
+        "does not: across the finished 128k and 1m campaigns it sent a mean of 1023 chars "
+        "against a 32000 cap. This makes the size a rule -- the split prompt switches to "
+        "its large-read variants and any shorter slice is widened in the source document. "
+        "Required for the KV-compression arm to measure anything: a slice under "
+        "--press-min-tokens skips the press entirely",
+    )
+    ap.add_argument(
         "--target-compression-ratio",
         type=float,
         default=None,
@@ -607,6 +654,16 @@ def main() -> None:
             ap.error("--target-compression-ratio only applies with --max-subcall-chars auto")
         if not 0.0 <= args.target_compression_ratio < 1.0:
             ap.error("--target-compression-ratio must be in [0.0, 1.0)")
+    if args.min_subcall_chars < 0:
+        ap.error("--min-subcall-chars must be >= 0 (0 disables the floor)")
+    # A floor above the ceiling is silently self-cancelling: _expand_subcall widens
+    # to the floor and _cap_subcall immediately truncates back to the cap, so the
+    # run looks configured for big reads and produces the size it always did.
+    if not auto_chunk and args.min_subcall_chars and args.min_subcall_chars > args.max_subcall_chars:
+        ap.error(
+            f"--min-subcall-chars ({args.min_subcall_chars}) exceeds --max-subcall-chars "
+            f"({args.max_subcall_chars}); the floor would be truncated away by the cap"
+        )
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -665,6 +722,14 @@ def main() -> None:
                 "--sub-max-context-tokens (and check the sub model's window) to hit the "
                 "requested ratio."
             )
+        # Same self-cancelling pair as the fixed path, but only checkable here: on
+        # the auto path the cap is not a number until the sizing has run.
+        if args.min_subcall_chars > args.max_subcall_chars:
+            raise SystemExit(
+                f"--min-subcall-chars ({args.min_subcall_chars}) exceeds the auto-sized chunk "
+                f"({args.max_subcall_chars} chars, bound by {subcall_sizing.binding!r}); the floor "
+                "would be truncated away by the cap. Lower the floor or raise the budget."
+            )
 
     budget = None
     if args.max_context_tokens is not None:
@@ -686,6 +751,7 @@ def main() -> None:
         run_timeout=args.run_timeout or None,
         max_sub_calls=args.max_sub_calls or None,
         max_subcall_chars=args.max_subcall_chars,
+        min_subcall_chars=args.min_subcall_chars,
         # In-process sub-calls can take minutes each; without an in-call check a
         # single code cell looping over slices sails past the per-step deadline.
         subcall_deadline_check=(args.sub_backend == "kvzip"),
@@ -900,6 +966,7 @@ def build_run_config(
         "sub_kv_memory_budget": args.memory_budget if args.sub_backend == "kvzip" else None,
         "sub_kv_memory_budget_unit": args.memory_budget_unit if args.sub_backend == "kvzip" else None,
         "max_subcall_chars": args.max_subcall_chars,
+        "min_subcall_chars": args.min_subcall_chars,
         # How that number was arrived at. `subcall_sizing` carries every cap
         # considered and which one bound, so a surprising size can be explained
         # without re-running; `max_subcall_chars_resolved` is what the resume
