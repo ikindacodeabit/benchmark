@@ -683,8 +683,10 @@ def main() -> None:
     ap.add_argument(
         "--press-min-tokens",
         type=int,
-        default=1024,
-        help="one-arg llm_query prompts below this many tokens skip the press",
+        default=None,
+        help="one-arg llm_query prompts below this many tokens skip the press; "
+        "defaults to the memory budget's own token capacity (kvzip_backend.py "
+        "derives it) rather than a fixed constant",
     )
     ap.add_argument("--out", default=RLM_RESULTS_DIR)
     ap.add_argument("--debug", action="store_true", help="print every RLM step (model reply, code, REPL output) live")
@@ -842,7 +844,18 @@ def main() -> None:
         tdir = run_dir / "transcripts"
         tdir.mkdir(parents=True, exist_ok=True)
         done = load_done(res_path)
-        run_config = build_run_config(args, mode, dataset_name, budget, scratchpad, subcall_sizing)
+        run_config = build_run_config(
+            args,
+            mode,
+            dataset_name,
+            budget,
+            scratchpad,
+            subcall_sizing,
+            # Resolved on the constructed client: --press-min-tokens defaults to
+            # None and kvzip_backend derives it from the memory budget, so the
+            # effective value only exists on `sub`, not on `args`.
+            getattr(sub, "press_min_tokens", None),
+        )
         if done:
             # The run-dir name cannot carry every result-affecting knob, so a resume
             # is checked against the config the first run wrote. Without this, a
@@ -1001,6 +1014,7 @@ def build_run_config(
     budget: MemoryBudget | None,
     scratchpad: Scratchpad | None,
     subcall_sizing: Any,
+    resolved_press_min_tokens: int | None = None,
 ) -> dict:
     """The run's full settings, as written to config.yaml.
 
@@ -1054,7 +1068,10 @@ def build_run_config(
         "subcall_sizing": asdict(subcall_sizing) if subcall_sizing else None,
         "sub_max_tokens": args.sub_max_tokens if args.sub_backend == "kvzip" else None,
         "sub_max_context_tokens": args.sub_max_context_tokens if args.sub_backend == "kvzip" else None,
-        "press_min_tokens": args.press_min_tokens if args.sub_backend == "kvzip" else None,
+        # The client's resolved value, not args.press_min_tokens: with the flag
+        # left at its None default, kvzip_backend derives this from the memory
+        # budget, so args would serialise None while the run used a real floor.
+        "press_min_tokens": resolved_press_min_tokens if args.sub_backend == "kvzip" else None,
     }
 
 

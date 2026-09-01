@@ -1,0 +1,42 @@
+# Full RULER-32k matrix for Qwen3-4B-Instruct-2507: reference (unbounded/no
+# press) + every RULER_32K_BUDGETS budget (0.2/0.4/0.6/0.8/1 GB) under KVzip,
+# across all 13 RULER-32k tasks, one model load per worker. Driven by
+# run_matrix.py --profile=ruler32k (generic profile; budgets come from
+# matrix_constants.py's RULER_32K_BUDGETS, not this file). Not GPTQ, so the
+# plain `kvpress` conda env is sufficient -- no kvpress-tf515 needed.
+output_dir: "../benchmark_artifacts/results/ruler32k/runs/results_ruler32k_qwen3_4b_instruct_2507_all_budgets"
+
+model: "/home/rethinkingai-self/25m0820/kvpress/Qwen3-4B-Instruct-2507"
+dataset: "ruler32k"
+data_dir:
+  - "cwe"
+  - "fwe"
+  - "niah_multikey_1"
+  - "niah_multikey_2"
+  - "niah_multikey_3"
+  - "niah_multiquery"
+  - "niah_multivalue"
+  - "niah_single_1"
+  - "niah_single_2"
+  - "niah_single_3"
+  - "qa_1"
+  - "qa_2"
+  - "vt"
+
+press_name: "kvzip"
+compression_ratio: 0.01
+memory_budget: null
+
+fraction: 1.0
+max_new_tokens: null
+max_context_length: null
+query_aware: false
+needle_depth: null
+synthetic_kv_metadata_override: false
+seed: 42
+
+device: "cuda:0"
+fp8: false
+int8: false
+int4: false
+model_kwargs: {}
