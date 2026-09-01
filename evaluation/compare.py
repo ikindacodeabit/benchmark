@@ -23,6 +23,8 @@ from typing import Any, Iterator, Optional
 import pandas as pd
 import yaml
 
+from evaluation.results_layout import RESULTS_ROOT
+
 # Scorers disagree on what to call the headline number, and some nest it per task.
 # Checked in order; the first hit wins. Both backends run the SAME scorer for a
 # given dataset, so whichever key is picked is picked identically for both -- that
@@ -35,33 +37,65 @@ import yaml
 # fallback below and were dropped from the comparison entirely.
 SCORE_KEYS = ("average", "string_match", "exact_match", "score", "accuracy", "subspan_em", "f1")
 
+# ...but "first hit in a global priority list" is a fragile way to pick a headline:
+# a scorer that reports two of these keys gets whichever happens to sit earlier,
+# silently. Where a dataset has a documented primary metric, name it here and the
+# ordering above never comes into play.
+DATASET_SCORE_KEY = {"loft": "subspan_em"}
+
 # Reported by the RLM harness about itself; never a benchmark score.
 RUNTIME_KEY = "runtime"
 
 
 def _flatten(metrics: dict, prefix: str = "") -> dict[str, Any]:
-    """Flatten one level of per-task nesting, e.g. {'niah_single_1': {...}}."""
+    """Flatten per-task nesting, e.g. {'niah_single_1': {'f1': ...}}.
+
+    Nested keys keep their path. Dropping the prefix on recursion collapsed
+    every task's metrics onto the same bare names, so a per-task dict like
+    {'niah_single_1': {'f1': ...}, 'cwe': {'f1': ...}} left one 'f1' -- the
+    last task silently winning -- and headline_score reported it as the run's
+    score. _lookup below resolves a bare metric name against these paths.
+    """
     flat: dict[str, Any] = {}
     for key, value in metrics.items():
         if key == RUNTIME_KEY:
             continue
         name = f"{prefix}{key}"
         if isinstance(value, dict):
-            flat.update(_flatten(value, prefix=""))
+            flat.update(_flatten(value, prefix=f"{name}."))
         else:
             flat[name] = value
     return flat
 
 
-def headline_score(metrics: dict) -> tuple[Optional[str], Optional[float]]:
+def _lookup(flat: dict[str, Any], key: str) -> Optional[float]:
+    """The value for ``key``, at the top level or nested under a single task.
+
+    Returns None when several tasks report it. Silently picking one is how a
+    multi-task metrics.json used to publish an arbitrary task's number as the
+    whole run's headline score.
+    """
+    value = flat.get(key)
+    if isinstance(value, (int, float)):
+        return float(value)
+    nested = [v for k, v in flat.items() if k.rsplit(".", 1)[-1] == key and isinstance(v, (int, float))]
+    return float(nested[0]) if len(nested) == 1 else None
+
+
+def headline_score(metrics: dict, dataset: Optional[str] = None) -> tuple[Optional[str], Optional[float]]:
     """Pick the comparable number out of a scorer's metrics dict."""
     flat = _flatten(metrics)
+    preferred = DATASET_SCORE_KEY.get(dataset or "")
+    if preferred is not None:
+        value = _lookup(flat, preferred)
+        if value is not None:
+            return preferred, value
     for key in SCORE_KEYS:
-        value = flat.get(key)
-        if isinstance(value, (int, float)):
-            return key, float(value)
+        value = _lookup(flat, key)
+        if value is not None:
+            return key, value
     # Fall back to the only numeric entry, if the scorer reports exactly one.
-    numeric = {k: v for k, v in flat.items() if isinstance(v, (int, float)) and k != "num_samples"}
+    numeric = {k: v for k, v in flat.items() if isinstance(v, (int, float)) and k.rsplit(".", 1)[-1] != "num_samples"}
     if len(numeric) == 1:
         key, value = next(iter(numeric.items()))
         return key, float(value)
@@ -89,15 +123,27 @@ def describe_configuration(backend: str, config: dict) -> str:
         mode = config.get("mode", "rlm")
         budget = (config.get("memory_budget") or {}).get("max_context_tokens")
         label = f"{mode}" if budget is None else f"{mode}@ctx{budget}"
+        # The scratchpad arm is a different experiment from plain RLM, and the two
+        # rendered identically here -- so the table showed two `rlm` rows per task
+        # and the groupby checks below read them as duplicates of one configuration.
+        if config.get("scratchpad"):
+            label += "+scratchpad"
         # Without these, two arm-4 runs that differ only in their sub-call KV budget
         # or chunk size -- the whole point of the arm -- render as the same row.
         kv_budget = config.get("sub_kv_memory_budget")
         if kv_budget is not None:
             label += f"+kv{kv_budget:g}{config.get('sub_kv_memory_budget_unit', 'GB')}"
             if config.get("subcall_sizing_mode") == "auto":
-                label += f"@auto{config.get('target_compression_ratio', 0.0):g}"
+                factor = config.get("compression_factor")
+                label += (
+                    f"@autox{factor:g}"
+                    if factor is not None
+                    else f"@auto{config.get('target_compression_ratio', 0.0):g}"
+                )
             else:
                 label += f"@sub{config.get('max_subcall_chars')}"
+            if config.get("fixed_chunk"):
+                label += "+fixed"
         return label
     press = config.get("press_name", "unknown")
     if config.get("memory_budget") is not None:
@@ -107,7 +153,7 @@ def describe_configuration(backend: str, config: dict) -> str:
 
 def build_row(run_dir: Path, config: dict, metrics: dict) -> dict[str, Any]:
     backend = config.get("backend", "kvpress")
-    metric_name, score = headline_score(metrics)
+    metric_name, score = headline_score(metrics, config.get("dataset"))
     runtime = metrics.get(RUNTIME_KEY, {}) if isinstance(metrics.get(RUNTIME_KEY), dict) else {}
 
     data_dir = config.get("data_dir")
@@ -129,10 +175,16 @@ def build_row(run_dir: Path, config: dict, metrics: dict) -> dict[str, Any]:
     # tokens were live at peak", which is what KV memory is proportional to -- so
     # this is the column to plot score against for either backend.
     if backend == "rlm":
+        # For an arm with KV-compressed sub-calls this is max(root, sub): while the
+        # root holds ~2k tokens the sub model is holding a whole slice of KV on the
+        # GPU, and counting only the root made that arm look far cheaper than it is.
+        # `_root` keeps the un-mixed number visible beside it.
         row["context_tokens_held"] = runtime.get("average_peak_context_tokens")
+        row["context_tokens_root"] = runtime.get("average_peak_context_tokens_root")
         row["total_tokens"] = runtime.get("average_tokens")
         row["examples"] = runtime.get("scored")
         row["errors"] = runtime.get("errors")
+        row["abstained"] = runtime.get("abstained")
         # Only meaningful for the vanilla arm, and the reason its score may be a
         # property of the truncation limit rather than of the model.
         row["context_retained"] = runtime.get("average_context_chars_retained")
@@ -149,9 +201,10 @@ def build_row(run_dir: Path, config: dict, metrics: dict) -> dict[str, Any]:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--results-dir", default="evaluation/results", help="tree holding both KVPress and RLM run dirs")
+    ap.add_argument("--results-dir", default=RESULTS_ROOT, help="tree holding both KVPress and RLM run dirs")
     ap.add_argument("--dataset", default=None, help="restrict to one dataset")
     ap.add_argument("--model", default=None, help="restrict to one model id")
+    ap.add_argument("--backend", default=None, choices=["rlm", "kvpress"], help="restrict to one backend")
     ap.add_argument("--csv", default=None, help="also write the joined table here")
     args = ap.parse_args()
 
@@ -168,6 +221,8 @@ def main() -> None:
         frame = frame[frame["dataset"] == args.dataset]
     if args.model:
         frame = frame[frame["model"] == args.model]
+    if args.backend:
+        frame = frame[frame["backend"] == args.backend]
     if frame.empty:
         raise SystemExit("No runs matched the given filters")
 
@@ -184,9 +239,11 @@ def main() -> None:
             "metric",
             "score",
             "context_tokens_held",
+            "context_tokens_root",
             "total_tokens",
             "context_retained",
             "kv_memory_gb",
+            "abstained",
             "errors",
         )
         if c in frame.columns
@@ -196,15 +253,18 @@ def main() -> None:
 
     # A KVPress row and an RLM row are only comparable if they ran the same
     # scorer, which means the same dataset. Say so explicitly rather than letting
-    # a reader assume every printed row belongs in one plot.
-    for (dataset, task), group in frame.groupby(["dataset", "task"]):
-        backends = set(group["backend"])
-        if len(backends) < 2:
-            print(f"\nnote: {dataset}/{task} has only {backends.pop()} runs -- nothing to compare against yet")
-        elif group["metric"].nunique() > 1:
-            print(
-                f"\nwarning: {dataset}/{task} rows use different metrics {sorted(set(group['metric']))}; not comparable"
-            )
+    # a reader assume every printed row belongs in one plot. A --backend view is
+    # deliberately single-backend, so the cross-backend notes don't apply there.
+    if not args.backend:
+        for (dataset, task), group in frame.groupby(["dataset", "task"]):
+            backends = set(group["backend"])
+            if len(backends) < 2:
+                print(f"\nnote: {dataset}/{task} has only {backends.pop()} runs -- nothing to compare against yet")
+            elif group["metric"].nunique() > 1:
+                print(
+                    f"\nwarning: {dataset}/{task} rows use different metrics "
+                    f"{sorted(set(group['metric']))}; not comparable"
+                )
 
     if args.csv:
         frame.to_csv(args.csv, index=False)

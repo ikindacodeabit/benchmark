@@ -14,6 +14,20 @@ except ImportError:  # pragma: no cover - older Transformers releases
     Qwen3_5Attention = ()
 
 
+def is_qwen35_attention(module: nn.Module) -> bool:
+    """Whether ``module`` is a Qwen3.5 attention layer.
+
+    Falls back to a class-name check when Qwen3_5Attention could not be
+    imported. On an older Transformers the import sets it to ``()``, and
+    ``isinstance(module, ())`` is always False -- so a real Qwen3.5 layer used
+    to fall through to the Llama branch below and return gate-contaminated
+    query states with nothing said about it.
+    """
+    if Qwen3_5Attention and isinstance(module, Qwen3_5Attention):
+        return True
+    return type(module).__name__ == "Qwen3_5Attention"
+
+
 def get_prerope_query_states(module: nn.Module, hidden_states: torch.Tensor) -> torch.Tensor:
     """
     Extracts the query states from a given attention module and hidden states tensor.
@@ -43,7 +57,7 @@ def get_prerope_query_states(module: nn.Module, hidden_states: torch.Tensor) -> 
     if isinstance(module, Phi3Attention):
         qkv = module.qkv_proj(hidden_states)
         query_states = qkv[..., : num_heads * head_dim]
-    elif isinstance(module, Qwen3_5Attention):
+    elif is_qwen35_attention(module):
         # Qwen3.5 packs query and the attention gate into q_proj.  KVzip's
         # query statistics must use only the first half (the gate is applied
         # after attention in Qwen3_5Attention.forward).
@@ -58,7 +72,7 @@ def get_prerope_query_states(module: nn.Module, hidden_states: torch.Tensor) -> 
     query_states = query_states.view(bsz, q_len, num_heads, head_dim).transpose(1, 2)
 
     # Support for Qwen3 and Gemma3 QK norm
-    if isinstance(module, (Qwen3Attention, Gemma3Attention, Qwen3_5Attention)):
+    if isinstance(module, (Qwen3Attention, Gemma3Attention)) or is_qwen35_attention(module):
         query_states = module.q_norm(query_states)
 
     return query_states
@@ -101,7 +115,7 @@ def get_prerope_key_states(module: nn.Module, hidden_states: torch.Tensor) -> to
     key_states = key_states.view(bsz, k_len, -1, head_dim).transpose(1, 2)
 
     # Support for Qwen3 and Gemma3 QK norm
-    if isinstance(module, (Qwen3Attention, Gemma3Attention, Qwen3_5Attention)):
+    if isinstance(module, (Qwen3Attention, Gemma3Attention)) or is_qwen35_attention(module):
         key_states = module.k_norm(key_states)
     return key_states
 

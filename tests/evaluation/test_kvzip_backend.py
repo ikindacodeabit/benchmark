@@ -143,11 +143,44 @@ class PlanSubcallChunkTest(unittest.TestCase):
         """--subcall-reserve-tokens has to actually move the caps, or the question
         and the decoded answer are unbudgeted."""
         client = _fake_client(max_position_embeddings=8192, max_context_tokens=131072)
-        sizing = client.plan_subcall_chunk(
-            document="word " * 20000, target_compression_ratio=0.9, reserve_tokens=4096
-        )
+        sizing = client.plan_subcall_chunk(document="word " * 20000, target_compression_ratio=0.9, reserve_tokens=4096)
         self.assertEqual(sizing.caps["sub_window"], 8192 - 4096)
         self.assertEqual(sizing.tokens, 8192 - 4096)
+
+    def test_fixed_grid_ignores_legacy_cli_cap_but_keeps_hard_caps_strict(self):
+        client = _fake_client(max_context_tokens=34_000)
+        client.memory_budget = 8192
+        client.memory_budget_unit = "tokens"
+        sizing = client.plan_subcall_chunk(
+            document="word " * 20000,
+            target_compression_ratio=0.9375,
+            char_overshoot=1.15,
+            require_budget_binding=True,
+            apply_cli_context_cap=False,
+        )
+        self.assertEqual(sizing.tokens, 131_072)
+        self.assertEqual(sizing.binding, "budget")
+        self.assertIsNone(sizing.caps["cli_cap"])
+
+
+class TruncationAccountingTest(unittest.TestCase):
+    def test_decode_reencode_drift_is_measured_instead_of_recording_the_cap(self):
+        class DriftTokenizer:
+            def encode(self, text, add_special_tokens=False):
+                return list(range(len(text)))
+
+            def decode(self, ids):
+                return "x" * (len(ids) - 1)
+
+        client = kvzip_backend.KVzipSubClient.__new__(kvzip_backend.KVzipSubClient)
+        client.pipeline = SimpleNamespace(tokenizer=DriftTokenizer())  # type: ignore[assignment]
+        client.max_context_tokens = 5
+
+        text, measured, dropped = client._truncate_context_to_token_cap("abcdefghij")
+
+        self.assertEqual(text, "xxxx")
+        self.assertEqual(measured, 4)
+        self.assertEqual(dropped, 5)
 
 
 if __name__ == "__main__":

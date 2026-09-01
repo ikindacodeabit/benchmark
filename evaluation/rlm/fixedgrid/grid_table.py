@@ -1,0 +1,123 @@
+# SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""Render fixed-chunk grid results as per-dataset CSV and Markdown tables."""
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
+import yaml
+
+
+def _score(metrics: dict[str, Any]) -> float | None:
+    value = metrics.get("score")
+    return float(value) if isinstance(value, (int, float)) else None
+
+
+def collect(results: Path) -> pd.DataFrame:
+    rows = []
+    seen: set[tuple[str, int, float]] = set()
+    for metrics_path in sorted(results.rglob("metrics.json")):
+        config_path = metrics_path.parent / "config.yaml"
+        if not config_path.exists():
+            continue
+        try:
+            config = yaml.safe_load(config_path.read_text()) or {}
+            metrics = json.loads(metrics_path.read_text())
+        except (yaml.YAMLError, json.JSONDecodeError):
+            continue
+        if config.get("dataset") != "longbench128k" or not config.get("fixed_chunk"):
+            continue
+        if str(config.get("sub_kv_memory_budget_unit", "")).lower() != "tokens":
+            continue
+        subset = str(config.get("data_dir"))
+        budget = int(config["sub_kv_memory_budget"])
+        factor = float(config["compression_factor"])
+        key = (subset, budget, factor)
+        if key in seen:
+            raise ValueError(f"duplicate completed grid cell for {subset}, B={budget}, F={factor:g}")
+        seen.add(key)
+        runtime = metrics.get("runtime", {})
+        rows.append(
+            {
+                "dataset": subset,
+                "kv_budget_tokens": budget,
+                "compression_factor": factor,
+                "qa_f1": _score(metrics),
+                "realized_compression_factor": runtime.get("realized_compression_factor"),
+                "document_coverage_fraction": runtime.get("document_coverage_fraction"),
+                "sub_context_tokens_on_target_fraction": runtime.get("sub_context_tokens_on_target_fraction"),
+                "sub_slice_unlocatable_calls": runtime.get("sub_slice_unlocatable_calls"),
+                "errors": runtime.get("errors"),
+                "run_dir": str(metrics_path.parent),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _cell(row: pd.Series | None) -> str:
+    if row is None or pd.isna(row.get("qa_f1")):
+        return "—"
+    realized = row.get("realized_compression_factor")
+    coverage = row.get("document_coverage_fraction")
+    realized_text = "?" if pd.isna(realized) else f"{float(realized):.2f}x"
+    coverage_text = "?" if pd.isna(coverage) else f"{100 * float(coverage):.1f}%"
+    return f"{float(row['qa_f1']):.2f} | {realized_text} | {coverage_text}"
+
+
+def render_dataset(frame: pd.DataFrame, output: Path, subset: str) -> None:
+    budgets = sorted(int(value) for value in frame["kv_budget_tokens"].unique())
+    factors = sorted(float(value) for value in frame["compression_factor"].unique())
+    indexed = frame.set_index(["kv_budget_tokens", "compression_factor"])
+    table_rows = []
+    for budget in budgets:
+        row: dict[str, Any] = {"KV budget (tokens)": budget}
+        for factor in factors:
+            key = (budget, factor)
+            match = indexed.loc[key] if key in indexed.index else None
+            row[f"{factor:g}x"] = _cell(match)
+        table_rows.append(row)
+    table = pd.DataFrame(table_rows)
+    table.to_csv(output / f"{subset}.csv", index=False)
+
+    columns = list(table.columns)
+    lines = [
+        f"# {subset}: fixed-chunk × logical-KV-retention grid",
+        "",
+        "Cells are `qa_f1 | realized factor | document coverage`.",
+        "KVzipPress masks evicted KV but does not free it; budgets are simulated retention, "
+        "not measured memory savings.",
+        "",
+        "| " + " | ".join(columns) + " |",
+        "| " + " | ".join("---" for _ in columns) + " |",
+    ]
+    for _, row in table.iterrows():
+        lines.append("| " + " | ".join(str(row[column]) for column in columns) + " |")
+    (output / f"{subset}.md").write_text("\n".join(lines) + "\n")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--results", type=Path, required=True)
+    parser.add_argument("--output", type=Path, default=None)
+    args = parser.parse_args()
+
+    frame = collect(args.results)
+    if frame.empty:
+        raise SystemExit(f"No completed fixed-grid runs under {args.results}")
+    output = args.output or args.results / "grid_tables"
+    output.mkdir(parents=True, exist_ok=True)
+    frame.sort_values(["dataset", "kv_budget_tokens", "compression_factor"]).to_csv(
+        output / "grid_long.csv", index=False
+    )
+    for subset, subset_frame in frame.groupby("dataset"):
+        render_dataset(subset_frame, output, str(subset))
+    print(f"wrote fixed-grid tables to {output}")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,12 +1,7 @@
 # LOFT-128k: vanilla vs RLM vs RLM+scratchpad vs RLM+scratchpad+KV-compression
 
-> **STALE from "The KV-compression arms" onward.** That section still describes the
-> standalone `snu-mllab/KVzip` backend (physical eviction, `KVZIP_DIR`, flash-attn,
-> `--compression-ratio`, `.venv-kvpress`), which was replaced by kvpress's own
-> `KVzipPress` in commit `0ec65c5`. Compression is now LOGICAL (masked, never freed),
-> the knob is `--memory-budget` / `--memory-budget-unit`, and there is a third arm `4c`
-> that derives the chunk size from the budget. See [RLM.md](../../../RLM.md) for the
-> current picture. Arms 1-3 and everything above that section are still accurate.
+See [RLM.md](../../../RLM.md) for how the RLM and KVPress halves of the repo fit
+together, and how the arm-4 chunk size is derived.
 
 Experiment arms on LOFT's five RAG subsets at 128k context, all on
 `Qwen/Qwen3-4B-Instruct-2507`:
@@ -91,53 +86,58 @@ GPU=1 bash evaluation/rlm/loft128k/run_infolab.sh serve
 DATASETS="nq" bash evaluation/rlm/loft128k/run_infolab.sh run
 ```
 
-**Contention is the main risk.** On an empty 48 GB card the util cap lands at 0.85
-(~33 GB of KV, ~1.8 concurrent 128k sequences). On a card already holding another
-user's 13 GB job it lands near 0.59 (~20 GB of KV, ~1.1 sequences) — still
-correct, just slow. Check `nvidia-smi` before launching and prefer the emptiest
-cards.
+**Contention is the main risk.** The server asks for what it needs —
+`ROOT_NEED_MIB` (default 31000 MiB: ~19.1 GiB of KV for one 139264-token
+sequence, ~7.5 GiB of weights, ~2 GB of overhead) — plus whatever co-tenants
+already hold, rather than for the whole card. On an empty 48 GB card that is a
+util of about 0.64; on one holding another user's 13 GB job, about 0.90. Cards
+with less than `MIN_FREE_MIB` (33000) free are skipped entirely. Check
+`nvidia-smi` before launching and prefer the emptiest cards.
 
-Each subset is 110 examples: `_load_loft` concatenates **dev (10) then test
-(100)**, in that order. So `LIMIT` values of 10 or less sample the dev split only
-— fine for a smoke test, not a result. `LIMIT=110` is the whole subset.
+Each subset is 110 examples **at 128k and 1m**: `_load_loft` concatenates
+**dev (10) then test (100)**, in that order. So `LIMIT` values of 10 or less
+sample the dev split only — fine for a smoke test, not a result. `LIMIT=110` is
+the whole subset. (At 32k, `qampari` and `quest` are 70 rows, not 110: their test
+splits ship 60.)
 
 ## The KV-compression arms (4a/4b and the kvzip baseline)
 
 ### Venvs
 
 The vLLM **server** needs `transformers==4.51.3` (5.x removed
-`all_special_tokens_extended`) — and standalone KVzip
-(https://github.com/snu-mllab/KVzip) pins the SAME version, so the arm-4
-driver runs from the main `.venv`: it talks to the vLLM ROOT server over HTTP
-and hosts the KVzip SUB model in-process
-(`evaluation/rlm/kvzip_backend.py`). `setup` clones KVzip into `$KVZIP_DIR`
-(default `KVzip/`), installs flash-attn (hard requirement — KVzip's evict
-cache decodes through `flash_attn_varlen_func`, no sdpa fallback), and builds
-its `tiny_api_cuda` kernel — WITHOUT pip-installing the KVzip repo, whose
-pyproject would force-downgrade torch to 2.3.0. Only the cell-5 baseline still
-uses `.venv-kvpress` (the kvpress library needs `transformers>=4.56`).
+`all_special_tokens_extended`), so the arm-4 driver runs from the main `.venv`:
+it talks to the vLLM ROOT server over HTTP and hosts the SUB model in-process
+through kvpress's own `KVzipPress` (`evaluation/rlm/kvzip_backend.py`). Only the
+cell-5 baseline uses `.venv-kvpress`, because the kvpress *library* wants
+`transformers>=4.56`. Nothing needs a KVzip checkout, flash-attn, or a custom
+CUDA kernel any more — the standalone `snu-mllab/KVzip` backend that did was
+replaced in `0ec65c5`.
 
 ### What actually changes inside the RLM
 
 With `--sub-backend kvzip` the REPL tool becomes
-`llm_query(question, context_text)`: the slice is prefilled into KVzip's
-`EvictCache`, scored by context reconstruction, pruned to the target ratio,
-and the question (and `SUB_SYSTEM_PROMPT`) decode against the pruned cache
-uncompressed. Documented deviations from the NIM path:
+`llm_query(question, context_text)`: the slice is prefilled through
+`KVPressTextGenerationPipeline` under `KVzipPress`, and the question (plus
+`SUB_SYSTEM_PROMPT`) decodes against the compressed cache uncompressed.
+Documented deviations from the original hosted-API path:
 
-1. KVzip renders the context under its own fixed chat template (a generic
-   system prompt + QA instruction), so the sub system prompt is prepended to
-   the question side (identical across 4a/4b/ratios, so internal comparisons
-   stay valid);
-2. **eviction is physical**: pruned KV is freed before decoding — but only
-   AFTER prefill+scoring, so PEAK memory is still the full uncompressed KV;
-3. `--compression-ratio` keeps the kvpress convention (fraction EVICTED); the
-   backend converts to KVzip's `prune(ratio)` (fraction RETAINED);
+1. the pipeline has no system role, so the sub system prompt is prepended to
+   the question side (identical across every arm-4 lane, so internal
+   comparisons stay valid);
+2. **compression is LOGICAL, not physical**: `KVzipPress` masks evicted keys
+   via an attention patch and never frees them, so a slice costs its full
+   uncompressed KV no matter the budget. Sizing chunks from the budget buys
+   comparability with the KVPress benchmarks, not GPU headroom;
+3. the knob is `--memory-budget` / `--memory-budget-unit` (decimal MB/GB, to
+   match `matrix_constants.py`'s published budgets); the pipeline converts each
+   call's budget into a compression ratio from the slice actually sent;
 4. the backend preflights GPU choice: it pins to the requested (or freest)
    GPU via `CUDA_VISIBLE_DEVICES`, refuses to load without
    `--sub-min-free-gib` of free memory, and pre-checks each sub-call's KV
    against actual free memory (too-big slices come back as a retry notice
-   instead of an OOM).
+   instead of an OOM). After three such refusals the harness stops offering
+   `llm_query` at all, rather than letting the root spend its whole sub-call
+   budget on slices that will never fit.
 
 ### Colocation budget (one 48 GB card, `KVPRESS_ARMS=1`)
 
@@ -148,14 +148,16 @@ to make room for the in-process sub model:
 |---|---|
 | vLLM root, `--max-model-len 65536`, capped at `ROOT_BUDGET_MIB` | ~21 GB (8 weights + overhead + KV pool) |
 | HF sub model | ~8.1 GB weights |
-| one 34k-token sub prefill (peak = full KV; eviction frees it only after scoring) | ~4.9 GB |
+| one 34k-token sub prefill (peak = full KV; masking frees nothing) | ~4.9 GB |
 | KVzip scoring transient | ~2.5 GB |
 | **total** | **~37 GB** (≈11 GB margin for co-tenants) |
 
-A root transcript that outgrows 65536 tokens gets a 400, is recorded as a
-harness error, and is retried on resume — raise `KV_ROOT_MAX_LEN` if it
-recurs. `SUB_GPUS="i j"` instead deals dedicated sub cards to the lanes and the
-servers keep the full 139264 window.
+A root transcript that outgrows 65536 tokens now gets the oldest turns evicted
+and the request retried, instead of ending the example as a harness error;
+`runtime` counts these as `overflow_evictions`. Raise `KV_ROOT_MAX_LEN` if they
+are frequent — eviction costs the root its history. `SUB_GPUS="i j"` instead
+deals dedicated sub cards to the lanes and the servers keep the full 139264
+window.
 
 ### Running
 
@@ -192,7 +194,15 @@ measured anything:
   measuring the press.
 - **`average_sub_retained_context_tokens`** vs `average_sub_context_tokens` —
   the sub-side analogue of KVPress's `average_retained_context_tokens`; the
-  ratio between them should track `--compression-ratio`.
+  ratio between them is what the memory budget actually bought, which is not
+  the ratio you asked for unless the root filled the chunk.
+- **`average_peak_context_tokens`** — the cost axis, reported as
+  `max(root, sub)`. `average_peak_context_tokens_root` keeps the root-only
+  number beside it: counting only the root made this arm look far cheaper than
+  it is, since the sub model holds a whole slice of (unfreed) KV.
+- **`abstained`** — examples that ended with `FINAL_NONE`. These score 0 like a
+  wrong answer, so without this column an arm that honestly reports finding
+  nothing is indistinguishable from one that hallucinates.
 
 ### Prajna
 
@@ -220,7 +230,7 @@ comparison is invalid.
 Then aggregate:
 
 ```bash
-python -m evaluation.rlm.score evaluation/results/loft128k
+python -m evaluation.compare --backend rlm --results-dir evaluation/results/loft128k
 python -m evaluation.compare --dataset loft --csv loft128k.csv
 ```
 

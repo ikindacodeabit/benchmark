@@ -10,13 +10,21 @@ runs each failed to confirm for three different, unrelated reasons (slice too
 small, budget too generous, model too erratic) -- none of which say anything
 about whether KVzipSubClient itself works.
 
-Usage: run on a GPU node, e.g. via sbatch.
+Not named test_* and not a pytest module: it needs a real GPU and a real model,
+so collecting it as a test would fail everywhere the rest of the suite runs.
+Run it by hand on a GPU node:
+
+    KVZIP_SMOKE_MODEL=Qwen/Qwen3-4B-Instruct-2507 \\
+        python -m evaluation.rlm.kvzip_direct_smoke
 """
+import os
 import random
 
 from evaluation.rlm.kvzip_backend import KVzipSubClient
 
-MODEL = "/home/rethinkingai-self/25m0820/kvpress/Qwen3-4B-Instruct-2507"
+# A Hugging Face id or a local path. Defaults to the hub id rather than the
+# absolute path of one particular machine's checkout, which nobody else had.
+MODEL = os.environ.get("KVZIP_SMOKE_MODEL", "Qwen/Qwen3-4B-Instruct-2507")
 
 
 def build_context(n_chars: int, needle: str) -> str:
@@ -63,8 +71,10 @@ def main() -> None:
     if needle_value in answer:
         print("BONUS: the needle survived compression and the model found it.")
     else:
-        print("NOTE: the needle did not appear in the answer -- compression ran, but this specific "
-              "budget may have evicted the needle. That's a separate accuracy question, not a wiring bug.")
+        print(
+            "NOTE: the needle did not appear in the answer -- compression ran, but this specific "
+            "budget may have evicted the needle. That's a separate accuracy question, not a wiring bug."
+        )
 
 
 if __name__ == "__main__":

@@ -30,6 +30,7 @@ from evaluation.benchmarks.loaders import load_benchmark_dataset  # noqa: E402
 from evaluation.benchmarks.needle_in_haystack.utils import insert_needle_in_haystack  # noqa: E402
 from evaluation.benchmarks.registry import DATASET_REGISTRY  # noqa: E402
 from evaluation.benchmarks.results import score_prediction_frame  # noqa: E402
+from evaluation.textstats import think_tag_stats  # noqa: E402
 
 
 LOGGER = logging.getLogger("direct_baseline")
@@ -293,8 +294,37 @@ def json_safe(value: Any) -> Any:
     return str(value)
 
 
+# What the predictions actually depend on. Deliberately NOT the whole config:
+# hashing every field meant bumping log_level, moving output_dir, or resuming on
+# cuda:1 instead of cuda:0 invalidated the checkpoint and threw away a run that
+# could take days. Sampling knobs are included only when do_sample is on, since
+# greedy decoding ignores them.
+RESULT_AFFECTING_FIELDS = (
+    "dataset",
+    "data_dir",
+    "model",
+    "dtype",
+    "attn_implementation",
+    "trust_remote_code",
+    "model_kwargs",
+    "max_context_length",
+    "max_new_tokens",
+    "fraction",
+    "limit",
+    "seed",
+    "needle_depth",
+    "enable_thinking",
+    "do_sample",
+)
+SAMPLING_FIELDS = ("temperature", "top_p", "top_k")
+
+
 def fingerprint(config: BaselineConfig, task: str | None) -> str:
-    payload = {**asdict(config), "task": task, "inference_backend": "transformers.generate"}
+    fields = asdict(config)
+    payload: dict[str, Any] = {name: fields[name] for name in RESULT_AFFECTING_FIELDS}
+    if config.do_sample:
+        payload.update({name: fields[name] for name in SAMPLING_FIELDS})
+    payload.update(task=task, inference_backend="transformers.generate")
     return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
 
 
@@ -421,8 +451,6 @@ def run(config: BaselineConfig) -> None:
                 )
                 generated_ids = generated[0, input_ids.shape[-1] :]
                 prediction = tokenizer.decode(generated_ids, skip_special_tokens=True)
-                open_tags = len(re.findall(r"<think>", prediction, flags=re.IGNORECASE))
-                close_tags = len(re.findall(r"</think>", prediction, flags=re.IGNORECASE))
                 record = {
                     "fingerprint": run_fingerprint,
                     "row_index": int(row_index),
@@ -431,10 +459,7 @@ def run(config: BaselineConfig) -> None:
                     "retained_context_tokens": retained_tokens,
                     "prompt_tokens": int(input_ids.shape[-1]),
                     "generated_tokens": int(generated_ids.shape[-1]),
-                    "think_open_tags": open_tags,
-                    "think_close_tags": close_tags,
-                    "has_think_tag": bool(open_tags or close_tags),
-                    "unclosed_think": open_tags > close_tags,
+                    **think_tag_stats(prediction),
                 }
                 sink.write(json.dumps(record, ensure_ascii=False) + "\n")
                 sink.flush()

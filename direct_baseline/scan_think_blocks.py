@@ -6,8 +6,14 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import re
+import sys
 from pathlib import Path
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
+
+from evaluation.textstats import think_tag_stats  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -35,22 +41,22 @@ def main() -> None:
         with path.open(newline="", errors="replace") as source:
             for row in csv.DictReader(source):
                 rows += 1
-                prediction = str(row.get("predicted_answer", ""))
-                opens = len(re.findall(r"<think>", prediction, flags=re.IGNORECASE))
-                closes = len(re.findall(r"</think>", prediction, flags=re.IGNORECASE))
-                tagged_rows += bool(opens or closes)
-                unclosed_rows += opens > closes
-                open_tags += opens
-                close_tags += closes
-        reports.append({
-            "file": str(path),
-            "rows": rows,
-            "tagged_rows": tagged_rows,
-            "tagged_percent": 100 * tagged_rows / rows if rows else 0.0,
-            "unclosed_rows": unclosed_rows,
-            "open_tags": open_tags,
-            "close_tags": close_tags,
-        })
+                stats = think_tag_stats(str(row.get("predicted_answer", "")))
+                tagged_rows += stats["has_think_tag"]
+                unclosed_rows += stats["unclosed_think"]
+                open_tags += stats["think_open_tags"]
+                close_tags += stats["think_close_tags"]
+        reports.append(
+            {
+                "file": str(path),
+                "rows": rows,
+                "tagged_rows": tagged_rows,
+                "tagged_percent": 100 * tagged_rows / rows if rows else 0.0,
+                "unclosed_rows": unclosed_rows,
+                "open_tags": open_tags,
+                "close_tags": close_tags,
+            }
+        )
     total_rows = sum(report["rows"] for report in reports)
     total_tagged = sum(report["tagged_rows"] for report in reports)
     result = {

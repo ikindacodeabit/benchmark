@@ -3,7 +3,7 @@
 """In-process KV-compression backend for RLM sub-calls, via kvpress's own KVzipPress.
 
 `KVzipSubClient` is duck-typed to the surface `rlm.py` consumes from
-`NIMClient` (`.chat()`, `.usage`, `.extra_body`, `.model`) and adds
+`LLMClient` (`.chat()`, `.usage`, `.extra_body`, `.model`) and adds
 `.chat_split(question, context)`, which routes through
 `kvpress.presses.kvzip_press.KVzipPress` and
 `kvpress.pipeline.KVPressTextGenerationPipeline` -- the exact same press and
@@ -89,16 +89,33 @@ def preflight_select_gpu(min_free_gib: float, device: Optional[str] = None) -> i
     if not gpus:
         raise RuntimeError(
             "No NVIDIA GPU visible (nvidia-smi failed). --sub-backend kvzip loads the sub model "
-            "in-process and needs a local GPU; use --sub-backend nim on CPU-only hosts."
+            "in-process and needs a local GPU; use --sub-backend http on CPU-only hosts."
         )
     table = "; ".join(f"GPU{g['index']}: {g['free_gib']:.1f}/{g['total_gib']:.1f} GiB free" for g in gpus)
 
+    # nvidia-smi reports PHYSICAL indices, but under a pre-set
+    # CUDA_VISIBLE_DEVICES (SLURM sets one routinely) torch device ordinals --
+    # and therefore --sub-device cuda:N -- are LOGICAL indices into that mask.
+    # Resolve through the mask so cuda:1 means "my second allocated GPU", and
+    # never pin outside the allocation.
+    mask = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    visible = [int(p) for p in mask.split(",") if p.strip()] if mask else None
+
     pinned: Optional[int] = None
     if device and device.startswith("cuda:"):
-        pinned = int(device.split(":", 1)[1])
-    elif os.environ.get("CUDA_VISIBLE_DEVICES", "").strip():
+        ordinal = int(device.split(":", 1)[1])
+        if visible is not None:
+            if ordinal >= len(visible):
+                raise RuntimeError(
+                    f"--sub-device {device} is out of range: CUDA_VISIBLE_DEVICES={mask!r} "
+                    f"exposes only {len(visible)} GPU(s)."
+                )
+            pinned = visible[ordinal]
+        else:
+            pinned = ordinal
+    elif visible is not None:
         # Already pinned externally; check the first visible physical GPU.
-        pinned = int(os.environ["CUDA_VISIBLE_DEVICES"].split(",")[0])
+        pinned = visible[0]
 
     if pinned is not None:
         match = next((g for g in gpus if g["index"] == pinned), None)
@@ -143,7 +160,7 @@ class KVzipSubClient:
         device: Optional[str] = None,
         max_new_tokens: int = 512,
         max_context_tokens: int = 34000,
-        press_min_tokens: int = 1024,
+        press_min_tokens: Optional[int] = None,
         min_free_gib: float = 14.0,
     ):
         if press_name not in SUB_PRESS_CHOICES:
@@ -156,13 +173,24 @@ class KVzipSubClient:
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
         from kvpress.model_adapter import get_model_adapter
-        from kvpress.pipeline import KVPressTextGenerationPipeline
+        from kvpress.pipeline import KVPressTextGenerationPipeline, compute_token_budget_from_memory
         from kvpress.presses.kvzip_press import KVzipPress
 
         self.model = model
         self.extra_body: Optional[dict] = None  # assignable no-op (chat_template_kwargs don't apply here)
         self.usage = Usage()
-        hf_model = AutoModelForCausalLM.from_pretrained(model, dtype="auto", device_map="auto", trust_remote_code=True)
+        # `torch_dtype`, not `dtype`: this backend runs from the MAIN venv, which
+        # pins transformers==4.51.3 because vLLM 0.8.5 calls
+        # `all_special_tokens_extended` (removed in 5.x). 4.51.3 knows only
+        # `torch_dtype` and forwards an unrecognised `dtype` straight to the model
+        # constructor, so arm 4 died at load with
+        # "Qwen3ForCausalLM.__init__() got an unexpected keyword argument 'dtype'".
+        # transformers 5.x still accepts `torch_dtype` (modeling_utils pops it with
+        # a deprecation warning), so the old spelling is the one that works in both
+        # this venv and .venv-kvpress.
+        hf_model = AutoModelForCausalLM.from_pretrained(
+            model, torch_dtype="auto", device_map="auto", trust_remote_code=True
+        )
         hf_model.eval()
         tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
         self.pipeline = KVPressTextGenerationPipeline(model=hf_model, tokenizer=tokenizer)
@@ -172,6 +200,19 @@ class KVzipSubClient:
         self.memory_budget_unit = memory_budget_unit
         self.max_new_tokens = max_new_tokens
         self.max_context_tokens = max_context_tokens
+        # Below this many tokens, pressing is skipped outright. Derived from the
+        # memory budget itself rather than a fixed constant: kvpress's own
+        # compression math already yields ratio=0 for ctx_tokens <= token_budget
+        # (nothing to evict), so skipping the press call below that point is a
+        # free no-op, not a missed opportunity. A fixed floor (the previous
+        # default was 1024) is wrong at small budgets -- e.g. 100MB for
+        # Qwen3-4B is a ~678-token budget, so a 1024-token floor would skip
+        # pressing on calls that are already over budget and have something to
+        # evict. Still overridable via --press-min-tokens for anyone who wants
+        # the old fixed-floor behavior.
+        if press_min_tokens is None:
+            token_budget, _, _ = compute_token_budget_from_memory(hf_model, memory_budget, memory_budget_unit)
+            press_min_tokens = token_budget
         self.press_min_tokens = press_min_tokens
         self._example_stats: list[dict] = []
         # Same helper the rest of kvpress uses to convert a GB budget into a
@@ -197,6 +238,9 @@ class KVzipSubClient:
         target_compression_ratio: float,
         cli_max_context_tokens: Optional[int] = None,
         reserve_tokens: int = DEFAULT_RESERVE_TOKENS,
+        char_overshoot: float = 1.0,
+        require_budget_binding: bool = False,
+        apply_cli_context_cap: bool = True,
     ) -> SubcallSizing:
         """Size the chunk advertised to the root from this client's KV budget.
 
@@ -208,7 +252,7 @@ class KVzipSubClient:
         chars-per-token ratio is measured from it rather than assumed, because a
         wrong ratio overshoots the token cap and the context is then truncated.
         """
-        # Deferred like every other kvpress/torch import in this module: the nim
+        # Deferred like every other kvpress/torch import in this module: the http
         # path must stay importable where they are absent.
         from kvpress.model_adapter import get_model_adapter
         from kvpress.pipeline import compute_token_budget_from_memory
@@ -237,26 +281,41 @@ class KVzipSubClient:
             memory_budget=self.memory_budget,
             memory_budget_unit=self.memory_budget_unit,
             sub_window_tokens=sub_window_tokens,
-            cli_max_context_tokens=cli_max_context_tokens or self.max_context_tokens,
+            cli_max_context_tokens=(
+                (cli_max_context_tokens or self.max_context_tokens) if apply_cli_context_cap else None
+            ),
             gpu_free_bytes=free_bytes,
             reserve_tokens=reserve_tokens,
+            char_overshoot=char_overshoot,
+            require_budget_binding=require_budget_binding,
         )
         self.subcall_sizing = sizing
         print(f"[kvzip] sub-chunk sizing: {sizing.describe()}")
         print(f"[kvzip] caps considered: {sizing.caps}")
         return sizing
 
-    # ---- NIMClient-compatible surface ---------------------------------------
+    # ---- LLMClient-compatible surface ---------------------------------------
     def chat(self, messages: list[dict], **kw: Any) -> str:
         """Legacy one-string path (root emitted a plain llm_query(prompt) call).
 
-        The flattened text is treated as KVzip `context` with an empty
-        question, so a big single-arg paste is still compressed instead of the
-        arm silently degenerating to dense. Tiny prompts (< press_min_tokens)
-        skip the press: compressing a two-line question is pure noise.
+        User content is treated as KVzip `context`, so a big single-arg paste is
+        still compressed instead of the arm silently degenerating to dense. Tiny
+        prompts (< press_min_tokens) skip the press: compressing a two-line
+        question is pure noise.
+
+        The SYSTEM message rides the uncompressed question side, as it does in
+        chat_split. Flattening every role into `context` put the sub model's own
+        instructions under KV masking -- the one span whose tokens are all load
+        bearing, and the reason an evicted instruction shows up as the sub model
+        ignoring its format rules rather than as a memory saving.
         """
-        text = "\n\n".join(str(m.get("content", "")) for m in messages if m.get("content"))
-        return self._generate(context=text, question="", split=False, **kw)
+        system = "\n\n".join(
+            str(m.get("content", "")) for m in messages if m.get("role") == "system" and m.get("content")
+        )
+        text = "\n\n".join(
+            str(m.get("content", "")) for m in messages if m.get("role") != "system" and m.get("content")
+        )
+        return self._generate(context=text, question=system, split=False, **kw)
 
     def chat_split(self, question: str, context: str, system: Optional[str] = None, **kw: Any) -> str:
         """Context-aware path: `context` is compressed, question side is not."""
@@ -279,15 +338,22 @@ class KVzipSubClient:
         free_bytes, _ = self._torch.cuda.mem_get_info()
         return ctx_tokens <= gpu_fit_token_cap(free_bytes, self._kv_bytes_per_token)
 
+    def _truncate_context_to_token_cap(self, context: str) -> tuple[str, int, int]:
+        """Return text, its measured token count, and requested tokens dropped."""
+        original_tokens = self._token_len(context)
+        if original_tokens <= self.max_context_tokens:
+            return context, original_tokens, 0
+        ids = self.pipeline.tokenizer.encode(context, add_special_tokens=False)
+        context = str(self.pipeline.tokenizer.decode(ids[: self.max_context_tokens]))
+        # The measured count, not the requested cap: decode -> encode is not
+        # token-count preserving for every tokenizer.
+        return context, self._token_len(context), original_tokens - self.max_context_tokens
+
     def _generate(self, context: str, question: str, split: bool, **kw: Any) -> str:
-        ctx_tokens = self._token_len(context)
-        if ctx_tokens > self.max_context_tokens:
+        context, ctx_tokens, dropped = self._truncate_context_to_token_cap(context)
+        if dropped:
             # Token-level analogue of kvpress's max_context_length truncation:
             # a 131072-char slice of dense text can exceed the model window.
-            ids = self.pipeline.tokenizer.encode(context, add_special_tokens=False)
-            context = self.pipeline.tokenizer.decode(ids[: self.max_context_tokens])
-            dropped = ctx_tokens - self.max_context_tokens
-            ctx_tokens = self.max_context_tokens
             # Tell the root, the same way llm_query's char cap does. This used to
             # be silent, so a slice sized in chars that overflowed the token cap
             # lost its tail with nothing in the transcript to explain a miss.
@@ -298,6 +364,11 @@ class KVzipSubClient:
                 f"({dropped} dropped from the end); pass a smaller snippet]"
             )
         prune = self.press is not None and ctx_tokens >= self.press_min_tokens
+        if prune:
+            # Presses carry per-call state; evaluate.py resets between matrix
+            # configurations for the same reason. One shared instance serving
+            # every sub-call of a run must not leak scores across calls.
+            self.press._reset_internal_parameters()
         if not self._fits_in_memory(ctx_tokens):
             self._torch.cuda.empty_cache()
             if not self._fits_in_memory(ctx_tokens):
@@ -317,9 +388,14 @@ class KVzipSubClient:
                 memory_budget=self.memory_budget if prune else None,
                 memory_budget_unit=self.memory_budget_unit,
                 max_new_tokens=max_new,
+                # Enforce the cell after the pipeline adds chat-template tokens.
+                # Raw decode->encode truncation alone can drift and the template
+                # itself adds a small header, both of which would move factor 1x
+                # away from the identity cell.
+                max_context_length=self.max_context_tokens,
             )
             answer = str(result["answer"])
-            stats = getattr(self.pipeline, "last_memory_budget_stats", {}) if prune else {}
+            stats = getattr(self.pipeline, "last_memory_budget_stats", {})
         except self._torch.cuda.OutOfMemoryError:
             return "[SUB-MODEL ERROR] the provided text did not fit in GPU memory; retry with a smaller snippet."
         finally:
@@ -332,7 +408,10 @@ class KVzipSubClient:
             {
                 "split": split,
                 "pressed": prune,
-                "context_tokens": ctx_tokens,
+                # Prefer the pipeline's post-chat-template count: this is the
+                # context length the press actually saw and used in its ratio.
+                "context_tokens": stats.get("context_tokens", ctx_tokens),
+                "target_context_tokens": self.max_context_tokens,
                 "retained_context_tokens": stats.get("retained_context_tokens", ctx_tokens),
                 "compression_ratio": stats.get("compression_ratio", 0.0) if prune else 0.0,
             }
@@ -353,10 +432,17 @@ class KVzipSubClient:
         if not calls:
             return {}
         n = len(calls)
+        on_target = sum(
+            1
+            for c in calls
+            if abs(c["context_tokens"] - c["target_context_tokens"]) <= 0.02 * c["target_context_tokens"]
+        )
         return {
             "calls": n,
             "split_calls": sum(1 for c in calls if c["split"]),
             "pressed_calls": sum(1 for c in calls if c["pressed"]),
+            "context_tokens_on_target_calls": on_target,
+            "target_context_tokens": self.max_context_tokens,
             "average_context_tokens": sum(c["context_tokens"] for c in calls) / n,
             "max_context_tokens": max(c["context_tokens"] for c in calls),
             "average_retained_context_tokens": sum(c["retained_context_tokens"] for c in calls) / n,

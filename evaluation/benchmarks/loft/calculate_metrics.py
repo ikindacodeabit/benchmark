@@ -117,6 +117,18 @@ def compute_multi_value_subspan_em(
     scores: np.ndarray = np.zeros([len(gold_answers), len(pred_answers)])
     for gold_index, gold_item in enumerate(gold_answers):
         for pred_index, pred_item in enumerate(pred_answers):
+            # `pred_item and` guards the empty string, which is a substring of
+            # every gold answer and so matched everything through the second
+            # test. A model answering "Final Answer: []" extracts to ["[]"],
+            # which normalize_answers strips to [""], and a single-item gold list
+            # then scored a full 1.0 for answering nothing. On LOFT-1m quest that
+            # was the baseline's ENTIRE score: 23 of 110 rows, every one of them
+            # an empty prediction, reported as subspan_em 0.209 against a true
+            # 0.000. Only the second test needs the guard -- `gold in ""` is
+            # already false -- but an empty gold item is equally degenerate, so
+            # both sides must be non-empty to count as a match.
+            if not gold_item or not pred_item:
+                continue
             if gold_item in pred_item or pred_item in gold_item:
                 scores[gold_index, pred_index] = 1
     row_ind, col_ind = scipy.optimize.linear_sum_assignment(-scores)

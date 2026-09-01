@@ -163,3 +163,55 @@ def test_enumerated_prose_becomes_a_list():
 def test_empty_prediction_returns_empty_list():
     assert extract_answers(None) == []
     assert extract_answers("   ") == []
+
+
+# --- empty predictions must never score on the multi-value subsets -------------
+# qampari and quest score through compute_multi_value_subspan_em, whose match test
+# runs BOTH directions (`gold in pred or pred in gold`). The empty string is a
+# substring of every gold answer, so it matched everything: "Final Answer: []"
+# extracts to ["[]"], normalize_answers strips that to [""], and a single-item gold
+# list scored a full 1.0 for answering nothing. On the LOFT-1m quest run that was
+# the baseline's ENTIRE score -- 23 of 110 rows, every one an empty prediction,
+# reported as 0.209 against a true 0.000, which inverted the arm comparison.
+
+
+@pytest.mark.parametrize("task", ["qampari_1m", "quest_1m"])
+def test_empty_list_answer_scores_zero_against_one_gold(task):
+    """The exact shape that inflated the LOFT-1m baseline."""
+    m = calculate_metrics(_frame("Final Answer: []", ["Spartacus (film)"], task=task))
+
+    assert m["subspan_em"] == 0.0
+    assert m["em"] == 0.0
+
+
+@pytest.mark.parametrize("task", ["qampari_1m", "quest_1m"])
+def test_empty_list_answer_scores_zero_against_several_golds(task):
+    m = calculate_metrics(_frame("Final Answer: []", ["Laal Paree", "Roja (film)"], task=task))
+
+    assert m["subspan_em"] == 0.0
+
+
+def test_a_genuine_multi_value_match_still_scores():
+    """Guards against fixing the hole by breaking real matches."""
+    m = calculate_metrics(
+        _frame("Final Answer: ['Spartacus (film)']", ["Spartacus (film)"], task="quest_1m")
+    )
+
+    assert m["subspan_em"] == 1.0
+
+
+def test_a_genuine_subspan_still_scores():
+    """The bidirectional test is the point of subspan_em -- a prediction that
+    contains the gold, or is contained by it, must still count."""
+    m = calculate_metrics(_frame("Final Answer: ['Spartacus']", ["Spartacus (film)"], task="quest_1m"))
+
+    assert m["subspan_em"] == 1.0
+
+
+def test_the_single_value_path_was_never_affected():
+    """nq/hotpotqa/musique go through compute_subspan_em, which tests one
+    direction only (`gold in pred`), so an empty prediction never scored there.
+    Pinned so the two paths cannot silently converge on the broken behaviour."""
+    m = calculate_metrics(_frame("Final Answer: []", ["Tyrion Lannister"], task="nq_1m"))
+
+    assert m["subspan_em"] == 0.0

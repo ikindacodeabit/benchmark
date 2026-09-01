@@ -19,9 +19,13 @@ RESULTS="${RESULTS:-evaluation/results/loft128k}"
 MODEL="${MODEL:-Qwen/Qwen3-4B-Instruct-2507}"
 MAX_NOTES_TOKENS="${MAX_NOTES_TOKENS:-1024}"
 LOGS="${LOGS:-$RESULTS/logs}"
+# Arms 1-3 caps. Defaults are the 128k values; LENGTH=1m needs both raised (see
+# the --vanilla-char-limit note above COMMON). The arm-4 lanes already take their
+# timeout from KV_RUN_TIMEOUT_4*, so this keeps every cap on the same footing.
+VANILLA_CHAR_LIMIT="${VANILLA_CHAR_LIMIT:-700000}"
+VANILLA_MAX_PROMPT_TOKENS="${VANILLA_MAX_PROMPT_TOKENS:-134000}"
+RUN_TIMEOUT="${RUN_TIMEOUT:-900}"
 
-# client.py no longer needs NVIDIA_API_KEY for a local base_url; only the
-# hosted catalog requires one.
 export TOKENIZERS_PARALLELISM=false
 export PYTHONUNBUFFERED=1
 
@@ -90,11 +94,15 @@ fi
 # served by a SMALL root server (see run_infolab.sh colocation sizing), and a
 # vanilla arm pointed at it would shrink-retry against the reduced window and
 # merge truncated rows into the existing vanilla checkpoints. The driver runs
-# from the MAIN venv (KVzip pins transformers==4.51.3, same as the vLLM server,
-# so no separate venv is needed); the sub model is hosted in-process on
-# RLM_SUB_GPU.
+# from the KVPRESS venv, NOT the main one -- kvpress needs transformers >=4.56
+# for the new Cache API while the main venv pins 4.51.3 for vLLM 0.8.5. Only the
+# vLLM server needs that pin, and it is a separate process, so the two live
+# side by side. The sub model is hosted in-process on RLM_SUB_GPU.
 if [ -n "${KVPRESS_ARMS:-}" ]; then
-    KVPY="${KVZIP_PYTHON:-.venv/bin/python}"
+    # Default off VENV, not a bare `.venv`: the venv is not always inside the repo
+    # (on the infolab hosts it lives on scratch, e.g. /mnt/nas/$USER/venvs/rlm),
+    # and a repo-relative default also silently depends on the caller's cwd.
+    KVPY="${KVZIP_PYTHON:-${VENV:-.venv}/bin/python}"
     if [ ! -x "$KVPY" ]; then
         echo "ERROR: no venv python at $KVPY; run run_infolab.sh setup first (or set KVZIP_PYTHON)" >&2
         exit 1
@@ -108,7 +116,6 @@ if [ -n "${KVPRESS_ARMS:-}" ]; then
         --base-url "http://localhost:$PORT/v1"
         --root-model "$MODEL"
         --sub-model "$MODEL"
-        --rpm 600
         --max-steps 50
         --exec-timeout 60
         --out "$RESULTS"
@@ -144,8 +151,29 @@ if [ -n "${KVPRESS_ARMS:-}" ]; then
                 --max-sub-calls 16
                 --run-timeout "${KV_RUN_TIMEOUT_4C:-3600}"
             ) ;;
+            # 4d is 4b with a FLOOR under the slice instead of only a ceiling over
+            # it. 4a/4b/4c all measured a press that never engaged: the root sent a
+            # mean of 1023 chars per call against their caps, and 4b's realized
+            # slice was 384 tokens against a 1024-token press_min_tokens. Raising
+            # the ceiling had already been tried -- 32k->131k chars moved the slice
+            # by 108 tokens -- so this makes the size a rule the harness enforces.
+            #
+            # WHY 65536 AND NOT SOMETHING SMALLER. Two thresholds have to be cleared,
+            # and only the second one bites. press_min_tokens (1024 tok, ~4k chars)
+            # decides whether the press RUNS; the KV token budget decides whether it
+            # EVICTES anything, because the pipeline derives each call's ratio as
+            # 1 - min(ctx, budget)/ctx. At 1 GB the budget is ~6.8k tokens, so a
+            # 4k-token slice clears press_min_tokens and still compresses by exactly
+            # zero. 65536 chars is ~16k tokens: ratio ~0.59 at 1 GB, ~0.79 at
+            # 0.512 GB, and comfortably inside --sub-max-context-tokens (34000).
+            4d) EXTRA=(
+                --max-subcall-chars 131072
+                --min-subcall-chars "${KV_MIN_SUBCALL_CHARS:-65536}"
+                --max-sub-calls "${KV_MAX_SUB_CALLS_4D:-12}"
+                --run-timeout "${KV_RUN_TIMEOUT_4D:-3600}"
+            ) ;;
             *)
-                echo "ERROR: unknown KV_ARMS entry '$arm' (use 4a, 4b and/or 4c)" >&2
+                echo "ERROR: unknown KV_ARMS entry '$arm' (use 4a, 4b, 4c and/or 4d)" >&2
                 exit 2
                 ;;
             esac
@@ -167,6 +195,13 @@ fi
 # The 400k default would silently cut the baseline to ~77% of the document and
 # hand the RLM arm a win it did not earn. Bound the prompt by TOKENS instead.
 #
+# At LENGTH=1m the 700k default binds FIRST -- a ~931k-token LOFT-1m document is
+# ~3.7M characters, so the char cap, not the token cap, decides what the baseline
+# reads, and `context_retained` then reports the truncation ratio (~0.19) instead
+# of the fraction the model actually saw (~0.14 = 134k tokens / ~931k). Raise
+# VANILLA_CHAR_LIMIT above the document size at 1m so the TOKEN cap governs and
+# the metric means what it says.
+#
 # NOTE: no --no-think and no --reasoning-parser anywhere in this pipeline.
 # Qwen3-*-Instruct-2507 is a non-thinking model; it emits no <think> blocks, and
 # the enable_thinking chat-template kwarg does not apply to its template.
@@ -177,12 +212,11 @@ COMMON=(
     --base-url "http://localhost:$PORT/v1"
     --root-model "$MODEL"
     --sub-model "$MODEL"
-    --rpm 600
     --max-steps 50
-    --vanilla-char-limit 700000
-    --vanilla-max-prompt-tokens 134000
+    --vanilla-char-limit "$VANILLA_CHAR_LIMIT"
+    --vanilla-max-prompt-tokens "$VANILLA_MAX_PROMPT_TOKENS"
     --exec-timeout 60
-    --run-timeout 900
+    --run-timeout "$RUN_TIMEOUT"
     --max-sub-calls 40
     --out "$RESULTS"
 )

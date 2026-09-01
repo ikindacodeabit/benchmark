@@ -17,11 +17,11 @@
 #   DATASETS="nq" LIMIT=3 LENGTH=32k bash evaluation/rlm/loft128k/run_infolab.sh run
 #
 # SIZING on a 48 GB card. Qwen3-4B-2507 is 36 layers x 8 KV heads x 128 head_dim
-# = 144 KiB per token, so one 128k sequence needs ~18 GB of KV on top of ~8 GB of
-# bf16 weights. On an EMPTY card (util cap 0.85 -> ~41 GB) that is roughly 1.8
-# concurrent sequences. On a card already holding another user's 13 GB job the cap
-# lands near 0.59 -> ~29 GB, which fits the weights and barely ONE 128k sequence.
-# It still runs; it is just slow. Prefer the emptiest cards.
+# = 144 KiB per token, so one 139264-token sequence needs ~19.1 GiB of KV on top
+# of ~7.5 GiB of bf16 weights, plus ~2 GB of activations and non-torch overhead:
+# about 29 GB, which is what ROOT_NEED_MIB encodes. The server asks for THAT much
+# rather than for the whole card, so co-tenants keep what they hold. Prefer the
+# emptiest cards anyway -- a card with under MIN_FREE_MIB free is skipped.
 set -euo pipefail
 
 MODEL="${MODEL:-Qwen/Qwen3-4B-Instruct-2507}"
@@ -32,13 +32,22 @@ DATASETS="${DATASETS:-nq hotpotqa musique qampari quest}"
 RESULTS="${RESULTS:-evaluation/results/loft128k}"
 LOGS="${LOGS:-$RESULTS/logs}"
 VENV="${VENV:-.venv}"
-# Second venv for the cell-5 kvzip vanilla baseline (kvpress evaluate.py). The
-# RLM venv above pins transformers==4.51.3 for the vLLM server; kvpress needs
-# >=4.56 (new Cache API), so the two cannot share an environment. Arm 4 no
-# longer uses this venv: its sub-calls go through standalone KVzip (cloned by
-# setup into $KVZIP_DIR), which pins the same 4.51.3 as the server, so the
-# arm-4 driver runs from the MAIN venv.
+# Second venv for anything that imports kvpress: the cell-5 kvzip baseline AND
+# the arm-4 driver. The RLM venv above pins transformers==4.51.3 for the vLLM
+# server; kvpress needs >=4.56 (new Cache API), so the two cannot share an
+# environment. This used to claim arm 4 ran from the MAIN venv "because KVzip
+# pins 4.51.3 too" -- it does not work: under 4.51.3 the imports all succeed and
+# KVzipPress() constructs fine, so the mistake only surfaces once the press
+# touches a DynamicCache that has no `.layers`.
 KVPRESS_VENV="${KVPRESS_VENV:-.venv-kvpress}"
+# Which python runs the ARM-4 driver. It must be the kvpress venv, not $VENV:
+# $VENV pins transformers==4.51.3 because vLLM 0.8.5 calls
+# `all_special_tokens_extended` (gone in 5.x), but kvpress needs >=4.56 for the
+# new Cache API -- under 4.51.3 `DynamicCache()` has no `.layers` and the press
+# fails once it touches the cache. Both constraints are satisfiable at once only
+# because they live in different PROCESSES: the vLLM server is its own process on
+# $VENV, while the arm-4 driver only speaks HTTP to it and can run on 5.x.
+KVZIP_PYTHON="${KVZIP_PYTHON:-$KVPRESS_VENV/bin/python}"
 
 # --- arm-4 colocation mode (KVPRESS_ARMS=1) -----------------------------------
 # Arm 4 puts TWO models on one card: the vLLM root server plus the in-process HF
@@ -58,8 +67,10 @@ KVPRESS_VENV="${KVPRESS_VENV:-.venv-kvpress}"
 if [ -n "${KVPRESS_ARMS:-}" ]; then
     MIN_FREE_MIB="${MIN_FREE_MIB:-38000}"
 else
-    # 8 GB of weights plus enough KV for at least one 128k sequence.
-    MIN_FREE_MIB="${MIN_FREE_MIB:-30000}"
+    # Must cover ROOT_NEED_MIB plus HEADROOM_MIB: at 30000 the gate admitted cards
+    # on which a 139264-token window only just fit, and a co-tenant arriving during
+    # startup pushed the engine core over.
+    MIN_FREE_MIB="${MIN_FREE_MIB:-33000}"
 fi
 # Leave headroom so a co-tenant's job growing slightly does not OOM the server.
 HEADROOM_MIB="${HEADROOM_MIB:-2000}"
@@ -70,6 +81,11 @@ KV_ROOT_MAX_LEN="${KV_ROOT_MAX_LEN:-65536}"
 # overhead. Capping it stops a near-empty card from handing the root a KV pool
 # far larger than its window can ever use.
 ROOT_BUDGET_MIB="${ROOT_BUDGET_MIB:-21000}"
+# What a NON-colocated root may take for itself (see the sizing note in the header):
+# ~19.1 GiB of KV for one 139264-token sequence, ~7.5 GiB of weights, ~2 GB of
+# activations and non-torch overhead. Asking for this rather than for the whole
+# card is what keeps a shared host usable by everyone else on it.
+ROOT_NEED_MIB="${ROOT_NEED_MIB:-31000}"
 
 # Some infolab hosts mix A6000 (sm_86) and RTX 6000 Ada (sm_89). CUDA orders
 # devices FASTEST_FIRST by default while nvidia-smi reports PCI order, so without
@@ -152,40 +168,19 @@ if [ "$1" = "setup" ]; then
     # at tokenizer init with "Qwen2Tokenizer has no attribute
     # all_special_tokens_extended". pip will warn about the kvpress conflict; that is
     # expected and harmless here, because the RLM arm never imports the presses.
-    # Bonus: standalone KVzip pins the SAME 4.51.3, so the arm-4 driver (which
-    # hosts the KVzip sub model in-process) runs from THIS venv too; only the
-    # cell-5 kvpress baseline still needs the separate venv below.
+    # Bonus: the arm-4 driver (which hosts the sub model in-process through
+    # kvpress's KVzipPress) runs from THIS venv too; only the cell-5 kvpress
+    # baseline still needs the separate venv below.
     pip install "transformers==${TRANSFORMERS_VERSION:-4.51.3}"
-
-    # --- standalone KVzip (arm 4 sub-call backend) ----------------------------
-    # Clone + build its CUDA kernel, but do NOT `pip install -e` the repo: its
-    # pyproject pins torch==2.3.0 and would clobber vLLM's torch. The backend
-    # imports the checkout via KVZIP_DIR instead.
-    KVZIP_DIR="${KVZIP_DIR:-KVzip}"
-    if [ ! -f "$KVZIP_DIR/model/wrapper.py" ]; then
-        git clone --depth 1 https://github.com/snu-mllab/KVzip "$KVZIP_DIR"
-    fi
-    # flash-attn: KVzip's evict cache decodes through flash_attn_varlen_func;
-    # there is no sdpa fallback. Prebuilt wheels exist for torch 2.6 + cu12x.
-    pip install ninja packaging
-    pip install "flash-attn==${FLASH_ATTN_VERSION:-2.7.4.post1}" --no-build-isolation
-    # tiny_api_cuda: KVzip's kernel for flattening the pruned cache.
-    (cd "$KVZIP_DIR/csrc" && python build.py install)
 
     # Probe the exact seams arm 4 depends on, HERE, where the error message can
     # say what to fix -- not five minutes into a GPU run.
-    KVZIP_DIR="$KVZIP_DIR" python - <<'PY'
-import os
-import sys
-
-sys.path.insert(0, os.path.abspath(os.environ["KVZIP_DIR"]))
-
-import flash_attn  # noqa: F401
-import tiny_api_cuda  # noqa: F401
-from model import ModelKVzip  # noqa: F401
-
-print("KVzip OK: ModelKVzip, flash-attn and tiny_api_cuda importable")
-
+    #
+    # Arm 4 used to run standalone snu-mllab/KVzip, which had to be cloned here
+    # along with flash-attn and its tiny_api_cuda kernel. It now goes through
+    # kvpress's own KVzipPress, which needs none of that -- the clone and the two
+    # builds were pure setup cost for an import nothing makes any more.
+    python - <<'PY'
 from evaluation.rlm.kvzip_backend import SUB_PRESS_CHOICES  # import-graph check
 
 print(f"kvzip_backend OK: presses {SUB_PRESS_CHOICES}")
@@ -291,6 +286,7 @@ PY
     echo "setup done. Next: DATASETS=\"nq\" LENGTH=32k LIMIT=3 SERVERS=1 $0 auto"
     echo "arm 4:      KVPRESS_ARMS=1 KV_BUDGETS=1 KV_ARMS=4a DATASETS=nq LENGTH=32k LIMIT=1 SERVERS=1 $0 auto"
     echo "arm 4c:     KVPRESS_ARMS=1 KV_BUDGETS=1 KV_ARMS=4c KV_TARGET_RATIO=0.75 DATASETS=nq LENGTH=32k LIMIT=1 SERVERS=1 $0 auto"
+    echo "arm 4d:     KVPRESS_ARMS=1 KV_BUDGETS=1 KV_ARMS=4d KV_MIN_SUBCALL_CHARS=65536 DATASETS=nq LENGTH=32k LIMIT=1 SERVERS=1 $0 auto"
     echo "cell 5:     DATASETS=nq KV_RATIOS=0.5 $0 kvzip-baseline"
     exit 0
 fi
@@ -321,12 +317,19 @@ pick_gpus() {
 # shortfall. That is not theoretical: on bee 2026-08-18, util 0.44 on a card with
 # ~10 GB of co-tenants left the root 1.40 GiB of KV against the 9.00 GiB one
 # 65536-token sequence needs, and the engine core refused to start.
+# Take what the server NEEDS, not the whole card. The previous shape was
+# (t-f) + (f-h), whose free terms cancel to (t-h)/t -- a constant 0.90 on any card
+# bigger than 20 GB, with HEADROOM_MIB inert. That claimed 90% of a shared GPU
+# however little the server actually needed, and the 0.90 ceiling then silently
+# capped the headroom at 10% of the card. Same total-device correction as before,
+# but the "own" term is now bounded by ROOT_NEED_MIB, exactly as kv_util_for does.
 util_for() {
     local idx="$1" free total
     free=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits -i "$idx")
     total=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits -i "$idx")
-    awk -v f="$free" -v t="$total" -v h="$HEADROOM_MIB" \
-        'BEGIN{u=(t-f+f-h)/t; if(u>0.90)u=0.90; if(u<0.50)u=0.50; printf "%.2f", u}'
+    awk -v f="$free" -v t="$total" -v h="$HEADROOM_MIB" -v n="$ROOT_NEED_MIB" \
+        'BEGIN{own=f-h; if(own>n)own=n; u=(t-f+own)/t;
+               if(u>0.90)u=0.90; if(u<0.50)u=0.50; printf "%.2f", u}'
 }
 
 # Colocation variant: the root shares the card with the ~16 GB in-process sub
@@ -410,10 +413,23 @@ serve)
     ;;
 
 run)
+    # Arm 4 hosts a ~16 GB sub model in-process, and run_cells.sh pins it with
+    # CUDA_VISIBLE_DEVICES="${RLM_SUB_GPU:-0}". `auto` passes RLM_SUB_GPU; this
+    # path did not, so the sub model landed on physical GPU 0 whatever card was
+    # serving -- somebody else's, on a shared host. Demand the card explicitly
+    # rather than guessing, since this path cannot know which GPU serves $PORT.
+    SUB_GPU_FOR_RUN="${RLM_SUB_GPU:-${GPU:-}}"
+    if [ -n "${KVPRESS_ARMS:-}" ] && [ -z "$SUB_GPU_FOR_RUN" ]; then
+        echo "ERROR: KVPRESS_ARMS is set but neither RLM_SUB_GPU nor GPU is." >&2
+        echo "  Arm 4 loads a ~16 GB sub model; name the card to put it on, e.g." >&2
+        echo "  RLM_SUB_GPU=4 ... $0 run" >&2
+        exit 2
+    fi
     for ds in $DATASETS; do
         DATASET="$ds" LENGTH="$LENGTH" PORT="$PORT" LIMIT="$LIMIT" \
             RESULTS="$RESULTS" MODEL="$MODEL" LOGS="$LOGS" \
-            KVPRESS_PYTHON="$KVPRESS_VENV/bin/python" \
+            VENV="$VENV" KVZIP_PYTHON="$KVZIP_PYTHON" \
+            ${SUB_GPU_FOR_RUN:+RLM_SUB_GPU="$SUB_GPU_FOR_RUN"} \
             bash evaluation/rlm/loft128k/run_cells.sh
     done
     ;;
@@ -444,7 +460,7 @@ auto)
     # here is the backgrounded subshell, and killing it orphans the vllm child
     # inside -- the children must be killed too (pkill -P).
     cleanup() {
-        trap - EXIT INT TERM
+        trap - EXIT INT TERM HUP
         echo "shutting down servers: ${PIDS[*]-}"
         for p in "${PIDS[@]-}"; do
             pkill -TERM -P "$p" 2>/dev/null || true
@@ -452,7 +468,11 @@ auto)
         done
         exit "${1:-0}"
     }
-    trap 'cleanup 130' INT TERM
+    # HUP as well as INT/TERM: a dropped ssh session sends SIGHUP, and without a
+    # handler for it the script died while its vllm children kept the port and
+    # ~44 GB of GPU memory until someone killed them by hand. Run under tmux
+    # anyway -- this makes the accident survivable, it does not make it fine.
+    trap 'cleanup 130' INT TERM HUP
     trap 'cleanup $?' EXIT
 
     for i in "${!GPUS[@]}"; do
@@ -488,7 +508,7 @@ auto)
                 if [ $((j % ${#GPUS[@]})) -eq "$i" ]; then
                     DATASET="${DS_ARR[$j]}" LENGTH="$LENGTH" PORT="$p" LIMIT="$LIMIT" \
                         RESULTS="$RESULTS" MODEL="$MODEL" LOGS="$LOGS" \
-                        KVPRESS_PYTHON="$KVPRESS_VENV/bin/python" \
+                        VENV="$VENV" KVZIP_PYTHON="$KVZIP_PYTHON" \
                         RLM_SUB_GPU="$sub_gpu" \
                         bash evaluation/rlm/loft128k/run_cells.sh || true
                 fi

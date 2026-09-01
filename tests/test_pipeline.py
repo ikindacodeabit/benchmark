@@ -40,6 +40,7 @@ def make_memory_budget_pipeline():
     [
         (200, "MB", 1525, 200_000_000),
         (1, "GB", 7629, 1_000_000_000),
+        (1024, "tokens", 1024, 134_217_728),
     ],
 )
 def test_compute_token_budget_from_memory(budget, unit, expected_tokens, expected_bytes):

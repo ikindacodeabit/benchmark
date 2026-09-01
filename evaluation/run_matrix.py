@@ -3,9 +3,8 @@
 """Run any supported task/memory-budget matrix with one model load."""
 
 import argparse
-from dataclasses import asdict
 
-from evaluate import EvaluationConfig, EvaluationRunner, _load_yaml_config
+from evaluate import EvaluationConfig, EvaluationRunner, build_config
 from matrix_constants import MATRIX_PROFILES, MatrixProfile
 
 
@@ -157,11 +156,7 @@ def main() -> None:
     if args.max_memory_budgets is not None and args.max_memory_budgets < 1:
         raise ValueError("max-memory-budgets must be positive")
 
-    config_values = asdict(EvaluationConfig())
-    config_values.update(_load_yaml_config(args.config_file))
-    if args.fraction is not None:
-        config_values["fraction"] = args.fraction
-    config = EvaluationConfig(**config_values)
+    config = build_config(args.config_file, fraction=args.fraction)
 
     profile = MATRIX_PROFILES[args.profile]
     tasks = validate_tasks(config, profile)
