@@ -11,6 +11,10 @@ generation path.
 the full `N`-token cache, regardless of its row budget. These are simulated
 retention budgets and must not be reported as measured GPU-memory savings.
 
+To run a single cell of your choice (a chosen `B` and `F`) on an infolab host,
+follow [`RUNBOOK.md`](RUNBOOK.md) — a self-contained copy-paste guide. The rest
+of this file describes the full campaign.
+
 Build the local six-subset dataset pack:
 
 ```bash
