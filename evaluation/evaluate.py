@@ -184,7 +184,8 @@ class EvaluationConfig:
             assert self.memory_budget_unit in {
                 "MB",
                 "GB",
-            }, f"memory_budget_unit must be MB or GB, got {self.memory_budget_unit}"
+                "TOKENS",
+            }, f"memory_budget_unit must be MB, GB, or tokens, got {self.memory_budget_unit}"
 
         # Initialize model_kwargs if None
         if self.model_kwargs is None:

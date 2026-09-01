@@ -247,6 +247,8 @@ def iter_benchmark_examples(
     task: Optional[str],
     limit: Optional[int] = None,
     split: Optional[str] = None,
+    sample_fraction: Optional[float] = None,
+    sample_seed: int = 42,
 ) -> Iterator[dict[str, Any]]:
     """Adapt shared benchmark rows to the backend-neutral example contract."""
     required = {"context", "question"}
@@ -255,11 +257,19 @@ def iter_benchmark_examples(
         raise ValueError(f"Missing required benchmark columns: {sorted(missing)}")
     if limit is not None and limit < 1:
         raise ValueError("limit must be positive")
+    if sample_fraction is not None and not (0 < sample_fraction <= 1):
+        raise ValueError(f"sample_fraction must be in (0, 1], got {sample_fraction}")
 
     if split and split != "all" and "split" in df.columns:
         df = df[df["split"] == split]
         if df.empty:
             raise ValueError(f"{dataset_name}/{task or 'default'} has no rows in split {split!r}")
+
+    # A reproducible RANDOM subset, not a prefix: df.head(limit) below always takes
+    # the same leading rows regardless of seed, so --limit alone can't express "half
+    # the data, but always the same half via a seed" the way --sample-fraction does.
+    if sample_fraction is not None:
+        df = df.sample(frac=sample_fraction, random_state=sample_seed).sort_index()
 
     rows = df.head(limit) if limit is not None else df
     # LOFT concatenates dev (10 rows) then test (100), so `--limit 10` with no split

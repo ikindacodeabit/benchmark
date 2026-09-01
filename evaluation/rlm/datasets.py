@@ -132,6 +132,8 @@ def load_examples(
     task: str | None = None,
     limit: int | None = None,
     split: str | None = None,
+    sample_fraction: float | None = None,
+    sample_seed: int = 42,
 ):
     """Yield backend-neutral examples from a synthetic or shared benchmark."""
     if dataset_name in SYNTHETIC_TASKS:
@@ -153,4 +155,6 @@ def load_examples(
         task=task,
         dataset_registry=DATASET_REGISTRY,
     )
-    yield from iter_benchmark_examples(frame, canonical_name, task, limit, split)
+    yield from iter_benchmark_examples(
+        frame, canonical_name, task, limit, split, sample_fraction=sample_fraction, sample_seed=sample_seed
+    )

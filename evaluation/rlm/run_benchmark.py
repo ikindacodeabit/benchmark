@@ -466,6 +466,20 @@ def main() -> None:
         "like a real run that scored 0.000",
     )
     ap.add_argument(
+        "--sample-fraction",
+        type=float,
+        default=None,
+        help="evaluate a reproducible random subset of the (post-split) examples, e.g. "
+        "0.5 for half -- unlike --limit, this shuffles with --sample-seed before "
+        "selecting, instead of just taking the first N rows",
+    )
+    ap.add_argument(
+        "--sample-seed",
+        type=int,
+        default=42,
+        help="random seed for --sample-fraction; ignored without it",
+    )
+    ap.add_argument(
         "--root-model",
         default="Qwen/Qwen3-4B-Instruct-2507",
         help="served model id for vanilla baseline AND the RLM root",
@@ -894,7 +908,14 @@ def main() -> None:
 
         n, correct = 0, 0
         with open(res_path, "a") as fout:
-            for ex in load_examples(requested_dataset, args.data_dir, args.limit, args.split):
+            for ex in load_examples(
+                requested_dataset,
+                args.data_dir,
+                args.limit,
+                args.split,
+                sample_fraction=args.sample_fraction,
+                sample_seed=args.sample_seed,
+            ):
                 if ex["id"] in done:
                     continue
                 t0 = time.time()
