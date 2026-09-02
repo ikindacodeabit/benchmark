@@ -10,6 +10,15 @@ set -euo pipefail
 DATASETS="${DATASETS:-musique hotpotqa 2wikimqa narrativeqa qasper triviaqa}"
 BUDGETS="${BUDGETS:-1024 2048 4096 8192}"
 FACTORS="${FACTORS:-1 2 4 8 16}"
+# Qwen3-4B-Instruct-2507: max_position_embeddings, minus the sizing reserve.
+# A cell with N above this cannot be served at all -- --fixed-chunk refuses
+# rather than silently shrinking, so it is skipped here instead.
+SUB_WINDOW="${SUB_WINDOW:-262144}"
+RESERVE_TOKENS="${RESERVE_TOKENS:-1024}"
+# Auto-sizing refuses below this. The 1024 default predates budget-derived
+# press_min_tokens and would block every B<1024 cell; grid lanes set it to
+# the smallest N they intend to run.
+MIN_TOKENS="${MIN_TOKENS:-1024}"
 LIMIT="${LIMIT:-50}"
 GPU="${GPU:-0}"
 PORT="${PORT:-8000}"
@@ -44,6 +53,15 @@ for subset in $DATASETS; do
                 exit 2
             fi
             n=$((budget * factor))
+            window_cap=$((SUB_WINDOW - RESERVE_TOKENS))
+            if [ "$n" -gt "$window_cap" ]; then
+                echo "skip infeasible: $subset B=$budget F=$factor N=$n > window cap $window_cap"
+                continue
+            fi
+            if [ "$n" -lt "$MIN_TOKENS" ]; then
+                echo "skip below floor: $subset B=$budget F=$factor N=$n < MIN_TOKENS $MIN_TOKENS"
+                continue
+            fi
             calls=$(((131072 + n - 1) / n + 1))
             if [ "$calls" -gt 64 ]; then calls=64; fi
             min_free=$(awk -v n="$n" 'BEGIN{x=n*147456*1.2/(2^30); m=int(x); if(x>m)m++; m+=12; if(m<14)m=14; print m}')
@@ -66,7 +84,7 @@ for subset in $DATASETS; do
             fi
 
             echo "=== $subset :: B=$budget tokens :: F=${factor}x :: N=$n :: calls=$calls :: minfree=${min_free}GiB ==="
-            CUDA_VISIBLE_DEVICES="$GPU" "$KVPY" -m evaluation.rlm.run_benchmark \
+            if ! CUDA_VISIBLE_DEVICES="$GPU" "$KVPY" -m evaluation.rlm.run_benchmark \
                 --dataset longbench128k --data-dir "$subset" --limit "$LIMIT" \
                 --base-url "http://localhost:$PORT/v1" \
                 --root-model "$MODEL" --sub-model "$MODEL" \
@@ -75,7 +93,11 @@ for subset in $DATASETS; do
                 --memory-budget "$budget" --memory-budget-unit tokens \
                 --max-subcall-chars auto --compression-factor "$factor" --fixed-chunk \
                 --max-sub-calls "$calls" --sub-max-tokens 128 --sub-min-free-gib "$min_free" \
-                --out "$RESULTS"
+                --subcall-min-tokens "$MIN_TOKENS" \
+                --out "$RESULTS"; then
+                echo "!! CELL FAILED: $subset B=$budget F=$factor N=$n -- continuing" >&2
+                echo "$subset $budget $factor $n" >> "$RESULTS/failed_cells.txt"
+            fi
             flock -u 9
         done
     done

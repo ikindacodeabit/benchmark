@@ -147,6 +147,28 @@ class PlanSubcallChunkTest(unittest.TestCase):
         self.assertEqual(sizing.caps["sub_window"], 8192 - 4096)
         self.assertEqual(sizing.tokens, 8192 - 4096)
 
+    def test_the_min_token_floor_reaches_the_planner(self):
+        """The small-budget grid rows exist only if --subcall-min-tokens is honoured.
+
+        A B=128 x F=4 cell resolves to N=512, which the 1024 default refuses. That
+        default dates from a fixed 1024-token press floor; press_min_tokens is now
+        derived from the budget, so the cell is legitimate and must be runnable.
+        """
+        client = _fake_client(max_context_tokens=131072)
+        client.memory_budget = 128
+        client.memory_budget_unit = "tokens"
+
+        with self.assertRaises(RuntimeError):
+            client.plan_subcall_chunk(document="word " * 20000, target_compression_ratio=0.75)
+
+        sizing = client.plan_subcall_chunk(
+            document="word " * 20000,
+            target_compression_ratio=0.75,
+            min_tokens=128,
+        )
+        self.assertEqual(sizing.tokens, 512)
+        self.assertEqual(sizing.binding, "budget")
+
     def test_fixed_grid_ignores_legacy_cli_cap_but_keeps_hard_caps_strict(self):
         client = _fake_client(max_context_tokens=34_000)
         client.memory_budget = 8192

@@ -27,6 +27,7 @@ from .client import LLMClient
 from .datasets import available_datasets, canonical_dataset_name, load_examples
 from .rlm import RLM, MemoryBudget, Scratchpad, vanilla_answer
 from .sizing import (
+    DEFAULT_MIN_TOKENS,
     DEFAULT_RESERVE_TOKENS,
     FIXED_CHUNK_CHAR_OVERSHOOT,
     compression_ratio_from_factor,
@@ -667,6 +668,16 @@ def main() -> None:
         "question and the decoded answer (the context cap alone budgets for neither)",
     )
     ap.add_argument(
+        "--subcall-min-tokens",
+        type=int,
+        default=DEFAULT_MIN_TOKENS,
+        help="smallest chunk auto-sizing may resolve to before it refuses the run. The 1024 "
+        "default dates from the era of a FIXED 1024-token press floor, below which pressing "
+        "was skipped and the chunk was pointless. press_min_tokens is now derived from the "
+        "memory budget, so a sub-1024 budget presses normally and the old floor only blocks "
+        "otherwise-valid small-budget grid cells. Lower it to run them",
+    )
+    ap.add_argument(
         "--sub-max-tokens",
         type=int,
         default=512,
@@ -787,6 +798,7 @@ def main() -> None:
             target_compression_ratio=args.target_compression_ratio,
             cli_max_context_tokens=args.sub_max_context_tokens,
             reserve_tokens=args.subcall_reserve_tokens,
+            min_tokens=args.subcall_min_tokens,
             char_overshoot=(FIXED_CHUNK_CHAR_OVERSHOOT if args.fixed_chunk else 1.0),
             require_budget_binding=args.fixed_chunk,
             # In fixed mode this value is the OUTPUT of planning (N), not an

@@ -37,6 +37,7 @@ from typing import Any, Optional
 
 from .client import Usage
 from .sizing import (
+    DEFAULT_MIN_TOKENS,
     DEFAULT_RESERVE_TOKENS,
     SubcallSizing,
     calibrate_chars_per_token,
@@ -238,6 +239,7 @@ class KVzipSubClient:
         target_compression_ratio: float,
         cli_max_context_tokens: Optional[int] = None,
         reserve_tokens: int = DEFAULT_RESERVE_TOKENS,
+        min_tokens: int = DEFAULT_MIN_TOKENS,
         char_overshoot: float = 1.0,
         require_budget_binding: bool = False,
         apply_cli_context_cap: bool = True,
@@ -286,6 +288,7 @@ class KVzipSubClient:
             ),
             gpu_free_bytes=free_bytes,
             reserve_tokens=reserve_tokens,
+            min_tokens=min_tokens,
             char_overshoot=char_overshoot,
             require_budget_binding=require_budget_binding,
         )
