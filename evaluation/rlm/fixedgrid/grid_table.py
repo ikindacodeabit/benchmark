@@ -49,6 +49,18 @@ def collect(results: Path) -> pd.DataFrame:
                 "compression_factor": factor,
                 "qa_f1": _score(metrics),
                 "realized_compression_factor": runtime.get("realized_compression_factor"),
+                # The aggregate compression the cell actually delivered: total context
+                # tokens admitted over total KV retained.
+                #
+                # Prefer this over realized_compression_factor, which is
+                # 1/(1 - mean_ratio) and is hypersensitive at high ratios: a call
+                # whose slice lands under press_min_tokens skips the press and
+                # contributes ratio 0, so at F=8 a mere 6% of unpressed calls drags
+                # the reported factor from 8.0 to 5.6 even though every pressed call
+                # compressed exactly 8x. Those short calls barely move either sum
+                # here, so this ratio-of-means stays on target.
+                "effective_compression_factor": _effective_factor(runtime),
+                "sub_pressed_call_fraction": runtime.get("sub_pressed_call_fraction"),
                 "document_coverage_fraction": runtime.get("document_coverage_fraction"),
                 "sub_context_tokens_on_target_fraction": runtime.get("sub_context_tokens_on_target_fraction"),
                 "sub_slice_unlocatable_calls": runtime.get("sub_slice_unlocatable_calls"),
@@ -59,14 +71,25 @@ def collect(results: Path) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _effective_factor(runtime: dict) -> float | None:
+    """Context tokens admitted per KV token retained, aggregated over the cell."""
+    context = runtime.get("average_sub_context_tokens")
+    retained = runtime.get("average_sub_retained_context_tokens")
+    if context is None or retained is None or not retained:
+        return None
+    return float(context) / float(retained)
+
+
 def _cell(row: pd.Series | None) -> str:
     if row is None or pd.isna(row.get("qa_f1")):
         return "—"
-    realized = row.get("realized_compression_factor")
+    effective = row.get("effective_compression_factor")
     coverage = row.get("document_coverage_fraction")
-    realized_text = "?" if pd.isna(realized) else f"{float(realized):.2f}x"
+    pressed = row.get("sub_pressed_call_fraction")
+    effective_text = "?" if pd.isna(effective) else f"{float(effective):.2f}x"
     coverage_text = "?" if pd.isna(coverage) else f"{100 * float(coverage):.1f}%"
-    return f"{float(row['qa_f1']):.2f} | {realized_text} | {coverage_text}"
+    pressed_text = "" if pd.isna(pressed) else f" | p{100 * float(pressed):.0f}%"
+    return f"{float(row['qa_f1']):.2f} | {effective_text} | {coverage_text}{pressed_text}"
 
 
 def render_dataset(frame: pd.DataFrame, output: Path, subset: str) -> None:
@@ -88,7 +111,11 @@ def render_dataset(frame: pd.DataFrame, output: Path, subset: str) -> None:
     lines = [
         f"# {subset}: fixed-chunk × logical-KV-retention grid",
         "",
-        "Cells are `qa_f1 | realized factor | document coverage`.",
+        "Cells are `qa_f1 | effective factor | document coverage | pressed-call share`.",
+        "",
+        "Effective factor is context tokens admitted per KV token retained. It is NOT "
+        "`realized_compression_factor`, which is `1/(1 - mean_ratio)` and understates a "
+        "cell badly when a few sub-calls fall under `press_min_tokens` and skip the press.",
         "KVzipPress masks evicted KV but does not free it; budgets are simulated retention, "
         "not measured memory savings.",
         "",
