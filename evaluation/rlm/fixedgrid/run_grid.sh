@@ -36,6 +36,20 @@ if ! curl -sf -m 10 "http://localhost:$PORT/v1/models" | grep -qF "\"$MODEL\""; 
     echo "ERROR: localhost:$PORT is not serving $MODEL" >&2
     exit 1
 fi
+# The loader reads RLM_DATA_DIR from the environment and silently falls back to
+# ~/rlm_data, which on a shared-NAS host is the wrong tree and does not exist.
+# That surfaced only after the model had loaded, one cell at a time; check it
+# once, up front, for every subset the lane is about to run.
+: "${RLM_DATA_DIR:?set RLM_DATA_DIR to the tree holding longbench128k/<subset>/data.parquet}"
+for subset in $DATASETS; do
+    pack="$RLM_DATA_DIR/longbench128k/$subset/data.parquet"
+    if [ ! -f "$pack" ]; then
+        echo "ERROR: missing data pack $pack" >&2
+        echo "       build it with: python -m evaluation.benchmarks.longbench128k.build_dataset" >&2
+        exit 1
+    fi
+done
+
 mkdir -p "$RESULTS" "$LOCK_DIR"
 cd "$REPO_ROOT"
 
