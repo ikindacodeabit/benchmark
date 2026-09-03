@@ -55,6 +55,13 @@ MIN_FREE_GIB="${MIN_FREE_GIB:-}"
 LIMIT="${LIMIT:-50}"
 GPU="${GPU:-0}"
 PORT="${PORT:-8000}"
+# The host serving the ROOT model. Normally the machine running the lane, but the
+# root is a plain OpenAI-compatible endpoint doing light work (peak context ~2.4k
+# tokens), so a host that cannot serve can borrow one over the LAN. That is not a
+# nicety on ant: its Blackwell cards are sm_120 and the serving venv's torch has
+# no kernels for them, so vllm cannot start there at all, while the sub model
+# runs fine from the cu128 venv.
+ROOT_HOST="${ROOT_HOST:-localhost}"
 MODEL="${MODEL:-Qwen/Qwen3-4B-Instruct-2507}"
 RESULTS="${RESULTS:-evaluation/results/fixedgrid}"
 REPO_ROOT="${REPO_ROOT:-$(pwd)}"
@@ -65,8 +72,8 @@ if [ ! -x "$KVPY" ]; then
     echo "ERROR: no kvpress Python at $KVPY (set KVZIP_PYTHON)" >&2
     exit 1
 fi
-if ! curl -sf -m 10 "http://localhost:$PORT/v1/models" | grep -qF "\"$MODEL\""; then
-    echo "ERROR: localhost:$PORT is not serving $MODEL" >&2
+if ! curl -sf -m 10 "http://$ROOT_HOST:$PORT/v1/models" | grep -qF "\"$MODEL\""; then
+    echo "ERROR: $ROOT_HOST:$PORT is not serving $MODEL" >&2
     exit 1
 fi
 # longbench128k is read from a locally built tree; the loader takes its root from
@@ -151,7 +158,7 @@ for subset in $DATASETS; do
             echo "=== $task :: B=$budget tokens :: F=${factor}x :: N=$n :: calls=$calls :: minfree=${min_free}GiB ==="
             if ! CUDA_VISIBLE_DEVICES="$GPU" "$KVPY" -m evaluation.rlm.run_benchmark \
                 --dataset "$DATASET_NAME" --data-dir "$task" --limit "$LIMIT" "${split_args[@]}" \
-                --base-url "http://localhost:$PORT/v1" \
+                --base-url "http://$ROOT_HOST:$PORT/v1" \
                 --root-model "$MODEL" --sub-model "$MODEL" \
                 --mode rlm --scratchpad --max-steps 50 --exec-timeout 60 --run-timeout "$RUN_TIMEOUT" \
                 --sub-backend kvzip --press "$press" \
