@@ -143,6 +143,25 @@ class ResumeGuardTest(unittest.TestCase):
         self.assertEqual(len(conflicts), 1)
         self.assertIn("compression_factor", conflicts[0])
 
+    def test_the_sample_is_resume_critical(self):
+        """--sample-fraction reaches neither the run-dir name nor the slug, so the
+        config guard is the only thing standing between two different samples and
+        one shared checkpoint.jsonl."""
+        run_dir = self._run_dir(limit=20, sample_fraction=0.5, sample_seed=42)
+        self.assertEqual(resume_conflicts(run_dir, {"limit": 20, "sample_fraction": 0.5, "sample_seed": 42}), [])
+        for changed in ({"sample_fraction": 1.0}, {"sample_seed": 7}):
+            conflicts = resume_conflicts(run_dir, {"limit": 20, "sample_fraction": 0.5, "sample_seed": 42, **changed})
+            self.assertEqual(len(conflicts), 1, changed)
+            self.assertIn(next(iter(changed)), conflicts[0])
+
+    def test_runs_predating_the_sample_flags_still_resume(self):
+        """Every config.yaml already on disk lacks these keys; the guard reports
+        what the previous run actually recorded, so they must not become conflicts."""
+        run_dir = self._run_dir(limit=20, max_steps=50)
+        self.assertEqual(
+            resume_conflicts(run_dir, {"limit": 20, "max_steps": 50, "sample_fraction": None, "sample_seed": None}), []
+        )
+
     def test_a_missing_config_does_not_block_a_resume(self):
         """Checkpoints written before config.yaml was saved up front are still
         resumable -- the guard reports what it can prove, not what it assumes."""

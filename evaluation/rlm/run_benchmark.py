@@ -62,6 +62,12 @@ def _subcall_chars(value: str) -> Any:
 RESUME_CRITICAL_KEYS = (
     "limit",
     "split",
+    # Same reason as `limit` and `split`: they pick WHICH rows are evaluated, and
+    # neither reaches the run-directory name. A `--sample-fraction 0.5` run and a
+    # full run of the same cell otherwise land in one directory, share one
+    # checkpoint.jsonl, and merge two different samples into one score.
+    "sample_fraction",
+    "sample_seed",
     "root_model",
     # Not in the slug: adding it there would rename every run directory that has
     # ever been written, orphaning their checkpoints silently. Erroring on resume
@@ -1068,6 +1074,11 @@ def build_run_config(
         "base_url": args.base_url,
         "limit": args.limit,
         "split": args.split,
+        "sample_fraction": args.sample_fraction,
+        # Only meaningful alongside a fraction -- recorded unconditionally, two
+        # unsampled runs that merely passed different --sample-seed values would
+        # refuse to resume each other over a knob neither of them used.
+        "sample_seed": args.sample_seed if args.sample_fraction is not None else None,
         "max_steps": args.max_steps,
         "vanilla_char_limit": args.vanilla_char_limit,
         "vanilla_max_prompt_tokens": args.vanilla_max_prompt_tokens,
