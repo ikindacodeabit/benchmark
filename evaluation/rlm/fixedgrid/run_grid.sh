@@ -19,6 +19,15 @@ RESERVE_TOKENS="${RESERVE_TOKENS:-1024}"
 # press_min_tokens and would block every B<1024 cell; grid lanes set it to
 # the smallest N they intend to run.
 MIN_TOKENS="${MIN_TOKENS:-1024}"
+# Per-cell --sub-min-free-gib is derived below as the full uncompressed KV plus a
+# FLAT 12 GiB for weights and activations. That constant is sized for a model
+# larger than Qwen3-4B, so on a card whose free memory lands just under the
+# derived figure a cell the sub model could actually serve is refused before the
+# weights even load -- N=222208 asks for 49 GiB on a 48 GB A6000 while needing
+# ~36.6 GiB of KV against the ~39 GiB free once the 8 GiB of weights are
+# resident. Setting this overrides the derivation for every cell in the lane, so
+# scope a lane narrowly before using it.
+MIN_FREE_GIB="${MIN_FREE_GIB:-}"
 LIMIT="${LIMIT:-50}"
 GPU="${GPU:-0}"
 PORT="${PORT:-8000}"
@@ -79,6 +88,7 @@ for subset in $DATASETS; do
             calls=$(((131072 + n - 1) / n + 1))
             if [ "$calls" -gt 64 ]; then calls=64; fi
             min_free=$(awk -v n="$n" 'BEGIN{x=n*147456*1.2/(2^30); m=int(x); if(x>m)m++; m+=12; if(m<14)m=14; print m}')
+            if [ -n "$MIN_FREE_GIB" ]; then min_free="$MIN_FREE_GIB"; fi
             press=kvzip
             if [ "$factor" -eq 1 ]; then press=no_press; fi
 
