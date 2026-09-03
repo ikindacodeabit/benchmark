@@ -39,14 +39,18 @@ RESERVE_TOKENS="${RESERVE_TOKENS:-1024}"
 # press_min_tokens and would block every B<1024 cell; grid lanes set it to
 # the smallest N they intend to run.
 MIN_TOKENS="${MIN_TOKENS:-1024}"
-# Per-cell --sub-min-free-gib is derived below as the full uncompressed KV plus a
-# FLAT 12 GiB for weights and activations. That constant is sized for a model
-# larger than Qwen3-4B, so on a card whose free memory lands just under the
-# derived figure a cell the sub model could actually serve is refused before the
-# weights even load -- N=222208 asks for 49 GiB on a 48 GB A6000 while needing
-# ~36.6 GiB of KV against the ~39 GiB free once the 8 GiB of weights are
-# resident. Setting this overrides the derivation for every cell in the lane, so
-# scope a lane narrowly before using it.
+# Per-cell --sub-min-free-gib is derived below as 2.0x the uncompressed KV plus a
+# flat 12 GiB for weights and slack. The 2.0x is measured, not assumed: KVzip's
+# reconstruction-scoring pass roughly doubles peak memory over the cache itself
+# (a LOFT-1m cell at N=108504 held 38.8 GiB against a 16.0 GiB raw KV).
+#
+# This override exists for a card whose free memory lands just under the derived
+# figure. Use it to shave slack, NEVER to get under the 2.0x: a cell that does
+# not fit does not fail loudly. The sub model returns its out-of-memory string as
+# an ordinary answer, the root burns its call budget retrying, llm_query is
+# withdrawn, and the cell COMPLETES with a score describing an RLM that had no
+# sub-model. Lowering this to 20 on a 20 GiB card cost a LOFT-1m lane exactly
+# that. It applies to every cell in the lane, so scope such a lane narrowly.
 MIN_FREE_GIB="${MIN_FREE_GIB:-}"
 LIMIT="${LIMIT:-50}"
 GPU="${GPU:-0}"
@@ -111,7 +115,7 @@ for subset in $DATASETS; do
             fi
             calls=$(((DOC_TOKENS + n - 1) / n + 1))
             if [ "$calls" -gt "$MAX_CALLS_CAP" ]; then calls="$MAX_CALLS_CAP"; fi
-            min_free=$(awk -v n="$n" 'BEGIN{x=n*147456*1.2/(2^30); m=int(x); if(x>m)m++; m+=12; if(m<14)m=14; print m}')
+            min_free=$(awk -v n="$n" 'BEGIN{x=n*147456*2.0/(2^30); m=int(x); if(x>m)m++; m+=12; if(m<14)m=14; print m}')
             if [ -n "$MIN_FREE_GIB" ]; then min_free="$MIN_FREE_GIB"; fi
             press=kvzip
             if [ "$factor" -eq 1 ]; then press=no_press; fi

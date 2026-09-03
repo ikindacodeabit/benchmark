@@ -37,9 +37,23 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional, Sequence
 
 # Mirrors of the runtime fit check in kvzip_backend._fits_in_memory. Shared so the
-# planner and the per-call check cannot drift apart: the 1.2x covers scoring
-# activations and allocator fragmentation, the 1 GiB is flat slack.
-KV_FIT_SAFETY_FACTOR = 1.2
+# planner and the per-call check cannot drift apart.
+#
+# MEASURED, not assumed. The factor was 1.2 -- enough for a plain prefill's
+# activations and allocator fragmentation, but KVzip does a second,
+# reconstruction-scoring pass over the context whose transient allocations run to
+# roughly the size of the cache itself. On a LOFT-1m cell at N=108,504 the process
+# held 38.8 GiB against a raw KV of 16.0 GiB: ~8 GiB of weights plus 30.8 GiB of
+# cache and activations, i.e. 1.9x the cache, not 1.2x.
+#
+# Understating it is not a near miss, it is a silent wrong answer. The check
+# passes, the allocation then fails, `_generate` returns its out-of-memory string
+# as the sub-answer, the root spends its budget retrying, MAX_SUB_FIT_FAILURES
+# withdraws llm_query -- and the run COMPLETES, writing a metrics.json whose score
+# describes an RLM with no sub-model at all. A LOFT-1m grid lost 6 of 13 cells to
+# this before anyone noticed, because nothing in the metrics says "invalid" except
+# a zero coverage fraction. Overstating it merely refuses a cell up front, loudly.
+KV_FIT_SAFETY_FACTOR = 2.0
 KV_FIT_HEADROOM_BYTES = 1 * 1024**3
 
 # Same assumption as TokenCounter's fallback in rlm.py. Only used when calibration
@@ -134,7 +148,7 @@ def gpu_fit_token_cap(
     """Largest chunk whose FULL uncompressed KV fits in ``free_bytes``.
 
     The exact inverse of kvzip_backend's per-call check
-    ``ctx_tokens * kv_bytes_per_token * 1.2 + 1 GiB <= free_bytes``. Full, not
+    ``ctx_tokens * kv_bytes_per_token * 2.0 + 1 GiB <= free_bytes``. Full, not
     retained, because KVzipPress masks rather than frees: the whole chunk's cache
     is resident for the duration of the call.
 

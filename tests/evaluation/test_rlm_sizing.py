@@ -145,7 +145,7 @@ class ClampTest(unittest.TestCase):
 class GpuFitTest(unittest.TestCase):
     def test_it_inverts_the_runtime_fit_check_exactly(self):
         """Anti-drift: gpu_fit_token_cap must be the exact inverse of
-        kvzip_backend._fits_in_memory's `tokens * bytes * 1.2 + 1 GiB <= free`.
+        kvzip_backend._fits_in_memory's `tokens * bytes * 2.0 + 1 GiB <= free`.
         If either side is edited alone, this fails."""
 
         def fits(tokens, free_bytes):
@@ -161,7 +161,23 @@ class GpuFitTest(unittest.TestCase):
         self.assertEqual(gpu_fit_token_cap(KV_FIT_HEADROOM_BYTES // 2, QWEN3_4B_KV_BYTES_PER_TOKEN), 0)
 
     def test_the_reference_number(self):
-        self.assertEqual(gpu_fit_token_cap(20 * 1024**3, QWEN3_4B_KV_BYTES_PER_TOKEN), 115_294)
+        self.assertEqual(gpu_fit_token_cap(20 * 1024**3, QWEN3_4B_KV_BYTES_PER_TOKEN), 69_176)
+
+    def test_the_factor_covers_kvzips_scoring_pass(self):
+        """The measurement the 2.0x comes from, kept as a test so a future edit
+        cannot quietly walk it back to a plain-prefill number.
+
+        A LOFT-1m cell at N=108,504 was observed holding 38.8 GiB: ~8 GiB of
+        weights plus 30.8 GiB of cache and scoring transients, against a raw KV
+        of 16.0 GiB. So the cap for the ~39 GiB left after weights on a 48 GB
+        A6000 must admit that cell and must NOT admit twice its size -- which is
+        the 4GB x 8x cell whose 45-of-55 out-of-memory sub-calls, silently
+        scored, is what prompted the measurement.
+        """
+        free_after_weights = int(39 * 1024**3)
+        cap = gpu_fit_token_cap(free_after_weights, QWEN3_4B_KV_BYTES_PER_TOKEN)
+        self.assertGreater(cap, 108_504)
+        self.assertLess(cap, 217_008)
 
 
 class CalibrationTest(unittest.TestCase):
