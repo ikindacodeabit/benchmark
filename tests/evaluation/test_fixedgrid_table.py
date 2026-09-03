@@ -80,3 +80,37 @@ def test_effective_factor_ignores_the_unpressed_call_artifact(tmp_path):
     markdown = (output / "hotpotqa.md").read_text()
     assert "8.00x" in markdown
     assert "p94%" in markdown
+
+
+def _loft_run(root, name, config_overrides, metrics):
+    run = root / name
+    run.mkdir()
+    config = {
+        "dataset": "loft",
+        "data_dir": "nq_1m",
+        "fixed_chunk": True,
+        "sub_kv_memory_budget": 13563,
+        "sub_kv_memory_budget_unit": "tokens",
+        "compression_factor": 8.0,
+    }
+    config.update(config_overrides)
+    (run / "config.yaml").write_text(yaml.safe_dump(config))
+    (run / "metrics.json").write_text(json.dumps(metrics))
+
+
+def test_a_loft_cell_scores_on_subspan_em(tmp_path):
+    """LOFT's scorer publishes no `score` key, so reading that key directly gave
+    every LOFT cell a blank. compare.DATASET_SCORE_KEY names subspan_em as LOFT's
+    primary metric; the grid must report the same number compare.py would."""
+    _loft_run(tmp_path, "cell", {}, {"em": 0.1, "subspan_em": 0.375, "f1": 0.2, "runtime": {}})
+    frame = collect(tmp_path)
+    assert len(frame) == 1
+    assert frame.iloc[0]["dataset"] == "nq_1m"
+    assert frame.iloc[0]["qa_f1"] == 0.375
+
+
+def test_an_ordinary_loft_run_is_not_a_grid_cell(tmp_path):
+    """`fixed_chunk` is what makes a run a cell. Dropping the longbench128k check
+    must not sweep the plain RLM/vanilla LOFT arms into the grid."""
+    _loft_run(tmp_path, "cell", {"fixed_chunk": False}, {"subspan_em": 0.4, "runtime": {}})
+    assert collect(tmp_path).empty

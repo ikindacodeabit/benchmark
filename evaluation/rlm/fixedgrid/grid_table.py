@@ -12,10 +12,21 @@ from typing import Any
 import pandas as pd
 import yaml
 
+from evaluation.compare import headline_score
 
-def _score(metrics: dict[str, Any]) -> float | None:
-    value = metrics.get("score")
-    return float(value) if isinstance(value, (int, float)) else None
+
+def _score(metrics: dict[str, Any], dataset: str | None = None) -> float | None:
+    """The run's headline number, chosen the way the rest of the repo chooses it.
+
+    Delegates to compare.headline_score rather than reading `score` directly:
+    only some scorers publish that key. LOFT publishes `em`/`subspan_em`/`f1`
+    and no `score`, so a local lookup returned None for every LOFT cell and the
+    grid rendered a table of blanks. compare.DATASET_SCORE_KEY already names
+    subspan_em as LOFT's primary metric, and reusing it keeps this table and
+    compare.py reporting the same number for the same run.
+    """
+    _, value = headline_score(metrics, dataset)
+    return value
 
 
 def collect(results: Path) -> pd.DataFrame:
@@ -30,7 +41,12 @@ def collect(results: Path) -> pd.DataFrame:
             metrics = json.loads(metrics_path.read_text())
         except (yaml.YAMLError, json.JSONDecodeError):
             continue
-        if config.get("dataset") != "longbench128k" or not config.get("fixed_chunk"):
+        # Any benchmark the grid can drive, not just the one it was written for:
+        # run_grid.sh now takes DATASET_NAME, and a LOFT-1m grid is the same
+        # instrument pointed at a longer document. `fixed_chunk` is what makes a
+        # run a grid cell, so that stays the real filter.
+        dataset = str(config.get("dataset") or "")
+        if not config.get("fixed_chunk"):
             continue
         if str(config.get("sub_kv_memory_budget_unit", "")).lower() != "tokens":
             continue
@@ -47,7 +63,7 @@ def collect(results: Path) -> pd.DataFrame:
                 "dataset": subset,
                 "kv_budget_tokens": budget,
                 "compression_factor": factor,
-                "qa_f1": _score(metrics),
+                "qa_f1": _score(metrics, dataset),
                 "realized_compression_factor": runtime.get("realized_compression_factor"),
                 # The aggregate compression the cell actually delivered: total context
                 # tokens admitted over total KV retained.
