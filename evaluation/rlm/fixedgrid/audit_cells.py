@@ -64,7 +64,11 @@ def audit(results: Path) -> list[dict[str, Any]]:
             metrics = json.loads(metrics_path.read_text())
         except (yaml.YAMLError, json.JSONDecodeError):
             continue
-        if not config.get("fixed_chunk"):
+        # A search arm is a grid cell too, and the http pilot has no fixed chunk
+        # at all -- filtering on fixed_chunk alone made those runs invisible to
+        # the auditor, which is the one tool that catches a cell whose sub-model
+        # never really ran.
+        if not (config.get("fixed_chunk") or config.get("search_k")):
             continue
         runtime = metrics.get("runtime", {})
         budget = config.get("sub_kv_memory_budget")
@@ -82,6 +86,14 @@ def audit(results: Path) -> list[dict[str, Any]]:
             reasons.append("no sub-call stats recorded (pressed share is null)")
         if coverage == 0:
             reasons.append("document coverage is exactly 0")
+        # The search arm's own dead-cell tells: the primitive was offered and
+        # never called, or it returned windows the root never read.
+        search_k = int(config.get("search_k") or 0)
+        if search_k:
+            if not runtime.get("search_calls"):
+                reasons.append("the search primitive was never called")
+            elif not runtime.get("search_hits_read"):
+                reasons.append("search returned windows but none were read")
 
         rows.append(
             {
@@ -90,6 +102,7 @@ def audit(results: Path) -> list[dict[str, Any]]:
                 "budget": budget,
                 "factor": factor,
                 "n": (int(budget) * int(factor)) if budget and factor else None,
+                "search_k": search_k,
                 "pressed": pressed,
                 "coverage": coverage,
                 "fit_failures": hits,

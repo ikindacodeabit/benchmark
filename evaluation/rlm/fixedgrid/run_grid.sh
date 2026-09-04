@@ -30,6 +30,9 @@ RUN_TIMEOUT="${RUN_TIMEOUT:-3600}"
 SPLIT="${SPLIT:-}"
 BUDGETS="${BUDGETS:-1024 2048 4096 8192}"
 FACTORS="${FACTORS:-1 2 4 8 16}"
+# Retrieval depth. 0 = no search primitive, which is every cell run before the
+# BM25 arm existed and is the control the search cells are compared against.
+SEARCH_KS="${SEARCH_KS:-0}"
 # Qwen3-4B-Instruct-2507: max_position_embeddings, minus the sizing reserve.
 # A cell with N above this cannot be served at all -- --fixed-chunk refuses
 # rather than silently shrinking, so it is skipped here instead.
@@ -106,6 +109,7 @@ model_slug="${MODEL//\//_}"
 for subset in $DATASETS; do
     for budget in $BUDGETS; do
         for factor in $FACTORS; do
+          for search_k in $SEARCH_KS; do
             if ! [[ "$budget" =~ ^[0-9]+$ && "$factor" =~ ^[0-9]+$ ]]; then
                 echo "ERROR: BUDGETS and FACTORS must contain positive integers" >&2
                 exit 2
@@ -135,9 +139,15 @@ for subset in $DATASETS; do
             # matches, so every finished cell reloads the model to do nothing.
             split_slug=""
             if [ -n "$SPLIT" ] && [ "$SPLIT" != "all" ]; then split_slug="__split-${SPLIT}"; fi
-            run_name="${DATASET_NAME}__${task}__${model_slug}__rlm${split_slug}__scratchpad__kvzip-${press}${budget}tokens__autosubx${factor}__fixed"
+            search_slug=""
+            search_flags=()
+            if [ "$search_k" -gt 0 ]; then
+                search_slug="__bm25k${search_k}"
+                search_flags=(--search-k "$search_k")
+            fi
+            run_name="${DATASET_NAME}__${task}__${model_slug}__rlm${split_slug}__scratchpad__kvzip-${press}${budget}tokens__autosubx${factor}__fixed${search_slug}"
             if [ -f "$RESULTS/$run_name/metrics.json" ]; then
-                echo "skip complete: $subset B=$budget F=$factor"
+                echo "skip complete: $subset B=$budget F=$factor k=$search_k"
                 continue
             fi
 
@@ -152,9 +162,9 @@ for subset in $DATASETS; do
             # one checkpoint.jsonl while each believed it held the cell. mkdir is
             # atomic over NFS and is the portable primitive here. The trap
             # releases it on exit, including on Ctrl-C.
-            lock="$LOCK_DIR/${task}.${budget}.${factor}.lock.d"
+            lock="$LOCK_DIR/${task}.${budget}.${factor}.k${search_k}.lock.d"
             if ! mkdir "$lock" 2>/dev/null; then
-                echo "skip locked: $task B=$budget F=$factor (held by $(cat "$lock/owner" 2>/dev/null || echo unknown))"
+                echo "skip locked: $task B=$budget F=$factor k=$search_k (held by $(cat "$lock/owner" 2>/dev/null || echo unknown))"
                 continue
             fi
             echo "$(hostname -s):$$" > "$lock/owner"
@@ -163,7 +173,7 @@ for subset in $DATASETS; do
             split_args=()
             if [ -n "$SPLIT" ]; then split_args=(--split "$SPLIT"); fi
 
-            echo "=== $task :: B=$budget tokens :: F=${factor}x :: N=$n :: calls=$calls :: minfree=${min_free}GiB ==="
+            echo "=== $task :: B=$budget tokens :: F=${factor}x :: k=$search_k :: N=$n :: calls=$calls :: minfree=${min_free}GiB ==="
             if ! CUDA_VISIBLE_DEVICES="$GPU" "$KVPY" -m evaluation.rlm.run_benchmark \
                 --dataset "$DATASET_NAME" --data-dir "$task" --limit "$LIMIT" "${split_args[@]}" \
                 --base-url "http://$ROOT_HOST:$PORT/v1" \
@@ -173,13 +183,14 @@ for subset in $DATASETS; do
                 --memory-budget "$budget" --memory-budget-unit tokens \
                 --max-subcall-chars auto --compression-factor "$factor" --fixed-chunk \
                 --max-sub-calls "$calls" --sub-max-tokens 128 --sub-min-free-gib "$min_free" \
-                --subcall-min-tokens "$MIN_TOKENS" \
+                --subcall-min-tokens "$MIN_TOKENS" "${search_flags[@]}" \
                 --out "$RESULTS"; then
-                echo "!! CELL FAILED: $task B=$budget F=$factor N=$n -- continuing" >&2
-                echo "$task $budget $factor $n" >> "$RESULTS/failed_cells.txt"
+                echo "!! CELL FAILED: $task B=$budget F=$factor k=$search_k N=$n -- continuing" >&2
+                echo "$task $budget $factor $search_k $n" >> "$RESULTS/failed_cells.txt"
             fi
             rm -rf "$lock"
             trap - EXIT INT TERM
+          done
         done
     done
 done

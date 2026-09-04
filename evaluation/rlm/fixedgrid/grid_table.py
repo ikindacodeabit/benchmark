@@ -53,9 +53,16 @@ def collect(results: Path) -> pd.DataFrame:
         subset = str(config.get("data_dir"))
         budget = int(config["sub_kv_memory_budget"])
         factor = float(config["compression_factor"])
-        key = (subset, budget, factor)
+        # Retrieval depth is part of a cell's identity, not a detail: two search
+        # depths of one budget/factor are two different cells, and without k in the
+        # key the second one raises "duplicate completed grid cell" and kills the
+        # whole table build.
+        search_k = int(config.get("search_k") or 0)
+        key = (subset, budget, factor, search_k)
         if key in seen:
-            raise ValueError(f"duplicate completed grid cell for {subset}, B={budget}, F={factor:g}")
+            raise ValueError(
+                f"duplicate completed grid cell for {subset}, B={budget}, F={factor:g}, k={search_k}"
+            )
         seen.add(key)
         runtime = metrics.get("runtime", {})
         rows.append(
@@ -63,6 +70,11 @@ def collect(results: Path) -> pd.DataFrame:
                 "dataset": subset,
                 "kv_budget_tokens": budget,
                 "compression_factor": factor,
+                "search_k": search_k,
+                # The retrieval arm's structural ceiling: a score below this is the
+                # reader's fault, a score at it means retrieval is what binds.
+                "gold_in_retrieved_fraction": runtime.get("gold_in_retrieved_fraction"),
+                "search_hits_read": runtime.get("search_hits_read"),
                 "qa_f1": _score(metrics, dataset),
                 "realized_compression_factor": runtime.get("realized_compression_factor"),
                 # The aggregate compression the cell actually delivered: total context
@@ -154,11 +166,15 @@ def main() -> None:
         raise SystemExit(f"No completed fixed-grid runs under {args.results}")
     output = args.output or args.results / "grid_tables"
     output.mkdir(parents=True, exist_ok=True)
-    frame.sort_values(["dataset", "kv_budget_tokens", "compression_factor"]).to_csv(
+    frame.sort_values(["dataset", "search_k", "kv_budget_tokens", "compression_factor"]).to_csv(
         output / "grid_long.csv", index=False
     )
-    for subset, subset_frame in frame.groupby("dataset"):
-        render_dataset(subset_frame, output, str(subset))
+    # One budget x factor table per (subset, retrieval depth). The k=0 tables keep
+    # their original filenames, so every table written before this arm existed is
+    # regenerated under the same name.
+    for (subset, search_k), cell_frame in frame.groupby(["dataset", "search_k"]):
+        suffix = "" if not search_k else f".k{int(search_k)}"
+        render_dataset(cell_frame, output, f"{subset}{suffix}")
     print(f"wrote fixed-grid tables to {output}")
 
 
