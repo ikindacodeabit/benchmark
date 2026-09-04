@@ -145,12 +145,20 @@ for subset in $DATASETS; do
             # preventing two workers from interleaving one checkpoint.jsonl.
             # Keyed on the TASK, not the subset: `nq_1m` and `nq_128k` are
             # different cells that would otherwise share one lock.
-            lock="$LOCK_DIR/${task}.${budget}.${factor}.lock"
-            exec 9>"$lock"
-            if ! flock -n 9; then
-                echo "skip locked: $subset B=$budget F=$factor"
+            #
+            # mkdir, not flock. flock on this NAS does NOT lock across hosts --
+            # tested directly, two hosts both acquired the same lock file at
+            # once -- so a lane on dog and a lane on elk would happily interleave
+            # one checkpoint.jsonl while each believed it held the cell. mkdir is
+            # atomic over NFS and is the portable primitive here. The trap
+            # releases it on exit, including on Ctrl-C.
+            lock="$LOCK_DIR/${task}.${budget}.${factor}.lock.d"
+            if ! mkdir "$lock" 2>/dev/null; then
+                echo "skip locked: $task B=$budget F=$factor (held by $(cat "$lock/owner" 2>/dev/null || echo unknown))"
                 continue
             fi
+            echo "$(hostname -s):$$" > "$lock/owner"
+            trap 'rm -rf "$lock"' EXIT INT TERM
 
             split_args=()
             if [ -n "$SPLIT" ]; then split_args=(--split "$SPLIT"); fi
@@ -170,7 +178,8 @@ for subset in $DATASETS; do
                 echo "!! CELL FAILED: $task B=$budget F=$factor N=$n -- continuing" >&2
                 echo "$task $budget $factor $n" >> "$RESULTS/failed_cells.txt"
             fi
-            flock -u 9
+            rm -rf "$lock"
+            trap - EXIT INT TERM
         done
     done
 done
