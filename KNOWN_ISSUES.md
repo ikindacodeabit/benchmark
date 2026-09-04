@@ -60,6 +60,21 @@ keep the diff reviewable. `make style` was already failing on master for
 
 ## Smaller things, knowingly left alone
 
+- **The RLM venv cannot score `longbench128k` or `longbench`, and the run still
+  looks like it worked.** `evaluation/benchmarks/longbench/calculate_metrics.py`
+  imports `jieba`, `fuzzywuzzy` and `rouge`, none of which the minimal RLM venv
+  installs (it exists to avoid the kvpress/vLLM transformers conflict — see
+  "Deliberate design limitations"). `write_run_artifacts` runs the scorer AFTER
+  every example has finished, so a run completes, writes `checkpoint.jsonl`,
+  `predictions.csv` and `config.yaml`, prints a `ModuleNotFoundError` traceback,
+  and simply never writes `metrics.json`. Nothing else fails, the exit status of
+  a driver that pipes the output can hide the traceback entirely, and the run
+  reads downstream as merely unfinished. `pip install jieba fuzzywuzzy rouge`
+  into that venv fixes it, and re-running the identical command rescores from the
+  checkpoint without re-invoking the model. Left as a note rather than a
+  dependency change because the venv split is deliberate and the RLM arm does not
+  otherwise need these.
+
 - `rlm.py` observation truncation reports `len(out) - obs_limit` dropped, but
   builds `2 * (obs_limit // 2) + marker`, so for an odd `obs_limit` the reported
   figure is off by one.
