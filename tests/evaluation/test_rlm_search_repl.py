@@ -5,7 +5,13 @@
 import pytest
 
 from evaluation.rlm import retrieval
-from evaluation.rlm.rlm import HIT_SEPARATOR, RLM, SUB_FIT_FAILURE_PREFIX
+from evaluation.rlm.rlm import (
+    HIT_SEPARATOR,
+    READ_STRATEGY_DEFAULT,
+    RLM,
+    SEARCH_TERMS_FIND,
+    SUB_FIT_FAILURE_PREFIX,
+)
 
 DOCUMENT = (
     ("filler text about nothing in particular " * 40)
@@ -228,3 +234,46 @@ def _merged(hits):
 
 def test_the_separator_is_what_clipping_charges_for():
     assert HIT_SEPARATOR
+
+
+class TestAblation:
+    """--search-ablate takes the four-change bundle apart, one part at a time."""
+
+    def test_the_full_treatment_teaches_search_everywhere(self):
+        rlm, _, _ = build(search_k=5)
+        slots = rlm._read_instructions(False)
+        assert "search(" in slots["search_terms"]
+        assert "hits = search(" in slots["worked_session"]
+
+    def test_ablating_locate_reverts_the_prose_but_keeps_the_demo(self):
+        rlm, _, _ = build(search_k=5, search_ablate=("locate",))
+        slots = rlm._read_instructions(False)
+        assert slots["search_terms"] == SEARCH_TERMS_FIND
+        assert slots["read_strategy"] == READ_STRATEGY_DEFAULT
+        assert "hits = search(" in slots["worked_session"]
+
+    def test_ablating_example_reverts_the_demo_but_keeps_the_prose(self):
+        rlm, _, _ = build(search_k=5, search_ablate=("example",))
+        slots = rlm._read_instructions(False)
+        assert 'context.find("invoice total")' in slots["worked_session"]
+        assert "search(" in slots["search_terms"]
+
+    def test_the_tool_is_always_described_even_when_both_are_ablated(self):
+        """Binding a tool whose help is withheld tests nothing anyone would ship."""
+        rlm, env, _ = build(search_k=5, search_ablate=("locate", "example"))
+        assert "search" in env
+        assert "search(query: str)" in rlm._read_instructions(False)["llm_query_help"]
+
+    def test_ablating_gate_lets_an_unsearched_abstention_through(self):
+        with_gate, _, _ = build(search_k=5)
+        without, _, _ = build(search_k=5, search_ablate=("gate",))
+        assert "gate" not in with_gate.search_ablate
+        assert "gate" in without.search_ablate
+
+    def test_an_unknown_component_is_refused(self):
+        with pytest.raises(ValueError):
+            build(search_k=5, search_ablate=("typo",))
+
+    def test_ablation_is_empty_by_default(self):
+        rlm, _, _ = build(search_k=5)
+        assert rlm.search_ablate == frozenset()

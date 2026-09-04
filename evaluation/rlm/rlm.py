@@ -161,6 +161,9 @@ READ_STRATEGY_SEARCH = """\
   LEARNED, not a re-run of the original query. If your first read already answers
   the question, finish instead; an unnecessary second search wastes a turn."""
 
+# The components of the search treatment that can be withheld one at a time.
+SEARCH_ABLATABLE = frozenset({"locate", "example", "gate"})
+
 EXAMPLE_LLM_QUERY_SEARCH = '        ans = llm_query("What was the March invoice total?", hits)'
 
 WORKED_SESSION_SEARCH = """\
@@ -578,6 +581,7 @@ class RLM:
         search_window_chars: int = retrieval.DEFAULT_CHUNK_CHARS,
         search_overlap_chars: int = retrieval.DEFAULT_OVERLAP,
         max_search_calls: int = 200,
+        search_ablate: Sequence[str] = (),
     ):
         self.root = root_client
         self.sub = sub_client or root_client
@@ -643,6 +647,24 @@ class RLM:
         # pure Python over a prebuilt index, so this should never bind; it exists so
         # a model that loops on search() cannot spin out the per-example deadline.
         self.max_search_calls = max_search_calls
+        # Which parts of the search treatment to withhold, so the bundle can be taken
+        # apart. Turning on retrieval changes FOUR things at once -- the tool, the
+        # prose that tells the root to use it, the worked example that demonstrates
+        # it, and the abstention effort gate -- and a combined result cannot say
+        # which did the work. Empty (the default) is the full treatment.
+        #   tool     always on when search_k > 0; withhold it with --search-k 0
+        #   locate   the FINDING THINGS bullet and the read strategy (prose)
+        #   example  the worked session (demonstration)
+        #   gate     an abstention must be backed by at least one search
+        # `locate` vs `example` is the prose-vs-demonstration split that commit
+        # ec2c8a2 already showed matters: the demonstration outvoted the prose.
+        unknown = set(search_ablate) - SEARCH_ABLATABLE
+        if unknown:
+            raise ValueError(
+                f"unknown search_ablate components: {sorted(unknown)}; "
+                f"choose from {sorted(SEARCH_ABLATABLE)}"
+            )
+        self.search_ablate = frozenset(search_ablate)
         self._sub_call_budget: Optional[int] = None
         self._deadline: Optional[float] = None
         self.tok = TokenCounter(token_counter)
@@ -691,12 +713,26 @@ class RLM:
             # identically either way, because the fold is invisible to the model.
             # Deliberately does NOT borrow the split-large "a large slice costs
             # barely more than a small one" claim, which is false on http.
+            #
+            # The tool is always described -- withholding its help while binding it
+            # would test nothing anyone would ship. What `--search-ablate` withholds
+            # is the PROSE that tells the root to prefer it (`locate`) and the
+            # DEMONSTRATION that shows it (`example`), independently.
+            teach_locate = "locate" not in self.search_ablate
+            teach_example = "example" not in self.search_ablate
+            find_example = EXAMPLE_LLM_QUERY_SPLIT if split_capable else EXAMPLE_LLM_QUERY_DENSE
             return {
                 "llm_query_help": LLM_QUERY_HELP_SEARCH.format(k=self.search_k),
-                "example_llm_query": EXAMPLE_LLM_QUERY_SEARCH,
-                "read_strategy": READ_STRATEGY_SEARCH.format(k=self.search_k),
-                "search_terms": SEARCH_TERMS_BM25.format(k=self.search_k),
-                "worked_session": WORKED_SESSION_SEARCH,
+                "example_llm_query": EXAMPLE_LLM_QUERY_SEARCH if teach_example else find_example,
+                "read_strategy": (
+                    READ_STRATEGY_SEARCH.format(k=self.search_k) if teach_locate else READ_STRATEGY_DEFAULT
+                ),
+                "search_terms": (SEARCH_TERMS_BM25.format(k=self.search_k) if teach_locate else SEARCH_TERMS_FIND),
+                "worked_session": (
+                    WORKED_SESSION_SEARCH
+                    if teach_example
+                    else WORKED_SESSION_FIND.format(example_llm_query=find_example)
+                ),
             }
         large = self.min_subcall_chars > 0 and split_capable
         if not large:
@@ -1295,7 +1331,7 @@ class RLM:
             """
             if metrics["sub_calls"] < self.min_sub_calls_before_abstain:
                 return False
-            if self.search_k > 0 and metrics.get("search_calls", 0) < 1:
+            if self.search_k > 0 and "gate" not in self.search_ablate and metrics.get("search_calls", 0) < 1:
                 return False
             return True
 

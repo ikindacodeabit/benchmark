@@ -26,7 +26,7 @@ from evaluation.results_layout import RLM_RESULTS_DIR
 from . import retrieval
 from .client import LLMClient
 from .datasets import available_datasets, canonical_dataset_name, load_examples
-from .rlm import RLM, MemoryBudget, Scratchpad, vanilla_answer
+from .rlm import SEARCH_ABLATABLE, RLM, MemoryBudget, Scratchpad, vanilla_answer
 from .sizing import (
     DEFAULT_MIN_TOKENS,
     DEFAULT_RESERVE_TOKENS,
@@ -104,6 +104,7 @@ RESUME_CRITICAL_KEYS = (
     "search_window_chars",
     "search_overlap_chars",
     "max_search_calls",
+    "search_ablate",
     "sub_max_tokens",
     "data_dir",
     # Dicts: comparing them whole covers their nested knobs too
@@ -485,6 +486,10 @@ def build_run_dir_components(args: argparse.Namespace, mode: str, scratchpad: Sc
         components.append(f"bm25k{args.search_k}")
         if (args.search_window, args.search_overlap) != (DEFAULT_SEARCH_WINDOW, DEFAULT_SEARCH_OVERLAP):
             components.append(f"win{args.search_window}o{args.search_overlap}")
+        # Only when ablating, so a full-treatment run keeps the name it already has.
+        for part in ("locate", "example", "gate"):
+            if part in getattr(args, "search_ablate", ()):
+                components.append(f"no-{part}")
     return components
 
 
@@ -714,6 +719,15 @@ def main() -> None:
         "boundary still matches one of them (--search-k)",
     )
     ap.add_argument(
+        "--search-ablate",
+        default="",
+        help="comma-separated parts of the search treatment to WITHHOLD, so the bundle can be "
+        "taken apart: locate (the prose telling the root to search), example (the worked "
+        "session demonstrating it), gate (an abstention must be backed by a search). Empty = "
+        "the full treatment. Turning retrieval on changes four things at once, and a combined "
+        "result cannot say which did the work; --search-k 0 withholds the tool itself",
+    )
+    ap.add_argument(
         "--max-search-calls",
         type=int,
         default=200,
@@ -832,6 +846,12 @@ def main() -> None:
         ap.error("--min-subcall-chars must be >= 0 (0 disables the floor)")
     if args.search_k < 0:
         ap.error("--search-k must be >= 0 (0 disables retrieval)")
+    args.search_ablate = tuple(x.strip() for x in str(args.search_ablate).split(",") if x.strip())
+    unknown_ablate = set(args.search_ablate) - SEARCH_ABLATABLE
+    if unknown_ablate:
+        ap.error(f"--search-ablate: unknown {sorted(unknown_ablate)}; choose from {sorted(SEARCH_ABLATABLE)}")
+    if args.search_ablate and not args.search_k:
+        ap.error("--search-ablate needs --search-k > 0; without the tool there is nothing to ablate")
     if args.search_k and not 0 <= args.search_overlap < args.search_window:
         ap.error(
             f"--search-overlap ({args.search_overlap}) must satisfy 0 <= overlap < "
@@ -973,6 +993,7 @@ def main() -> None:
         search_window_chars=args.search_window,
         search_overlap_chars=args.search_overlap,
         max_search_calls=args.max_search_calls,
+        search_ablate=args.search_ablate,
     )
 
     for mode in modes:
@@ -1236,6 +1257,7 @@ def build_run_config(
         "search_window_chars": args.search_window,
         "search_overlap_chars": args.search_overlap,
         "max_search_calls": args.max_search_calls,
+        "search_ablate": ",".join(args.search_ablate),
         # Which semantics produced document_coverage_fraction. Before this, spans
         # were derived AFTER the dense fold set chunk=None, so coverage was
         # structurally 0.0 on every --sub-backend http run; it is now resolved
