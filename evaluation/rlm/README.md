@@ -98,6 +98,20 @@ them silently flatters RLM:
   `runtime.abstained` is reported separately: an arm that abstains honestly and
   one that hallucinates confidently are not the same result, and the score column
   alone cannot tell them apart. Vanilla has no equivalent ending.
+- **Retrieval.** A `--search-k > 0` arm has an information channel the others do
+  not: a BM25 index over the whole document. Vanilla truncates, KVPress
+  compresses, and this arm *selects*. The only fair comparator is a `--search-k 0`
+  run of the same commit, which is why the flag is stamped into the run directory
+  and `config.yaml` rather than becoming a default.
+  `runtime.gold_in_retrieved_fraction` is the arm's structural ceiling — the
+  analogue of `context_retained` for vanilla. A score below it is the reader's
+  fault; a score at it means retrieval, not reading, is the binding constraint.
+  Two caveats travel with it. The treatment is not one variable: the primitive,
+  the worked example, the locate bullet and the abstention gate all move together.
+  And `document_coverage_fraction` changed meaning — spans are now resolved before
+  the dense fold, so it was structurally `0.0` on every earlier `--sub-backend
+  http` run. `config.yaml` records `coverage_attribution: spans_v2`; do not
+  compare a coverage number across that line.
 
 ## Runaway guards and the scratchpad
 All four are toggleable and independent; pass `0` to disable one without
@@ -111,6 +125,7 @@ to watch a single example run to completion can switch any of them off.
 | `--run-timeout` | `900` s | `0` | Wall-clock for ONE example, ending it with `end_reason=run_timeout`. Needed because `--exec-timeout` deliberately does not bound `llm_query` time. |
 | `--max-sub-calls` | `40` | `0` | `llm_query` calls per example. Past the cap, calls return a notice instead of hitting the server, so the model degrades gracefully rather than erroring. |
 | `--scratchpad` | off | (omit) | Opt-in `note(text)` REPL tool. Notes are re-shown every turn and survive budget eviction, giving the model a durable place to keep findings. Size it with `--max-notes-tokens`. |
+| `--search-k` | `0` (off) | `0` | Opt-in `search(query)` REPL tool: BM25 over fixed overlapping windows of the document, returning this many ranked windows. Pass them to `llm_query(question, hits)` so the payload stays attributable. The model may ask for fewer windows but never more, so a worked example cannot override a swept grid cell. Size the windows with `--search-window` / `--search-overlap`. |
 
 `--exec-timeout` relies on `SIGALRM`, so it is a no-op off the main thread or on
 platforms without it; it also cannot interrupt a C-level regex. `--run-timeout`
