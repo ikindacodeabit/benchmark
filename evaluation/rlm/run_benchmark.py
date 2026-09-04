@@ -23,6 +23,7 @@ from evaluation.benchmarks.registry import LOFT_TASKS, LONGBENCH_128K_SUBSETS, R
 from evaluation.benchmarks.results import score_prediction_frame
 from evaluation.results_layout import RLM_RESULTS_DIR
 
+from . import retrieval
 from .client import LLMClient
 from .datasets import available_datasets, canonical_dataset_name, load_examples
 from .rlm import RLM, MemoryBudget, Scratchpad, vanilla_answer
@@ -38,6 +39,11 @@ from .sizing import (
 # build_run_dir_components as well as being the argparse default -- as two separate
 # literals, changing one would silently shift every run directory name.
 DEFAULT_MAX_SUBCALL_CHARS = 32000
+
+# Same reason as above: these are both argparse defaults and compared against in
+# build_run_dir_components, so they must be one literal each.
+DEFAULT_SEARCH_WINDOW = retrieval.DEFAULT_CHUNK_CHARS
+DEFAULT_SEARCH_OVERLAP = retrieval.DEFAULT_OVERLAP
 
 
 def _subcall_chars(value: str) -> Any:
@@ -88,6 +94,16 @@ RESUME_CRITICAL_KEYS = (
     # on/off-by-value, and resuming a floor-2048 run into a floor-16384 checkpoint
     # would merge two different read regimes.
     "min_subcall_chars",
+    # In the slug too (search_k is), but listed here for the same reason
+    # min_subcall_chars is: the slug distinguishes depth, not window geometry, and
+    # resuming a 2000-char-window run into a 4000-char-window checkpoint would merge
+    # two different retrievers. --sample-fraction is the cautionary precedent: it
+    # picked which rows were evaluated, reached neither the name nor this list, and
+    # two different samples merged into one score.
+    "search_k",
+    "search_window_chars",
+    "search_overlap_chars",
+    "max_search_calls",
     "sub_max_tokens",
     "data_dir",
     # Dicts: comparing them whole covers their nested knobs too
@@ -321,6 +337,27 @@ def write_run_artifacts(
         ]
         if coverage:
             runtime["document_coverage_fraction"] = float(sum(coverage) / len(coverage))
+        # The effort thesis had no run-level aggregate at all: the grid granted 50
+        # steps and up to 64 sub-calls while the median example used 2 and 1.
+        for column in ("steps", "sub_calls"):
+            if column in scored_frame:
+                runtime[f"average_{column}"] = float(scored_frame[column].mean())
+        # Search arm only, so a non-search run's runtime block is unchanged.
+        searches = [m.get("search_calls") for m in rlm_metrics if m.get("search_calls") is not None]
+        if searches:
+            runtime["search_calls"] = int(sum(searches))
+            runtime["average_search_calls"] = float(sum(searches) / len(searches))
+            runtime["search_hits_returned"] = int(sum(m.get("search_hits_returned", 0) for m in rlm_metrics))
+            # The number that says whether the tool was actually USED, as opposed to
+            # merely offered: hits returned but never handed to llm_query.
+            runtime["search_hits_read"] = int(sum(m.get("search_hits_read", 0) for m in rlm_metrics))
+            runtime["search_k_clamped_calls"] = int(sum(m.get("search_k_clamped_calls", 0) for m in rlm_metrics))
+        if "gold_in_retrieved" in scored_frame:
+            # The arm's structural ceiling: a score below this is the reader's fault,
+            # a score at it means retrieval is the binding constraint.
+            gold = scored_frame["gold_in_retrieved"].dropna()
+            if len(gold):
+                runtime["gold_in_retrieved_fraction"] = float(gold.astype(bool).sum() / len(gold))
 
     # Sub-side KV retention: the direct analogue of KVPress's
     # `average_retained_context_tokens`, but measured over llm_query sub-calls --
@@ -442,6 +479,12 @@ def build_run_dir_components(args: argparse.Namespace, mode: str, scratchpad: Sc
         components.append(f"autosubx{factor:g}" if factor is not None else f"autosub{args.target_compression_ratio:g}")
     if mode == "rlm" and getattr(args, "fixed_chunk", False):
         components.append("fixed")
+    # Last, and only when retrieval is on, so every directory written before this
+    # arm existed keeps its exact name and its checkpoint stays reachable.
+    if mode == "rlm" and getattr(args, "search_k", 0):
+        components.append(f"bm25k{args.search_k}")
+        if (args.search_window, args.search_overlap) != (DEFAULT_SEARCH_WINDOW, DEFAULT_SEARCH_OVERLAP):
+            components.append(f"win{args.search_window}o{args.search_overlap}")
     return components
 
 
@@ -642,6 +685,41 @@ def main() -> None:
         "Required for the KV-compression arm to measure anything: a slice under "
         "--press-min-tokens skips the press entirely",
     )
+    # --- BM25 retrieval over the document (arm 5) ---
+    # The root's only locate primitive was `str.find`, which returns the FIRST
+    # literal occurrence. Across the 879 finished LOFT-1m transcripts 80.5% of
+    # examples never surfaced the gold answer into any REPL output at all, against
+    # 5.2% that saw it and still answered wrong -- a recall failure sitting upstream
+    # of every knob the fixed-chunk grid sweeps.
+    ap.add_argument(
+        "--search-k",
+        type=int,
+        default=0,
+        help="give the root a BM25 `search(query)` over the whole document, returning this "
+        "many ranked windows (0 = off, which is every arm run so far and leaves the REPL "
+        "namespace unchanged). This is the grid's retrieval-depth axis: the model may ask "
+        "for fewer windows but never more, so a worked example cannot override the cell",
+    )
+    ap.add_argument(
+        "--search-window",
+        type=int,
+        default=DEFAULT_SEARCH_WINDOW,
+        help="character width of each indexed window (--search-k)",
+    )
+    ap.add_argument(
+        "--search-overlap",
+        type=int,
+        default=DEFAULT_SEARCH_OVERLAP,
+        help="character overlap between adjacent indexed windows, so an answer straddling a "
+        "boundary still matches one of them (--search-k)",
+    )
+    ap.add_argument(
+        "--max-search-calls",
+        type=int,
+        default=200,
+        help="runaway guard on search() calls per example, in the shape of --max-sub-calls. "
+        "Searching is pure Python over a prebuilt index, so this should never bind",
+    )
     compression_target = ap.add_mutually_exclusive_group()
     compression_target.add_argument(
         "--target-compression-ratio",
@@ -752,6 +830,30 @@ def main() -> None:
         ap.error(str(exc))
     if args.min_subcall_chars < 0:
         ap.error("--min-subcall-chars must be >= 0 (0 disables the floor)")
+    if args.search_k < 0:
+        ap.error("--search-k must be >= 0 (0 disables retrieval)")
+    if args.search_k and not 0 <= args.search_overlap < args.search_window:
+        ap.error(
+            f"--search-overlap ({args.search_overlap}) must satisfy 0 <= overlap < "
+            f"--search-window ({args.search_window})"
+        )
+    # A retrieval payload is k windows wide, and _cap_subcall truncates whatever
+    # exceeds --max-subcall-chars. At the 2000-char default window that caps the
+    # REAL depth near k=16, so a k=20 and a k=50 cell would both quietly read ~16
+    # windows and the top of the axis would be several cells measuring the same
+    # thing. Refuse up front, the way --fixed-chunk refuses a cell the GPU would
+    # shrink, rather than producing a plausible number for a depth never run.
+    if args.search_k and not auto_chunk:
+        needed = args.search_k * args.search_window
+        room = args.max_subcall_chars - args.max_subcall_chars // 4
+        if needed > room:
+            ap.error(
+                f"--search-k {args.search_k} x --search-window {args.search_window} = {needed} chars "
+                f"of payload, but --max-subcall-chars {args.max_subcall_chars} leaves only {room} for "
+                f"it (the question reserves a quarter). The run would silently read about "
+                f"{room // args.search_window} windows instead of {args.search_k}. Raise "
+                f"--max-subcall-chars to at least {needed * 4 // 3 + 1}."
+            )
     # A floor above the ceiling is silently self-cancelling: _expand_subcall widens
     # to the floor and _cap_subcall immediately truncates back to the cap, so the
     # run looks configured for big reads and produces the size it always did.
@@ -867,6 +969,10 @@ def main() -> None:
         min_sub_calls_before_abstain=args.min_sub_calls_before_abstain,
         max_unproductive_steps=args.max_unproductive_steps,
         max_error_steps=args.max_error_steps,
+        search_k=args.search_k,
+        search_window_chars=args.search_window,
+        search_overlap_chars=args.search_overlap,
+        max_search_calls=args.max_search_calls,
     )
 
     for mode in modes:
@@ -1016,6 +1122,16 @@ def main() -> None:
                 # try: vanilla_answer fills the dict before re-raising, and the
                 # errored record is exactly the one a triage pass needs it on.
                 record.update(vstats)
+                # Was the gold inside the windows retrieval actually returned? This
+                # separates "retrieval missed it" from "the reader missed it" -- the
+                # search arm's analogue of the vanilla arm's `truncated` column, and
+                # the arm's structural ceiling. Reads gold AFTER the example has
+                # ended, exactly like the is_correct line below it; nothing here
+                # reaches the model.
+                spans = (record.get("metrics") or {}).pop("search_retrieved_spans", None) if mode == "rlm" else None
+                if spans:
+                    retrieved = "".join(ex["context"][start:end] for start, end in spans)
+                    record["gold_in_retrieved"] = is_correct(retrieved, ex["answers"])
                 record["correct"] = is_correct(record.get("pred"), ex["answers"])
                 record["latency_s"] = round(time.time() - t0, 2)
                 record["tokens"] = root.usage.total_tokens + sub.usage.total_tokens - tok0
@@ -1116,6 +1232,15 @@ def build_run_config(
         # left at its None default, kvzip_backend derives this from the memory
         # budget, so args would serialise None while the run used a real floor.
         "press_min_tokens": resolved_press_min_tokens if args.sub_backend == "kvzip" else None,
+        "search_k": args.search_k,
+        "search_window_chars": args.search_window,
+        "search_overlap_chars": args.search_overlap,
+        "max_search_calls": args.max_search_calls,
+        # Which semantics produced document_coverage_fraction. Before this, spans
+        # were derived AFTER the dense fold set chunk=None, so coverage was
+        # structurally 0.0 on every --sub-backend http run; it is now resolved
+        # before the fold. A coverage number must not be compared across that line.
+        "coverage_attribution": "spans_v2",
     }
 
 

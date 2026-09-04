@@ -43,9 +43,11 @@ import threading
 import time
 import traceback
 from dataclasses import dataclass, field
-from typing import Callable, Optional
+from typing import Callable, Optional, Sequence
 
+from . import retrieval
 from .client import LLMClient
+from .retrieval import Hit
 
 ROOT_SYSTEM_PROMPT = """You are solving a task over a LONG document that does NOT fit in your context window.
 The document is stored in a Python REPL as a string variable named `context`
@@ -65,14 +67,7 @@ RULES:
     * `print(...)`: anything you print is shown back to you in the NEXT message
       (truncated to {obs_limit} chars), so print only what you need to see.{note_tool}
 {read_strategy}
-- SEARCH TERMS: never search for the question itself. A query like "first who
-  wants to be a millionaire winner uk" appears nowhere in any document as a
-  literal string, so searching for it proves nothing. Pull out the DISTINCTIVE
-  terms — proper nouns, names, titles, numbers, rare words — and search for each
-  one SEPARATELY and case-insensitively, e.g.
-  `idx = context.lower().find(term.lower())`. For that query you would try
-  "millionaire", then "jackpot", then "winner". Try several terms before
-  concluding anything is absent.
+{search_terms}
 - If a search or extraction returns ZERO matches or fewer than the task implies,
   that is USUALLY a signal your pattern is wrong — not that the answer is empty.
   Print a sample of the text around a likely keyword to see the actual format,
@@ -91,6 +86,34 @@ RULES:
   the document before you can claim the answer is not in it.
 - You have at most {max_steps} code turns. Be efficient.{budget_note}
 
+{worked_session}
+
+The user's task is:
+{task}
+{answer_format_note}"""
+
+# The "how do I locate things" bullet and the worked session are slots rather than
+# fixed text because they are the two places that DEMONSTRATE a locate tactic, and
+# the demonstration is what the root copies. Commit ec2c8a2 measured this: told
+# "FEWER, BIGGER slices" one line above a 700-char keyhole example, the root sent a
+# mean of 1023 chars against a 32000-char cap, and a lane with a 131072-char cap
+# emitted every call at exactly 1500 chars -- the width of the example. So a search
+# arm that added an llm_query bullet but left `context.lower().find(term.lower())`
+# demonstrated here would keep getting `.find`.
+#
+# The _FIND defaults below are byte-identical to the text they replaced, so every
+# non-search arm renders exactly the prompt it always did.
+SEARCH_TERMS_FIND = """\
+- SEARCH TERMS: never search for the question itself. A query like "first who
+  wants to be a millionaire winner uk" appears nowhere in any document as a
+  literal string, so searching for it proves nothing. Pull out the DISTINCTIVE
+  terms — proper nouns, names, titles, numbers, rare words — and search for each
+  one SEPARATELY and case-insensitively, e.g.
+  `idx = context.lower().find(term.lower())`. For that query you would try
+  "millionaire", then "jackpot", then "winner". Try several terms before
+  concluding anything is absent."""
+
+WORKED_SESSION_FIND = """\
 Example of a correct session (3 turns):
   You:  ```python
         idx = context.find("invoice total")
@@ -104,11 +127,65 @@ Example of a correct session (3 turns):
   REPL: $4,210
   You:  ```python
         FINAL(ans)
-        ```
+        ```"""
 
-The user's task is:
-{task}
-{answer_format_note}"""
+SEARCH_TERMS_BM25 = """\
+- FINDING THINGS: `search(...)` is a keyword index over the WHOLE document. Unlike
+  `context.find(...)` it does NOT need a literal match and it does NOT stop at the
+  first occurrence — it returns the {k} best-matching windows, ranked, from
+  anywhere in the document. Pass the question itself, or the DISTINCTIVE terms in
+  it — proper nouns, names, titles, numbers, rare words. `context.find(...)` still
+  exists and is right for an exact string you already know, but it returns only
+  the FIRST literal occurrence, which in a document this long is almost never the
+  one you want."""
+
+LLM_QUERY_HELP_SEARCH = """\
+    * `search(query: str) -> list[Hit]`: keyword search over the whole document.
+      Returns the {k} best-matching windows, ranked. Each Hit has `.start` and
+      `.end` (character offsets into `context`), `.score`, and `.text` (exactly
+      `context[.start:.end]`). Print the hits to see where they landed.
+    * `llm_query(question: str, hits) -> str`: ask a sub-LLM about retrieved text.
+      IMPORTANT: the sub-LLM CANNOT see `context` or any of your variables. Put the
+      question FIRST and the HIT LIST second — `llm_query("What is X?", hits)` —
+      and the windows' text is sent for you. Pass the hits themselves rather than
+      text you joined yourself: that is what lets the harness know which part of
+      the document was read. Capture the result: ans = llm_query(...) then
+      print(ans)."""
+
+READ_STRATEGY_SEARCH = """\
+- Strategy: `search(...)` FIRST, then read. Print the hits, then hand the WHOLE hit
+  list to `llm_query` in ONE call — reading all {k} windows together costs one call
+  and is what search is for. Do NOT print the whole context.
+- SECOND HOP: when the question needs a fact you must look up first — it names a
+  film and asks about its director's birthplace — search AGAIN with what you just
+  LEARNED, not a re-run of the original query. If your first read already answers
+  the question, finish instead; an unnecessary second search wastes a turn."""
+
+EXAMPLE_LLM_QUERY_SEARCH = '        ans = llm_query("What was the March invoice total?", hits)'
+
+WORKED_SESSION_SEARCH = """\
+Example of a correct session (4 turns):
+  You:  ```python
+        hits = search("who directed the 1975 film about the shark")
+        for h in hits:
+            print(h)
+        ```
+  REPL: Hit(rank=1, start=812400, end=814400, score=17.40, '...Jaws (1975) was directed by Steven Spielberg...')
+        Hit(rank=2, start=55200, end=57200, score=9.12, '...shark attacks reported off Amity that summer...')
+  You:  ```python
+        ans = llm_query("Who directed the 1975 shark film?", hits)
+        print(ans)
+        ```
+  REPL: Steven Spielberg
+  You:  ```python
+        hits2 = search("Steven Spielberg born")
+        ans2 = llm_query("Where was Steven Spielberg born?", hits2)
+        print(ans2)
+        ```
+  REPL: Cincinnati, Ohio
+  You:  ```python
+        FINAL(ans2)
+        ```"""
 
 # The llm_query help/example rendered into ROOT_SYSTEM_PROMPT depends on the sub
 # backend. The SPLIT variants teach the two-arg form used when the sub client
@@ -331,6 +408,76 @@ def _mentions(haystack: str, needle: str) -> bool:
 
 
 # --------------------------------------------------------------------------- #
+# Retrieved-span arithmetic
+# --------------------------------------------------------------------------- #
+HIT_SEPARATOR = "\n...\n"
+
+
+def _merge_spans(spans: Sequence[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Sort and coalesce overlapping or touching spans.
+
+    Retrieval windows overlap by construction (2000-char windows on a 1600-char
+    stride), so two adjacent hits share 400 characters. Joining them unmerged
+    would repeat that text in the payload AND double-count it in coverage.
+    """
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(spans):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _widen_spans(spans: Sequence[tuple[int, int]], target_chars: int, doc_len: int) -> list[tuple[int, int]]:
+    """Grow retrieved spans symmetrically until they total `target_chars`.
+
+    The `--min-subcall-chars` floor exists so a KV-compression arm has something
+    to compress. `_expand_subcall` cannot serve a retrieved payload (there is no
+    single slice to locate), so the floor is applied to the spans instead, before
+    the payload is assembled.
+    """
+    spans = _merge_spans(spans)
+    total = sum(end - start for start, end in spans)
+    if not spans or doc_len <= 0 or total >= target_chars:
+        return list(spans)
+    grow = -(-(target_chars - total) // len(spans))  # ceil, so the floor is reached
+    widened = []
+    for start, end in spans:
+        want = (end - start) + grow
+        new_start = max(0, start - grow // 2)
+        new_end = min(doc_len, new_start + want)
+        new_start = max(0, new_end - want)
+        widened.append((new_start, new_end))
+    return _merge_spans(widened)
+
+
+def _clip_spans(spans: Sequence[tuple[int, int]], kept_chars: int, separator_len: int) -> list[tuple[int, int]]:
+    """The prefix of `spans` that survives a truncation to `kept_chars`.
+
+    `_cap_subcall` truncates the payload from the right, so a payload that was cut
+    must not go on claiming coverage for text the sub model never received. Walks
+    left to right and drops or shortens the tail.
+    """
+    kept: list[tuple[int, int]] = []
+    used = 0
+    for index, (start, end) in enumerate(spans):
+        if index:
+            used += separator_len
+        room = kept_chars - used
+        if room <= 0:
+            break
+        length = end - start
+        if length <= room:
+            kept.append((start, end))
+            used += length
+        else:
+            kept.append((start, start + room))
+            break
+    return kept
+
+
+# --------------------------------------------------------------------------- #
 # Token accounting
 # --------------------------------------------------------------------------- #
 class TokenCounter:
@@ -427,6 +574,10 @@ class RLM:
         min_sub_calls_before_abstain: int = 1,
         max_unproductive_steps: int = 3,
         max_error_steps: int = 3,
+        search_k: int = 0,
+        search_window_chars: int = retrieval.DEFAULT_CHUNK_CHARS,
+        search_overlap_chars: int = retrieval.DEFAULT_OVERLAP,
+        max_search_calls: int = 200,
     ):
         self.root = root_client
         self.sub = sub_client or root_client
@@ -479,6 +630,19 @@ class RLM:
         # other two breakers sees this: an exception counts as output, and broken
         # code that changes between attempts is never an exact repeat. 0 disables.
         self.max_error_steps = max_error_steps
+        # BM25 retrieval over the document. 0 = off, which is every arm run so far,
+        # and off means the `search` name is not bound in the REPL at all. Above 0
+        # the root gets a real locate primitive instead of `str.find`, which returns
+        # only the FIRST literal occurrence: across the 879 finished LOFT-1m
+        # transcripts 80.5% of examples never surfaced the gold answer into any REPL
+        # output, against 5.2% that saw it and still answered wrong.
+        self.search_k = search_k
+        self.search_window_chars = search_window_chars
+        self.search_overlap_chars = search_overlap_chars
+        # Runaway guard in the shape of --max-sub-calls, not a target. Searching is
+        # pure Python over a prebuilt index, so this should never bind; it exists so
+        # a model that loops on search() cannot spin out the per-example deadline.
+        self.max_search_calls = max_search_calls
         self._sub_call_budget: Optional[int] = None
         self._deadline: Optional[float] = None
         self.tok = TokenCounter(token_counter)
@@ -511,7 +675,8 @@ class RLM:
         return question, chunk, truncated
 
     def _read_instructions(self, split_capable: bool) -> dict:
-        """The three prompt slots that describe how to read: help, example, strategy.
+        """The prompt slots that describe how to read: help, example, strategy,
+        the locate bullet, and the worked session.
 
         Grouped because they must agree. They were previously chosen independently,
         which is how the split prompt ended up asking for "FEWER, BIGGER slices" one
@@ -521,9 +686,25 @@ class RLM:
         The large-read variants apply only on the split path: they promise that a big
         slice is cheap, which is only true when the sub backend compresses its context.
         """
+        if self.search_k > 0:
+            # One search block for both backends: llm_query(question, hits) behaves
+            # identically either way, because the fold is invisible to the model.
+            # Deliberately does NOT borrow the split-large "a large slice costs
+            # barely more than a small one" claim, which is false on http.
+            return {
+                "llm_query_help": LLM_QUERY_HELP_SEARCH.format(k=self.search_k),
+                "example_llm_query": EXAMPLE_LLM_QUERY_SEARCH,
+                "read_strategy": READ_STRATEGY_SEARCH.format(k=self.search_k),
+                "search_terms": SEARCH_TERMS_BM25.format(k=self.search_k),
+                "worked_session": WORKED_SESSION_SEARCH,
+            }
         large = self.min_subcall_chars > 0 and split_capable
         if not large:
             return {
+                "search_terms": SEARCH_TERMS_FIND,
+                "worked_session": WORKED_SESSION_FIND.format(
+                    example_llm_query=(EXAMPLE_LLM_QUERY_SPLIT if split_capable else EXAMPLE_LLM_QUERY_DENSE)
+                ),
                 "llm_query_help": (LLM_QUERY_HELP_SPLIT if split_capable else LLM_QUERY_HELP_DENSE).format(
                     max_chars=self.max_subcall_chars
                 ),
@@ -540,6 +721,10 @@ class RLM:
             ),
             "example_llm_query": EXAMPLE_LLM_QUERY_SPLIT_LARGE.format(half=half),
             "read_strategy": READ_STRATEGY_LARGE,
+            "search_terms": SEARCH_TERMS_FIND,
+            "worked_session": WORKED_SESSION_FIND.format(
+                example_llm_query=EXAMPLE_LLM_QUERY_SPLIT_LARGE.format(half=half)
+            ),
         }
 
     def _expand_subcall(self, chunk: str, document: str) -> tuple[str, bool]:
@@ -580,6 +765,11 @@ class RLM:
         # document inside it, so bind the document under a name the closure keeps.
         document = context
         coverage_spans: list[tuple[int, int]] = []
+        # Every span search() ever returned, whether or not the root went on to read
+        # it. run_benchmark turns this into `gold_in_retrieved`, which separates
+        # "retrieval missed it" from "the reader missed it" -- the retrieval arm's
+        # analogue of the vanilla arm's `truncated` column.
+        retrieved_spans: list[tuple[int, int]] = metrics.setdefault("search_retrieved_spans", [])
 
         def record_coverage(start: int, end: int) -> None:
             """Merge one real document span and expose the union as a fraction."""
@@ -597,14 +787,37 @@ class RLM:
                 covered += current_end - current_start
             metrics["document_coverage_fraction"] = covered / len(document) if document else 0.0
 
-        def llm_query(prompt: str, context: str | None = None) -> str:
+        def llm_query(prompt: str, context=None) -> str:
             # Key on the FULL strings. Keying on the TRUNCATED ones makes two
             # different calls that share a 32k-char prefix collide -- e.g.
             # context[0:100000] and context[0:200000] -- silently returning one
             # slice's answer for the other. The key is a (question, slice) pair so
             # the same question over two slices never collides either.
             question = str(prompt)
-            chunk = None if context is None else str(context)
+            # The second argument is a raw slice (the documented one- and two-arg
+            # forms) OR the hit list `search` returned. Accepting hits is what lets
+            # the harness attribute the payload to real document spans: a payload
+            # the MODEL joins is not findable in the document, so it records no
+            # coverage and reads downstream exactly like a cell whose sub-model
+            # never ran (fixedgrid/audit_cells.py treats coverage 0 as that tell).
+            hit_spans: Optional[list[tuple[int, int]]] = None
+            if context is None or isinstance(context, str):
+                chunk = None if context is None else str(context)
+            else:
+                items = list(context)
+                if items and all(isinstance(h, Hit) for h in items):
+                    metrics["search_hits_read"] = metrics.get("search_hits_read", 0) + len(items)
+                    spans = _merge_spans([(h.start, h.end) for h in items])
+                    if self.min_subcall_chars > 0:
+                        spans = _widen_spans(spans, self.min_subcall_chars, len(document))
+                    hit_spans = spans
+                    chunk = HIT_SEPARATOR.join(document[start:end] for start, end in spans)
+                elif not items:
+                    # search() found nothing. Send the question alone rather than the
+                    # string "[]", which is what str() of an empty list would paste in.
+                    chunk = None
+                else:
+                    chunk = str(context)
             # Widen BEFORE keying, so the cache is keyed on what the sub model
             # actually receives. (Only an exact repeat collapses: windows are centred
             # on the slice, so two NEARBY probes widen to overlapping-but-distinct
@@ -618,10 +831,14 @@ class RLM:
             expanded = False
             needs_expansion = bool(
                 chunk
+                and hit_spans is None
                 and self.min_subcall_chars > 0
                 and len(chunk) < min(self.min_subcall_chars, len(document))
             )
-            if chunk is not None:
+            # A hit payload is assembled from spans the harness already knows, so
+            # `document.find` cannot locate it and `_expand_subcall` has nothing to
+            # anchor on -- the spans were widened above instead.
+            if chunk is not None and hit_spans is None:
                 chunk, expanded = self._expand_subcall(chunk, document)
             unlocatable = needs_expansion and not expanded
             key = (question, chunk)
@@ -651,18 +868,36 @@ class RLM:
                     "as too large to fit. No further llm_query calls are available. "
                     "Use plain string/regex operations on `context` instead."
                 )
+            # Resolve where this payload sits in the document BEFORE the fold below,
+            # which sets chunk=None on a plain chat backend. Deriving it afterwards
+            # is why document_coverage_fraction was structurally 0.0 on EVERY
+            # --sub-backend http run: LLMClient has no chat_split, so the fold always
+            # fired and the `chunk is not None` guard below it never held.
+            spans_sent: list[tuple[int, int]] = []
+            if hit_spans is not None:
+                spans_sent = list(hit_spans)
+            elif chunk is not None:
+                start = document.find(chunk)
+                if start >= 0:
+                    spans_sent = [(start, start + len(chunk))]
+            payload_chars = len(chunk) if chunk is not None else 0
             if chunk is not None and not hasattr(self.sub, "chat_split"):
                 # Two-arg call against a plain chat backend (arms without a
                 # split-capable sub): fold the slice into the prompt so the call
                 # still behaves like the documented one-arg form.
                 question = f"{question}\n\n{chunk}"
                 chunk = None
+            question_chars = len(question)
             question, chunk, truncated = self._cap_subcall(question, chunk)
-            document_span = None
-            if chunk is not None:
-                start = document.find(chunk)
-                if start >= 0:
-                    document_span = (start, start + len(chunk))
+            if spans_sent and truncated:
+                # Keep only what survived the cap. _cap_subcall truncates from the
+                # right, so a clipped payload must stop claiming coverage for text
+                # the sub model never received. On the folded path the payload rides
+                # inside the question, so the surviving payload is whatever is left
+                # of it after the question's own prefix.
+                kept = len(chunk) if chunk is not None else max(0, len(question) - (question_chars - payload_chars))
+                spans_sent = _clip_spans(spans_sent, kept, len(HIT_SEPARATOR))
+                metrics["sub_payload_truncated_calls"] = metrics.get("sub_payload_truncated_calls", 0) + 1
             if truncated:
                 # Always on the QUESTION side: on the split path the context slice
                 # is what gets compressed, and a notice buried there can be evicted.
@@ -725,8 +960,8 @@ class RLM:
                 # neighbours free memory, and caching would make the failure permanent.
                 metrics["sub_fit_failures"] = metrics.get("sub_fit_failures", 0) + 1
                 return ans
-            if document_span is not None:
-                record_coverage(*document_span)
+            for span_start, span_end in spans_sent:
+                record_coverage(span_start, span_end)
             if self.cache_subcalls:
                 cache[key] = ans
             return ans
@@ -767,6 +1002,33 @@ class RLM:
                 return f"[saved note #{len(notes)}]"
 
             env["note"] = note
+
+        if self.search_k > 0:
+
+            def search(query, k=None) -> list:
+                """BM25 over the whole document. Returns the best-matching windows."""
+                if metrics.get("search_calls", 0) >= self.max_search_calls:
+                    return []
+                # Clamp DOWNWARD only. `k` is the grid's swept axis, and the worked
+                # example in the system prompt is copied verbatim by the root -- if
+                # the example showed `k=5`, every cell would read 5 windows whatever
+                # the flag said, and the axis would measure nothing. Asking for fewer
+                # is harmless; asking for more cannot be allowed to leak the axis.
+                limit = self.search_k
+                if k is not None:
+                    requested = max(1, int(k))
+                    if requested > self.search_k:
+                        metrics["search_k_clamped_calls"] = metrics.get("search_k_clamped_calls", 0) + 1
+                    limit = min(requested, self.search_k)
+                index = retrieval.get_index(document, self.search_window_chars, self.search_overlap_chars)
+                hits = index.search(str(query), limit)
+                metrics["search_calls"] = metrics.get("search_calls", 0) + 1
+                metrics["search_hits_returned"] = metrics.get("search_hits_returned", 0) + len(hits)
+                for hit in hits:
+                    retrieved_spans.append((hit.start, hit.end))
+                return hits
+
+            env["search"] = search
 
         def FINAL_VAR(name) -> None:
             # Raise rather than answering "<missing var X>", which used to be recorded
@@ -960,6 +1222,13 @@ class RLM:
         split_capable = hasattr(self.sub, "chat_split")
         if split_capable:
             metrics["sub_split_calls"] = 0
+        # Pre-initialized only for a search arm, the same way sub_split_calls is, so
+        # a non-search run's metrics.json stays byte-identical to what it was.
+        if self.search_k > 0:
+            metrics["search_calls"] = 0
+            metrics["search_hits_returned"] = 0
+            metrics["search_hits_read"] = 0
+            metrics["search_k_clamped_calls"] = 0
         cache: dict = {}
         notes: list = []
         self._sub_call_budget = self.max_sub_calls
@@ -1017,8 +1286,18 @@ class RLM:
             Absence is the one claim REPL output cannot ground, so it gets an effort
             test rather than a grounding test: a run that never called llm_query has
             not read the document at all, whatever its searches returned.
+
+            With a search arm the bar also includes having actually run the
+            retrieval primitive. Abstaining without ever calling search() is the
+            2026 analogue of searching for the whole natural-language question as a
+            literal string: it costs a compliant model nothing, and 77% of the 331
+            LOFT-1m abstentions were reached with one sub-call or none.
             """
-            return metrics["sub_calls"] >= self.min_sub_calls_before_abstain
+            if metrics["sub_calls"] < self.min_sub_calls_before_abstain:
+                return False
+            if self.search_k > 0 and metrics.get("search_calls", 0) < 1:
+                return False
+            return True
 
         def build_sent() -> tuple[list, int]:
             """Construct the bounded view actually sent to the root model."""
