@@ -26,7 +26,7 @@ from evaluation.results_layout import RLM_RESULTS_DIR
 from . import retrieval
 from .client import LLMClient
 from .datasets import available_datasets, canonical_dataset_name, load_examples
-from .rlm import SEARCH_ABLATABLE, RLM, MemoryBudget, Scratchpad, vanilla_answer
+from .rlm import RLM, SEARCH_ABLATABLE, MemoryBudget, Scratchpad, vanilla_answer
 from .sizing import (
     DEFAULT_MIN_TOKENS,
     DEFAULT_RESERVE_TOKENS,
@@ -161,11 +161,19 @@ def resume_conflicts(run_dir: Path, config: dict) -> list[str]:
             f"{config_path} is corrupt ({exc}); cannot verify this run matches the "
             "checkpoint beside it. Fix or remove the run directory."
         )
-    return [
+    conflicts = [
         f"{key}: checkpoint was written with {prior.get(key)!r}, this run has {config.get(key)!r}"
         for key in RESUME_CRITICAL_KEYS
         if key in prior and prior.get(key) != config.get(key)
     ]
+    # Zero-overlap retrieval previously indexed only the first window. Missing
+    # revisions must conflict here, unlike newly added optional settings above.
+    if "search_index_revision" in config and prior.get("search_index_revision") != config["search_index_revision"]:
+        conflicts.append(
+            "search_index_revision: zero-overlap retrieval changed; use a fresh results directory "
+            "instead of resuming a checkpoint from a different index revision"
+        )
+    return conflicts
 
 
 def _prior_resolved_chars(run_dir: Path) -> int | None:
@@ -354,8 +362,8 @@ def write_run_artifacts(
             runtime["search_hits_read"] = int(sum(m.get("search_hits_read", 0) for m in rlm_metrics))
             runtime["search_k_clamped_calls"] = int(sum(m.get("search_k_clamped_calls", 0) for m in rlm_metrics))
         if "gold_in_retrieved" in scored_frame:
-            # The arm's structural ceiling: a score below this is the reader's fault,
-            # a score at it means retrieval is the binding constraint.
+            # Loose answer-string presence diagnostic, not a score ceiling:
+            # the root can read elsewhere and a match need not supply evidence.
             gold = scored_frame["gold_in_retrieved"].dropna()
             if len(gold):
                 runtime["gold_in_retrieved_fraction"] = float(gold.astype(bool).sum() / len(gold))
@@ -1143,12 +1151,9 @@ def main() -> None:
                 # try: vanilla_answer fills the dict before re-raising, and the
                 # errored record is exactly the one a triage pass needs it on.
                 record.update(vstats)
-                # Was the gold inside the windows retrieval actually returned? This
-                # separates "retrieval missed it" from "the reader missed it" -- the
-                # search arm's analogue of the vanilla arm's `truncated` column, and
-                # the arm's structural ceiling. Reads gold AFTER the example has
-                # ended, exactly like the is_correct line below it; nothing here
-                # reaches the model.
+                # Check for answer strings in returned windows after the example;
+                # gold answers never reach the model. This loose diagnostic does
+                # not establish whether retrieval supplied sufficient evidence.
                 spans = (record.get("metrics") or {}).pop("search_retrieved_spans", None) if mode == "rlm" else None
                 if spans:
                     retrieved = "".join(ex["context"][start:end] for start, end in spans)
@@ -1258,6 +1263,8 @@ def build_run_config(
         "search_overlap_chars": args.search_overlap,
         "max_search_calls": args.max_search_calls,
         "search_ablate": ",".join(args.search_ablate),
+        # Only zero-overlap RLM retrieval changed; preserve other runs' configs.
+        **({"search_index_revision": 2} if mode == "rlm" and args.search_k > 0 and args.search_overlap == 0 else {}),
         # Which semantics produced document_coverage_fraction. Before this, spans
         # were derived AFTER the dense fold set chunk=None, so coverage was
         # structurally 0.0 on every --sub-backend http run; it is now resolved

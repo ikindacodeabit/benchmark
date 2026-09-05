@@ -103,15 +103,22 @@ them silently flatters RLM:
   compresses, and this arm *selects*. The only fair comparator is a `--search-k 0`
   run of the same commit, which is why the flag is stamped into the run directory
   and `config.yaml` rather than becoming a default.
-  `runtime.gold_in_retrieved_fraction` is the arm's structural ceiling — the
-  analogue of `context_retained` for vanilla. A score below it is the reader's
-  fault; a score at it means retrieval, not reading, is the binding constraint.
+  `runtime.gold_in_retrieved_fraction` is a loose answer-string presence
+  diagnostic among scored examples with recorded retrieved spans. It is not a
+  score ceiling: the root can read elsewhere, and a matching string does not
+  establish that the retrieved text supplies sufficient evidence to answer.
   Two caveats travel with it. The treatment is not one variable: the primitive,
   the worked example, the locate bullet and the abstention gate all move together.
   And `document_coverage_fraction` changed meaning — spans are now resolved before
   the dense fold, so it was structurally `0.0` on every earlier `--sub-backend
   http` run. `config.yaml` records `coverage_attribution: spans_v2`; do not
   compare a coverage number across that line.
+
+Search-enabled RLM runs with `--search-overlap 0` now record
+`search_index_revision: 2`: an earlier cleanup loop incorrectly discarded all
+but the first window. These runs require a fresh results directory when an
+existing configuration lacks that revision. Default overlapping windows are
+unchanged.
 
 ## Runaway guards and the scratchpad
 All four are toggleable and independent; pass `0` to disable one without

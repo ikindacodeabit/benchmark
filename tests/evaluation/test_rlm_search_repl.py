@@ -5,13 +5,7 @@
 import pytest
 
 from evaluation.rlm import retrieval
-from evaluation.rlm.rlm import (
-    HIT_SEPARATOR,
-    READ_STRATEGY_DEFAULT,
-    RLM,
-    SEARCH_TERMS_FIND,
-    SUB_FIT_FAILURE_PREFIX,
-)
+from evaluation.rlm.rlm import HIT_SEPARATOR, READ_STRATEGY_DEFAULT, RLM, SEARCH_TERMS_FIND, SUB_FIT_FAILURE_PREFIX
 
 DOCUMENT = (
     ("filler text about nothing in particular " * 40)
@@ -107,6 +101,16 @@ class TestSearchBinding:
 
 
 class TestCoverageAttribution:
+    @pytest.mark.parametrize("client_type", [FakeClient, FakeSplitClient])
+    def test_coverage_accumulates_the_union_across_reads(self, client_type):
+        _, env, metrics = build(sub=client_type())
+        # Hit offsets avoid ambiguity from the document's repeated filler text.
+        for start, end, total in [(0, 100, 100), (50, 150, 150), (150, 200, 200), (300, 400, 300), (0, 100, 300)]:
+            hit = retrieval.Hit(rank=1, start=start, end=end, score=1.0, text=DOCUMENT[start:end])
+            env["llm_query"]("read", [hit])
+            assert metrics["document_coverage_fraction"] == pytest.approx(total / len(DOCUMENT))
+        assert metrics["sub_cache_hits"] == 1
+
     def test_a_hit_list_payload_is_attributed_to_its_spans(self):
         _, env, metrics = build(sub=FakeSplitClient())
         hits = env["search"]("ZEBRAQUUX Riverside")
@@ -173,7 +177,7 @@ class TestCoverageAttribution:
         env["llm_query"]("what?", hits)
         assert metrics["search_hits_read"] == len(hits)
 
-    def test_retrieved_spans_are_recorded_for_the_gold_ceiling(self):
+    def test_retrieved_spans_are_recorded_for_the_gold_presence_diagnostic(self):
         _, env, metrics = build()
         env["search"]("ZEBRAQUUX Riverside")
         assert metrics["search_retrieved_spans"]
@@ -184,9 +188,7 @@ class TestFloorInteraction:
     def test_the_floor_widens_hit_spans_and_they_stay_verbatim(self):
         # One hit is `search_window` wide (2000); the floor must grow it past that
         # without saturating this deliberately small document.
-        rlm, env, metrics = build(
-            sub=FakeSplitClient(), search_k=1, min_subcall_chars=3000, max_subcall_chars=60000
-        )
+        rlm, env, metrics = build(sub=FakeSplitClient(), search_k=1, min_subcall_chars=3000, max_subcall_chars=60000)
         hits = env["search"]("ZEBRAQUUX Riverside")
         env["llm_query"]("who won?", hits)
         covered = metrics["document_coverage_fraction"] * len(DOCUMENT)
@@ -194,9 +196,7 @@ class TestFloorInteraction:
         assert metrics["sub_slice_unlocatable_calls"] == 0
 
     def test_a_hit_payload_is_never_counted_unlocatable(self):
-        _, env, metrics = build(
-            sub=FakeSplitClient(), search_k=1, min_subcall_chars=3000, max_subcall_chars=60000
-        )
+        _, env, metrics = build(sub=FakeSplitClient(), search_k=1, min_subcall_chars=3000, max_subcall_chars=60000)
         env["llm_query"]("who won?", env["search"]("ZEBRAQUUX"))
         assert metrics["sub_slice_unlocatable_calls"] == 0
 

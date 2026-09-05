@@ -110,12 +110,6 @@ class ChunkIndex:
         self.spans: list[tuple[int, int]] = [
             (start, min(start + chunk_chars, len(document))) for start in range(0, max(len(document), 1), stride)
         ]
-        # range() emits one window per stride, so a document whose tail is shorter
-        # than the overlap yields a final window wholly contained in its
-        # predecessor. Harmless for scoring, but it inflates the chunk count and
-        # shows up as a duplicate hit, so drop it.
-        while len(self.spans) > 1 and self.spans[-1][0] >= self.spans[-2][1]:
-            self.spans.pop()
 
         self._tf: list[Counter] = []
         self._lengths: list[int] = []
@@ -166,9 +160,7 @@ class ChunkIndex:
 # pay 0.35s per example for the same index. Exactly ONE entry, so switching
 # documents drops the previous index instead of accumulating multi-megabyte
 # indexes per subset; peak is one document plus its index.
-_CACHED_KEY: Optional[tuple] = None
 _CACHED_INDEX: Optional[ChunkIndex] = None
-_BUILD_COUNT = 0
 
 
 def get_index(
@@ -178,30 +170,22 @@ def get_index(
 ) -> ChunkIndex:
     """The index for this document, reusing the previous one when it matches.
 
-    Keyed on ``(len, hash)`` and then CONFIRMED with ``==``. Identity (``is`` /
-    ``id()``) would be wrong twice over: the loaders rebuild each row's context
-    from Arrow, so equal corpora are distinct objects and every example would
-    rebuild; and ids are recycled after GC, so a freed document's id can be
-    reused by a different one and serve a stale index -- a wrong answer, not a
-    slow one. ``hash()`` is PYTHONHASHSEED-salted, so this is an in-process
-    cache only; a resumed run simply rebuilds once.
+    Compare document contents: loaders can produce equal corpora as distinct
+    string objects. The index already holds its document and window settings.
     """
-    global _CACHED_KEY, _CACHED_INDEX, _BUILD_COUNT
-    key = (len(document), hash(document), chunk_chars, overlap)
-    if _CACHED_KEY == key and _CACHED_INDEX is not None and _CACHED_INDEX.document == document:
+    global _CACHED_INDEX
+    if (
+        _CACHED_INDEX is not None
+        and _CACHED_INDEX.chunk_chars == chunk_chars
+        and _CACHED_INDEX.overlap == overlap
+        and _CACHED_INDEX.document == document
+    ):
         return _CACHED_INDEX
-    index = ChunkIndex(document, chunk_chars=chunk_chars, overlap=overlap)
-    _CACHED_KEY, _CACHED_INDEX = key, index
-    _BUILD_COUNT += 1
-    return index
-
-
-def build_count() -> int:
-    """How many indexes have been built this process. For tests and diagnostics."""
-    return _BUILD_COUNT
+    _CACHED_INDEX = ChunkIndex(document, chunk_chars=chunk_chars, overlap=overlap)
+    return _CACHED_INDEX
 
 
 def reset_cache() -> None:
     """Drop the cached index. For tests, and to free a large index explicitly."""
-    global _CACHED_KEY, _CACHED_INDEX
-    _CACHED_KEY, _CACHED_INDEX = None, None
+    global _CACHED_INDEX
+    _CACHED_INDEX = None

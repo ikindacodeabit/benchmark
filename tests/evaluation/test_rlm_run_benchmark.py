@@ -143,6 +143,24 @@ class ResumeGuardTest(unittest.TestCase):
         self.assertEqual(len(conflicts), 1)
         self.assertIn("compression_factor", conflicts[0])
 
+    def test_zero_overlap_retrieval_requires_the_current_index_revision(self):
+        config = rb.build_run_config(_args(search_k=3, search_overlap=0), "rlm", "loft", None, None, None)
+        self.assertEqual(config["search_index_revision"], 2)
+        old_config = {key: value for key, value in config.items() if key != "search_index_revision"}
+        for prior in (old_config, {**old_config, "search_index_revision": 1}):
+            conflicts = resume_conflicts(self._run_dir(**prior), config)
+            self.assertEqual(len(conflicts), 1)
+            self.assertIn("search_index_revision", conflicts[0])
+        self.assertEqual(resume_conflicts(self._run_dir(**config), config), [])
+
+    def test_other_runs_do_not_require_an_index_revision(self):
+        for mode, search_k, overlap in [("rlm", 3, 400), ("rlm", 0, 0), ("vanilla", 3, 0)]:
+            config = rb.build_run_config(
+                _args(search_k=search_k, search_overlap=overlap), mode, "loft", None, None, None
+            )
+            self.assertNotIn("search_index_revision", config)
+            self.assertEqual(resume_conflicts(self._run_dir(**config), config), [])
+
     def test_the_sample_is_resume_critical(self):
         """--sample-fraction reaches neither the run-dir name nor the slug, so the
         config guard is the only thing standing between two different samples and
@@ -199,6 +217,25 @@ def _args(**overrides) -> argparse.Namespace:
         compression_factor=None,
         fixed_chunk=False,
         min_subcall_chars=0,
+        sub_model="Qwen/Qwen3-4B-Instruct-2507",
+        base_url="http://localhost:8000/v1",
+        limit=10,
+        sample_fraction=None,
+        max_steps=50,
+        vanilla_char_limit=100000,
+        vanilla_max_prompt_tokens=None,
+        exec_timeout=60,
+        run_timeout=900,
+        max_sub_calls=40,
+        min_sub_calls_before_abstain=1,
+        max_unproductive_steps=5,
+        max_error_steps=3,
+        no_think=False,
+        search_k=0,
+        search_window=2000,
+        search_overlap=400,
+        max_search_calls=40,
+        search_ablate=(),
     )
     base.update(overrides)
     return argparse.Namespace(**base)

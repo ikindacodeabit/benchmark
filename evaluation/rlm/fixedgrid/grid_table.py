@@ -60,9 +60,7 @@ def collect(results: Path) -> pd.DataFrame:
         search_k = int(config.get("search_k") or 0)
         key = (subset, budget, factor, search_k)
         if key in seen:
-            raise ValueError(
-                f"duplicate completed grid cell for {subset}, B={budget}, F={factor:g}, k={search_k}"
-            )
+            raise ValueError(f"duplicate completed grid cell for {subset}, B={budget}, F={factor:g}, k={search_k}")
         seen.add(key)
         runtime = metrics.get("runtime", {})
         rows.append(
@@ -71,8 +69,7 @@ def collect(results: Path) -> pd.DataFrame:
                 "kv_budget_tokens": budget,
                 "compression_factor": factor,
                 "search_k": search_k,
-                # The retrieval arm's structural ceiling: a score below this is the
-                # reader's fault, a score at it means retrieval is what binds.
+                # Loose answer-string presence diagnostic, not a score ceiling.
                 "gold_in_retrieved_fraction": runtime.get("gold_in_retrieved_fraction"),
                 "search_hits_read": runtime.get("search_hits_read"),
                 "qa_f1": _score(metrics, dataset),

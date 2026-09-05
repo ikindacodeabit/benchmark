@@ -342,17 +342,14 @@ FINAL_NONE_NAMES = ("FINAL_NONE", "Final_None", "FINAL_None", "final_none")
 FINAL_VAR_NAMES = ("FINAL_VAR", "Final_Var", "FINAL_Var", "final_var")
 _ALL_TERMINAL_NAMES = FINAL_NONE_NAMES + FINAL_VAR_NAMES + FINAL_NAMES  # longest-first
 
-STMT_KEYWORDS = (
-    r"print|import|from|for|while|if|elif|try|except|finally|with|return|note|"
-    + "|".join(_ALL_TERMINAL_NAMES)
+STMT_KEYWORDS = r"print|import|from|for|while|if|elif|try|except|finally|with|return|note|" + "|".join(
+    _ALL_TERMINAL_NAMES
 )
 ONELINE_FIX_RE = re.compile(rf"(?<=[\)\w'\"])\s+(?=(?:{STMT_KEYWORDS})\b)")
 _FINAL_ALT = "|".join(FINAL_NAMES)
 _FINAL_NONE_ALT = "|".join(FINAL_NONE_NAMES)
 _FINAL_VAR_ALT = "|".join(FINAL_VAR_NAMES)
-TEXT_FINAL_RE = re.compile(
-    rf"(?:{_FINAL_ALT})\(\s*(?:\"\"\"|'''|\"|')(.*?)(?:\"\"\"|'''|\"|')\s*\)", re.DOTALL
-)
+TEXT_FINAL_RE = re.compile(rf"(?:{_FINAL_ALT})\(\s*(?:\"\"\"|'''|\"|')(.*?)(?:\"\"\"|'''|\"|')\s*\)", re.DOTALL)
 TEXT_FINAL_VAR_RE = re.compile(rf"(?:{_FINAL_VAR_ALT})\(\s*[\"'](\w+)[\"']\s*\)")
 # FINAL_NONE may be written bare or with a reason, in code or in prose.
 TEXT_FINAL_NONE_RE = re.compile(
@@ -661,8 +658,7 @@ class RLM:
         unknown = set(search_ablate) - SEARCH_ABLATABLE
         if unknown:
             raise ValueError(
-                f"unknown search_ablate components: {sorted(unknown)}; "
-                f"choose from {sorted(SEARCH_ABLATABLE)}"
+                f"unknown search_ablate components: {sorted(unknown)}; " f"choose from {sorted(SEARCH_ABLATABLE)}"
             )
         self.search_ablate = frozenset(search_ablate)
         self._sub_call_budget: Optional[int] = None
@@ -801,26 +797,15 @@ class RLM:
         # document inside it, so bind the document under a name the closure keeps.
         document = context
         coverage_spans: list[tuple[int, int]] = []
-        # Every span search() ever returned, whether or not the root went on to read
-        # it. run_benchmark turns this into `gold_in_retrieved`, which separates
-        # "retrieval missed it" from "the reader missed it" -- the retrieval arm's
-        # analogue of the vanilla arm's `truncated` column.
+        # Every span search() returned, whether or not the root read it.
+        # run_benchmark uses these for the answer-string presence diagnostic.
         retrieved_spans: list[tuple[int, int]] = metrics.setdefault("search_retrieved_spans", [])
 
         def record_coverage(start: int, end: int) -> None:
             """Merge one real document span and expose the union as a fraction."""
-            coverage_spans.append((start, end))
-            covered = 0
-            current_start = current_end = -1
-            for span_start, span_end in sorted(coverage_spans):
-                if span_start > current_end:
-                    if current_end >= 0:
-                        covered += current_end - current_start
-                    current_start, current_end = span_start, span_end
-                else:
-                    current_end = max(current_end, span_end)
-            if current_end >= 0:
-                covered += current_end - current_start
+            nonlocal coverage_spans
+            coverage_spans = _merge_spans([*coverage_spans, (start, end)])
+            covered = sum(span_end - span_start for span_start, span_end in coverage_spans)
             metrics["document_coverage_fraction"] = covered / len(document) if document else 0.0
 
         def llm_query(prompt: str, context=None) -> str:

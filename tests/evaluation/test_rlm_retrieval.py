@@ -42,6 +42,19 @@ class TestIndexShape:
         index = retrieval.ChunkIndex("only a little text here", chunk_chars=2000, overlap=400)
         assert index.spans == [(0, len("only a little text here"))]
 
+    def test_zero_overlap_keeps_every_window_and_finds_the_tail(self):
+        document = "filler " * 600 + "ZEBRAQUUX"
+        index = retrieval.ChunkIndex(document, chunk_chars=2000, overlap=0)
+        assert index.spans == [(0, 2000), (2000, 4000), (4000, len(document))]
+        hits = index.search("ZEBRAQUUX")
+        assert len(hits) == 1
+        assert hits[0].start == 4000
+        assert "ZEBRAQUUX" in hits[0].text
+
+    def test_default_overlap_preserves_the_contained_tail_window(self):
+        index = retrieval.ChunkIndex("x" * 3300)
+        assert index.spans == [(0, 2000), (1600, 3300), (3200, 3300)]
+
     def test_an_empty_document_does_not_explode(self):
         index = retrieval.ChunkIndex("", chunk_chars=2000, overlap=400)
         assert index.search("anything", 5) == []
@@ -125,29 +138,29 @@ class TestIndexCache:
         # "".join([s]) and for s + "" -- neither would exercise the cache.
         twin = document[:10] + document[10:]
         assert twin is not document and twin == document
-        before = retrieval.build_count()
-        retrieval.get_index(document, 2000, 400)
-        retrieval.get_index(twin, 2000, 400)
-        assert retrieval.build_count() - before == 1
+        index = retrieval.get_index(document, 2000, 400)
+        assert retrieval.get_index(twin, 2000, 400) is index
 
     def test_a_different_document_evicts_the_previous_index(self):
         first, _ = make_document()
         second = first + " and something else entirely to change the content "
-        before = retrieval.build_count()
         one = retrieval.get_index(first, 2000, 400)
         two = retrieval.get_index(second, 2000, 400)
         assert two is not one
-        assert retrieval.build_count() - before == 2
         # One slot: going back rebuilds rather than serving a retained second entry.
-        retrieval.get_index(first, 2000, 400)
-        assert retrieval.build_count() - before == 3
+        assert retrieval.get_index(first, 2000, 400) is not one
 
-    def test_changing_the_geometry_rebuilds(self):
+    @pytest.mark.parametrize("chunk_chars,overlap", [(4000, 400), (2000, 0)])
+    def test_changing_the_geometry_rebuilds(self, chunk_chars, overlap):
         document, _ = make_document()
-        before = retrieval.build_count()
-        retrieval.get_index(document, 2000, 400)
-        retrieval.get_index(document, 4000, 400)
-        assert retrieval.build_count() - before == 2
+        index = retrieval.get_index(document, 2000, 400)
+        assert retrieval.get_index(document, chunk_chars, overlap) is not index
+
+    def test_reset_discards_the_index(self):
+        document, _ = make_document()
+        index = retrieval.get_index(document)
+        retrieval.reset_cache()
+        assert retrieval.get_index(document) is not index
 
 
 class TestNoDeepLearningStack:
@@ -155,9 +168,7 @@ class TestNoDeepLearningStack:
         """run_benchmark.py must stay importable in a venv without them; the http
         sub-call path has no torch. Same contract sizing.py states."""
         imports = [
-            line.strip()
-            for line in inspect.getsource(retrieval).splitlines()
-            if line.startswith(("import ", "from "))
+            line.strip() for line in inspect.getsource(retrieval).splitlines() if line.startswith(("import ", "from "))
         ]
         assert imports, "no imports found -- did the module move?"
         for banned in ("torch", "transformers", "numpy", "scipy", "sklearn"):
